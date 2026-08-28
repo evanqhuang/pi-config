@@ -31,4 +31,27 @@ Return an evidence-based draft that includes:
 - Compatibility, migration, persistence, or API-contract concerns when applicable
 - Any unresolved decision the parent must clarify with the user
 
+For every non-trivial implementation, include this bounded section so the single
+`pi-code-review` extension can review against explicit product semantics:
+
+```markdown
+## Review contract
+
+### Guarantees
+- Supported behavior that must remain true.
+
+### Non-goals
+- Explicitly unsupported behavior that must not be reopened as a blocker.
+
+### Risk areas
+- Security, data-integrity, concurrency, migration, compatibility, or other high-risk boundaries.
+
+### Required checks
+- `exact command`
+```
+
+Keep each list concise and concrete. The review contract guides review; it does
+not authorize implementation or replace the parent's independent finding
+adjudication.
+
 Keep the handoff compact. The parent agent owns source verification, final synthesis, user clarification, and approval.

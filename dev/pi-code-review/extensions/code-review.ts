@@ -7,14 +7,30 @@ import { parseReviewEffort, type ReviewEffort } from "../src/effort.js";
 import { NodeCommandRunner } from "../src/commands.js";
 import { PiReviewAgentRunner } from "../src/runner.js";
 import { runCodeReview } from "../src/pipeline.js";
+import {
+  formatStatusReport,
+  getReviewStatus,
+  recordReviewDispositions,
+  resetReviewSession,
+  runManagedReview,
+  type FindingDispositionInput,
+} from "../src/lifecycle.js";
 import { resolveReviewTarget } from "../src/targets.js";
-import type { ReviewResult } from "../src/types.js";
+import type { ReviewDecision, ReviewPhase, ReviewResult } from "../src/types.js";
 
 interface ReviewToolParams {
+  readonly action?: "run" | "record" | "status" | "reset";
   readonly target?: string;
   readonly comment?: boolean;
   readonly effort?: ReviewEffort;
   readonly model?: string;
+  readonly phase?: "auto" | ReviewPhase;
+  readonly planPath?: string;
+  readonly implementationId?: string;
+  readonly sessionId?: string;
+  readonly reviewedSnapshotHash?: string;
+  readonly dispositions?: readonly FindingDispositionInput[];
+  readonly confirmReset?: boolean;
 }
 
 interface ReviewUI {
@@ -22,6 +38,26 @@ interface ReviewUI {
   setStatus?: (key: string, text: string | undefined) => void;
   setWorkingMessage?: (message: string | undefined) => void;
 }
+
+interface SessionContextLike {
+  readonly cwd: string;
+  readonly sessionManager?: {
+    getBranch?: () => readonly unknown[];
+    getEntries?: () => readonly unknown[];
+  };
+}
+
+interface ReviewExecutionContext extends SessionContextLike {
+  readonly signal?: AbortSignal;
+  readonly ui: ReviewUI;
+}
+
+const REVIEW_REMINDER_CUSTOM_TYPE = "pi-code-review-lifecycle-reminder";
+const PLAN_CONTEXT_TYPE = "pi-plan-mode-plan-context";
+const MODE_STATE_TYPES = new Set(["pi-plan-mode-state", "mode-state"]);
+const IMPLEMENTATION_ALIASES = new Set(["implementationworker", "implementation-worker", "implementation", "worker"]);
+const REVIEW_AGENT_TYPES = new Set(["review", "reviewer", "code-review", "compliance", "lunacompliance", "test-verifier", "lunatestverifier"]);
+const REVIEW_TASK = /\b(?:code[- ]?review|review this|review the (?:diff|implementation|pull request|pr)|security review|spec(?:ification)? compliance review|test evidence review)\b/iu;
 
 function renderProgress(ctx: { ui: ReviewUI }, stage: string, message: string): void {
   const progress = `[${stage}] ${message}`;
@@ -34,28 +70,131 @@ function clearProgress(ctx: { ui: ReviewUI }): void {
   ctx.ui.setWorkingMessage?.(undefined);
 }
 
+function branchEntries(ctx: SessionContextLike | undefined): readonly unknown[] {
+  if (!ctx?.sessionManager) return [];
+  const branch = ctx.sessionManager.getBranch?.();
+  if (Array.isArray(branch)) return branch;
+  const entries = ctx.sessionManager.getEntries?.();
+  return Array.isArray(entries) ? entries : [];
+}
+
+function customEntry(value: unknown): { customType?: string; data?: Record<string, unknown> } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entry = value as { type?: unknown; customType?: unknown; data?: unknown };
+  if (entry.type !== "custom" || typeof entry.customType !== "string") return undefined;
+  return {
+    customType: entry.customType,
+    ...(entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? { data: entry.data as Record<string, unknown> } : {}),
+  };
+}
+
+function latestManagedPlanPath(ctx: SessionContextLike | undefined): string | undefined {
+  for (const raw of [...branchEntries(ctx)].reverse()) {
+    const entry = customEntry(raw);
+    if (entry?.customType !== PLAN_CONTEXT_TYPE || typeof entry.data?.planPath !== "string") continue;
+    const status = String(entry.data.status ?? "");
+    if (!["approved-pending", "transition-started", "approved"].includes(status)) continue;
+    return entry.data.planPath;
+  }
+  return undefined;
+}
+
+function latestMode(ctx: SessionContextLike | undefined): "PLAN" | "ORCHESTRATOR" | "YOLO" {
+  for (const raw of [...branchEntries(ctx)].reverse()) {
+    const entry = customEntry(raw);
+    if (!entry?.customType || !MODE_STATE_TYPES.has(entry.customType)) continue;
+    const mode = String(entry.data?.mode ?? "").toUpperCase();
+    if (mode === "PLAN" || mode === "ORCHESTRATOR" || mode === "YOLO") return mode;
+  }
+  return "PLAN";
+}
+
+function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDecision, status: ReviewResult["status"] = "complete"): ReviewResult {
+  return {
+    effort,
+    status,
+    summary: report,
+    findings: [],
+    failures: [],
+    report,
+    commented: false,
+    usage: [],
+    ...(decision ? { decision } : {}),
+  };
+}
+
 async function executeReview(
-  ctx: { cwd: string; signal?: AbortSignal | undefined; ui: ReviewUI },
+  ctx: ReviewExecutionContext,
   params: ReviewToolParams,
   activeReviews: Set<AbortController>,
 ): Promise<ReviewResult> {
+  const commands = new NodeCommandRunner();
+  const action = params.action ?? "run";
+  if (!["run", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
+  const effort = parseReviewEffort(params.effort);
+  const planPath = params.planPath?.trim() || latestManagedPlanPath(ctx);
+  const dependencies = {
+    commands,
+    agents: new PiReviewAgentRunner(),
+    ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
+    onProgress: (stage: Parameters<typeof renderProgress>[1], message: string) => renderProgress(ctx, stage, message),
+  };
+
+  if (action === "record") {
+    if (!params.sessionId?.trim()) throw new Error("record requires sessionId");
+    if (!params.reviewedSnapshotHash?.trim()) throw new Error("record requires reviewedSnapshotHash");
+    if (!params.dispositions || params.dispositions.length === 0) throw new Error("record requires at least one finding disposition");
+    return recordReviewDispositions({
+      cwd: ctx.cwd,
+      sessionId: params.sessionId.trim(),
+      reviewedSnapshotHash: params.reviewedSnapshotHash.trim(),
+      dispositions: params.dispositions,
+    }, dependencies);
+  }
+
+  const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
+  if (action === "status") {
+    const status = await getReviewStatus(ctx.cwd, dependencies, {
+      ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
+      ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+      ...(planPath ? { planPath } : {}),
+      target,
+    }, ctx.signal);
+    return plainResult(formatStatusReport(status), effort, status?.decision);
+  }
+  if (action === "reset") {
+    const message = await resetReviewSession(ctx.cwd, dependencies, {
+      ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
+      ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+      ...(planPath ? { planPath } : {}),
+      confirm: params.confirmReset === true,
+    });
+    return plainResult(`### Code review reset\n\n${message}`, effort);
+  }
+
+  const phase = params.phase ?? "auto";
+  if (!["auto", "initial", "delta", "final", "audit"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
+  const managed = phase !== "audit" && Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   try {
-    const parsed = params.target?.trim() ? { target: params.target.trim(), comment: params.comment === true } : { comment: params.comment === true };
-    const effort = parseReviewEffort(params.effort);
-    const reviewerModel = params.model?.trim();
-    const commands = new NodeCommandRunner();
-    const target = await resolveReviewTarget(parsed.target, ctx.cwd, commands, cancellation.signal);
-    return await runCodeReview(
-      { cwd: ctx.cwd, target, comment: parsed.comment, effort },
-      {
-        commands,
-        agents: new PiReviewAgentRunner(),
-        ...(reviewerModel ? { reviewerModel } : {}),
-        onProgress: (stage, message) => renderProgress(ctx, stage, message),
-      },
-      cancellation.signal,
-    );
+    if (managed) {
+      return runManagedReview({
+        cwd: ctx.cwd,
+        target,
+        requestedPhase: phase,
+        effort,
+        ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+        ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
+        ...(planPath ? { planPath } : {}),
+      }, dependencies, cancellation.signal);
+    }
+    return runCodeReview({
+      cwd: ctx.cwd,
+      target,
+      comment: params.comment === true,
+      effort: phase === "audit" && params.effort === undefined ? "high" : effort,
+      ...(phase === "audit" ? { phase: "audit" as const } : {}),
+    }, dependencies, cancellation.signal);
   } finally {
     cancellation.dispose();
     clearProgress(ctx);
@@ -78,10 +217,118 @@ export function injectReviewResult(pi: ReviewMessageSender, result: ReviewResult
   });
 }
 
+function messageContent(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const value = message as { content?: unknown };
+  if (typeof value.content === "string") return value.content;
+  if (!Array.isArray(value.content)) return "";
+  return value.content.map((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "").join("\n");
+}
+
+function isLifecycleReminder(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const value = message as { customType?: unknown };
+  return value.customType === REVIEW_REMINDER_CUSTOM_TYPE || messageContent(message).includes(`[${REVIEW_REMINDER_CUSTOM_TYPE}]`);
+}
+
+function isOldOrchestratorReminder(message: unknown): boolean {
+  return Boolean(message && typeof message === "object" && (message as { customType?: unknown }).customType === "pi-plan-mode-orchestrator-reminder");
+}
+
+function lifecycleReminder(mode: "ORCHESTRATOR" | "YOLO", planPath: string, statusReport: string): Record<string, unknown> {
+  return {
+    role: "custom",
+    customType: REVIEW_REMINDER_CUSTOM_TYPE,
+    display: false,
+    content: [
+      "<system-reminder>",
+      `[${REVIEW_REMINDER_CUSTOM_TYPE}]`,
+      `${mode} approved-plan review policy: pi-code-review is the only code-review authority.`,
+      "Do not launch reviewer, LunaCompliance, LunaTestVerifier, compliance, audit, or test-verifier subagents.",
+      "Implementation workers may edit only bounded implementation/remediation units. The parent inspects changes, runs project checks, commits the intended state, calls code_review with phase=auto, adjudicates candidates, and records dispositions before fixing anything.",
+      "A normal session permits one initial review, one delta review, and at most one final review. Never start a fourth review pass.",
+      `Managed plan: ${planPath}`,
+      statusReport,
+      "</system-reminder>",
+    ].join("\n"),
+    timestamp: Date.now(),
+  };
+}
+
+function agentRequestText(input: Record<string, unknown>): string {
+  return [input.subagent_type, input.task, input.prompt, input.description, input.name]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+export function applyReviewAgentPolicy(
+  mode: "PLAN" | "ORCHESTRATOR" | "YOLO",
+  input: Record<string, unknown>,
+): { block: true; reason: string } | undefined {
+  const requestText = agentRequestText(input);
+  const requestedType = String(input.subagent_type ?? "").trim().toLowerCase();
+  if (REVIEW_AGENT_TYPES.has(requestedType) || REVIEW_TASK.test(requestText)) {
+    return { block: true, reason: "Use code_review as the only review authority; reviewer/compliance/test-verifier subagents are disabled." };
+  }
+  if (mode === "ORCHESTRATOR") {
+    if (!IMPLEMENTATION_ALIASES.has(requestedType)) {
+      return { block: true, reason: "ORCHESTRATOR permits only a bounded ImplementationWorker unit. Use code_review for review work." };
+    }
+    input.subagent_type = "ImplementationWorker";
+  }
+  return undefined;
+}
+
 export default function (pi: ExtensionAPI): void {
   const activeReviews = new Set<AbortController>();
+  let activeContext: SessionContextLike | undefined;
+  let activeMode: "PLAN" | "ORCHESTRATOR" | "YOLO" = "PLAN";
+  let lateModeHooksRegistered = false;
+
+  const registerLateModeHooks = () => {
+    if (lateModeHooksRegistered) return;
+    lateModeHooksRegistered = true;
+    // pi-code-review is loaded before pi-plan-mode so its Agent guard sees the
+    // original request. Register prompt/context hooks after all session-start
+    // handlers so this policy remains the final mode guidance.
+    pi.on("before_agent_start", (event) => {
+      const planPath = latestManagedPlanPath(activeContext);
+      activeMode = latestMode(activeContext);
+      if (activeMode === "PLAN") {
+        return {
+          systemPrompt: `${event.systemPrompt}\n\nFor every non-trivial managed implementation plan, include a bounded \`## Review contract\` with \`### Guarantees\`, \`### Non-goals\`, \`### Risk areas\`, and \`### Required checks\`. These sections define the supported review boundary; they do not authorize implementation.`,
+        };
+      }
+      if (!planPath || (activeMode !== "ORCHESTRATOR" && activeMode !== "YOLO")) return undefined;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\nApproved-plan implementation is active. Use pi-code-review as the only review authority. Commit the intended implementation before each managed review pass. Run project checks, call code_review phase=auto, independently adjudicate every candidate, record dispositions, and fix only confirmed blockers in one coherent batch. Do not launch LunaCompliance, LunaTestVerifier, reviewer, compliance, audit, or test-verifier agents. Stop after initial, delta, and at most one final review pass.`,
+      };
+    });
+
+    pi.on("context", async (event) => {
+      activeMode = latestMode(activeContext);
+      const planPath = latestManagedPlanPath(activeContext);
+      const ordinaryMessages = event.messages.filter((message) => !isLifecycleReminder(message));
+      if (!planPath || (activeMode !== "ORCHESTRATOR" && activeMode !== "YOLO") || !activeContext) return { messages: ordinaryMessages };
+      const messages = ordinaryMessages.filter((message) => !isOldOrchestratorReminder(message));
+      let statusText: string;
+      try {
+        const commands = new NodeCommandRunner();
+        const status = await getReviewStatus(activeContext.cwd, { commands }, { planPath, target: { kind: "current-diff" } });
+        statusText = status
+          ? `Review status: ${status.decision}; phase=${status.phase}; passes=${status.completedPasses}/3; remediation=${status.remediationBatches}/2. ${status.nextAction}`
+          : "Review status: not started. After implementation is committed and checks are run, call code_review with phase=auto and the managed plan path.";
+      } catch (error) {
+        statusText = `Review status unavailable: ${error instanceof Error ? error.message : String(error)}. Do not claim sign-off until code_review status succeeds.`;
+      }
+      return { messages: [...messages, lifecycleReminder(activeMode, planPath, statusText)] };
+    });
+  };
 
   pi.on("session_start", (_event, ctx) => {
+    activeContext = ctx;
+    activeMode = latestMode(ctx);
+    registerLateModeHooks();
     ctx.ui.onTerminalInput((data) => {
       if (!matchesKey(data, "escape") || cancelActiveReviews(activeReviews) === 0) return;
       ctx.ui.notify("Code review canceled.", "warning");
@@ -89,8 +336,20 @@ export default function (pi: ExtensionAPI): void {
     });
   });
 
+  pi.on("session_tree", (_event, ctx) => {
+    activeContext = ctx;
+    activeMode = latestMode(ctx);
+  });
+
   pi.on("session_shutdown", () => {
     cancelActiveReviews(activeReviews);
+    activeContext = undefined;
+  });
+
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "Agent" || !event.input || typeof event.input !== "object" || Array.isArray(event.input)) return undefined;
+    const input = event.input as Record<string, unknown>;
+    return applyReviewAgentPolicy(activeMode, input);
   });
 
   pi.registerMessageRenderer<ReviewResult>("code-review-result", (message, _options, _theme) => {
@@ -98,17 +357,27 @@ export default function (pi: ExtensionAPI): void {
     return new Markdown(report || "Review result unavailable.", 0, 0, getMarkdownTheme());
   });
 
-  // Preserve rendering for reports created before they participated in model context.
   pi.registerEntryRenderer<ReviewResult>("code-review-result", (entry, _options, _theme) => {
     return new Markdown(entry.data?.report ?? "Review result unavailable.", 0, 0, getMarkdownTheme());
   });
 
   pi.registerCommand("code-review", {
-    description: "Run a deterministic multi-pass code review",
+    description: "Run or inspect the bounded stateful code-review lifecycle",
     handler: async (args, ctx) => {
       try {
         const parsed = parseReviewArgs(args);
-        const result = await executeReview(ctx, parsed, activeReviews);
+        const result = await executeReview(ctx, {
+          action: parsed.action,
+          comment: parsed.comment,
+          effort: parsed.effort,
+          phase: parsed.phase,
+          confirmReset: parsed.confirmReset,
+          ...(parsed.target ? { target: parsed.target } : {}),
+          ...(parsed.model ? { model: parsed.model } : {}),
+          ...(parsed.planPath ? { planPath: parsed.planPath } : {}),
+          ...(parsed.implementationId ? { implementationId: parsed.implementationId } : {}),
+          ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
+        }, activeReviews);
         injectReviewResult(pi, result);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -119,22 +388,42 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_review",
     label: "Code Review",
-    description: "Review a pull request, current diff, branch, path, or worktree. Results are report-only unless comment is explicitly true for a pull request.",
+    description: "Run, adjudicate, inspect, or explicitly reset the bounded initial/delta/final code-review lifecycle. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
     parameters: Type.Object({
+      action: Type.Optional(Type.String({ description: "run, record, status, or reset; defaults to run" })),
       target: Type.Optional(Type.String({ description: "Pull request number/URL, branch, path, worktree, or omit for current diff" })),
-      comment: Type.Optional(Type.Boolean({ description: "Publish a comment only when true and target is a pull request" })),
+      comment: Type.Optional(Type.Boolean({ description: "Publish only for an explicit one-shot pull-request review" })),
       effort: Type.Optional(Type.String({ description: "Review depth: low, medium, high, xhigh, max, or ultra" })),
-      model: Type.Optional(Type.String({ description: "Reviewer model provider/id; overrides the effort-routed reviewer model for this review" })),
+      model: Type.Optional(Type.String({ description: "Reviewer model provider/id override" })),
+      phase: Type.Optional(Type.String({ description: "auto, initial, delta, final, or audit" })),
+      planPath: Type.Optional(Type.String({ description: "Managed plan path whose review contract and implementation identity should be used" })),
+      implementationId: Type.Optional(Type.String({ description: "Stable approved implementation identity" })),
+      sessionId: Type.Optional(Type.String({ description: "Review session ID returned by a prior managed run" })),
+      reviewedSnapshotHash: Type.Optional(Type.String({ description: "Exact snapshot hash returned by the managed review being adjudicated" })),
+      dispositions: Type.Optional(Type.Array(Type.Object({
+        id: Type.String(),
+        disposition: Type.String(),
+        parentEvidence: Type.Optional(Type.String()),
+        deterministic: Type.Optional(Type.Boolean()),
+        contractBasis: Type.Optional(Type.String()),
+      }))),
+      confirmReset: Type.Optional(Type.Boolean({ description: "Must be true for an explicit reset" })),
     }),
     execute: async (_toolCallId, params: ReviewToolParams, signal, _onUpdate, ctx) => {
       try {
-        const result = await executeReview({ cwd: ctx.cwd, signal, ui: ctx.ui }, params, activeReviews);
+        const sessionManager = (ctx as unknown as SessionContextLike).sessionManager;
+        const result = await executeReview({ cwd: ctx.cwd, signal, ui: ctx.ui, ...(sessionManager ? { sessionManager } : {}) }, params, activeReviews);
         return {
           content: [{ type: "text", text: result.report }],
           details: {
             effort: result.effort,
             status: result.status,
+            decision: result.decision,
+            phase: result.phase,
+            sessionId: result.sessionId,
+            reviewedSnapshotHash: result.reviewedSnapshotHash,
             findings: result.findings,
+            ledger: result.ledger,
             failures: result.failures,
             commented: result.commented,
             usage: result.usage,
@@ -143,7 +432,7 @@ export default function (pi: ExtensionAPI): void {
       } catch (error) {
         return {
           content: [{ type: "text", text: `Code review failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { effort: params.effort ?? "medium", status: "incomplete", findings: [], failures: [String(error)], commented: false },
+          details: { effort: params.effort ?? "medium", status: "incomplete", decision: "incomplete", findings: [], failures: [String(error)], commented: false },
           isError: true,
         };
       }
