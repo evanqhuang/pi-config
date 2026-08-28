@@ -230,7 +230,7 @@ describe("managed review lifecycle", () => {
       planPath: plan,
     }, { commands: new NodeCommandRunner(), agents: new FakeAgents() });
     expect(result.status).toBe("incomplete");
-    expect(result.report).toContain("clean worktree");
+    expect(result.report).toContain("clean committed worktree");
   });
 
   it("blocks after the final confirmation instead of starting a fourth review", async () => {
