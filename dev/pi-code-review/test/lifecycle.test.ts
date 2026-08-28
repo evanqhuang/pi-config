@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NodeCommandRunner } from "../src/commands.js";
-import { recordReviewDispositions, runManagedReview } from "../src/lifecycle.js";
+import { getReviewStatus, recordReviewDispositions, runManagedReview } from "../src/lifecycle.js";
 import type { AgentInvocation, AgentResult, ReviewAgentRunner } from "../src/types.js";
 
 const roots: string[] = [];
@@ -172,13 +172,28 @@ describe("managed review lifecycle", () => {
     }, dependencies)).rejects.toThrow("Unknown finding disposition");
   });
 
+  it("does not let an initial candidate bypass remediation through resolved", async () => {
+    const { repo, plan } = await fixture();
+    const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
+    const initial = await runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
+    }, dependencies);
+
+    await expect(recordReviewDispositions({
+      cwd: repo,
+      sessionId: initial.sessionId!,
+      reviewedSnapshotHash: initial.reviewedSnapshotHash!,
+      dispositions: [{ id: "REV-001", disposition: "resolved", parentEvidence: "No remediation exists yet." }],
+    }, dependencies)).rejects.toThrow("reviewed remediation");
+  });
+
   it("rejects dispositions when the approved plan changes after review", async () => {
     const { repo, plan } = await fixture();
     const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
     const initial = await runManagedReview({
       cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
     }, dependencies);
-    await writeFile(plan, `${await (await import("node:fs/promises")).readFile(plan, "utf8")}\n- Changed contract after review.\n`);
+    await writeFile(plan, `${await readFile(plan, "utf8")}\n- Changed contract after review.\n`);
 
     await expect(recordReviewDispositions({
       cwd: repo,
@@ -186,6 +201,22 @@ describe("managed review lifecycle", () => {
       reviewedSnapshotHash: initial.reviewedSnapshotHash!,
       dispositions: [{ id: "REV-001", disposition: "non-blocking" }],
     }, dependencies)).rejects.toThrow("approved plan changed");
+  });
+
+  it("marks an approved status stale when uncommitted edits exist", async () => {
+    const { repo, plan } = await fixture();
+    const commands = new NodeCommandRunner();
+    const agents = new FakeAgents();
+    agents.candidates = false;
+    const approved = await runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
+    }, { commands, agents });
+    expect(approved.decision).toBe("approve");
+
+    await writeFile(join(repo, "src", "dirty.ts"), "export {};\n");
+    const status = await getReviewStatus(repo, { commands }, { planPath: plan, target: { kind: "current-diff" } });
+    expect(status?.stale).toBe(true);
+    expect(status?.nextAction).toContain("worktree is dirty");
   });
 
   it("refuses to advance a managed lifecycle from a dirty worktree", async () => {
