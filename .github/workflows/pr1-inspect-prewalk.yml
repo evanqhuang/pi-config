@@ -1,0 +1,18 @@
+name: Inspect PREWALK integration
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locate PREWALK and verifier paths
+        run: |
+          grep -RniE 'PREWALK|prewalk|LunaCompliance|LunaTestVerifier' dev/pi-plan-mode agents settings.json || true
