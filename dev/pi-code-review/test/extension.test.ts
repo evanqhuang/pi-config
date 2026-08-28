@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import registerCodeReview, {
   applyReviewAgentPolicy,
+  buildManagedImplementationId,
   injectReviewResult,
   latestManagedPlanPath,
   validateFindingDispositionInputs,
@@ -58,6 +59,13 @@ describe("review session context", () => {
       subagent_type: "Explore",
       task: "Review the relevant implementation paths and report evidence.",
     })).toBeUndefined();
+  });
+
+  it("binds managed identity to the checkout and plan path, not plan contents", () => {
+    const first = buildManagedImplementationId("/repo", "feature", "/plans/feature.md");
+    expect(buildManagedImplementationId("/repo", "feature", "/plans/feature.md")).toBe(first);
+    expect(buildManagedImplementationId("/repo", "other", "/plans/feature.md")).not.toBe(first);
+    expect(buildManagedImplementationId("/repo", "feature", "/plans/other.md")).not.toBe(first);
   });
 
   it("rejects unknown finding dispositions instead of treating them as approval", () => {
