@@ -13,6 +13,7 @@ const snapshot: ReviewSnapshot = {
 function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
   return {
     id: "finder:one:0",
+    rootCauseKey: "cache:stale-value",
     file: "src/a.ts",
     line: 12,
     summary: "Uses stale value",
@@ -29,7 +30,7 @@ describe("review output", () => {
   it("deduplicates the same defect while retaining distinct defects on one line", () => {
     const first = candidate();
     const same = candidate({ id: "finder:two:0", finder: "history" });
-    const distinct = candidate({ id: "finder:three:0", summary: "Drops error state" });
+    const distinct = candidate({ id: "finder:three:0", rootCauseKey: "errors:dropped-state", summary: "Drops error state" });
     expect(deduplicateCandidates([first, same, distinct])).toHaveLength(2);
   });
 
