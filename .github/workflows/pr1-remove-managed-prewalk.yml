@@ -26,12 +26,19 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           def replace_exact(text: str, old: str, new: str, expected: int = 1) -> str:
               actual = text.count(old)
               if actual != expected:
                   raise SystemExit(f"expected {expected} occurrence(s), found {actual}: {old[:120]!r}")
               return text.replace(old, new)
+
+          def sub_once(text: str, pattern: str, replacement: str) -> str:
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f"expected one regex match, found {count}: {pattern[:120]!r}")
+              return updated
 
           index_path = Path("dev/pi-plan-mode/index.ts")
           index = index_path.read_text()
@@ -58,27 +65,11 @@ jobs:
 
           test_path = Path("dev/pi-plan-mode/test/extension.test.mjs")
           tests = test_path.read_text()
-          prewalk_block = '''  const prewalkPath = await createDraft("# Prewalk plan\\n\\n1. Guide then execute.");
-          ctx.selections.push("Implement with PREWALK");
-          await approvalTool.execute("approval-prewalk", { planPath: prewalkPath }, undefined, undefined, ctx);
-          await pi.handlers.get("agent_settled")({}, ctx);
-          assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /# Prewalk plan/);
-          assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /full planning chat snapshot/);
-          assert.match(pi.customMessages.at(-1).content, /"final_status": "completed"/);
-          assert.equal(pi.active.includes("write"), false, "PREWALK does not switch the parent session mode");
-
-          writeFileSync(process.env.PI_PREWALK_LAUNCHER, "#!/bin/sh\\ncat >/dev/null\\necho '[prewalk] startup failed' >&2\\nexit 7\\n");
-          chmodSync(process.env.PI_PREWALK_LAUNCHER, 0o700);
-          const failingPrewalkPath = await createDraft("# Failing prewalk");
-          ctx.selections.push("Implement with PREWALK");
-          await approvalTool.execute("approval-prewalk-failure", { planPath: failingPrewalkPath }, undefined, undefined, ctx);
-          await pi.handlers.get("agent_settled")({}, ctx);
-          assert.equal(pi.active.includes("write"), false);
-          assert.match(pi.customMessages.at(-1).content, /PREWALK failed/);
-          assert.match(ctx.notifications.at(-1).message, /no fallback implementation/);
-
-          '''
-          tests = replace_exact(tests, prewalk_block, "")
+          tests = sub_once(
+              tests,
+              r'\n  const prewalkPath = await createDraft\("# Prewalk plan.*?\n\n  const block = await pi\.handlers\.get\("tool_call"\)',
+              '\n\n  const block = await pi.handlers.get("tool_call")',
+          )
           tests = replace_exact(
               tests,
               '  assert.match(ctx.selectCalls.at(-1).title, /PREWALK:/);',
@@ -89,25 +80,17 @@ jobs:
               'test("resume executes each approved action once, including compact callbacks and PREWALK", async (t) => {',
               'test("resume executes each managed YOLO/ORCHESTRATOR action once, including compact callbacks", async (t) => {',
           )
-          setup_block = '''  const launcher = join(root, "prewalk");
-          const capture = join(root, "prewalk-task");
-          writeFileSync(launcher, '#!/bin/sh\\ncat > "$PI_PREWALK_CAPTURE"\\nprintf \\'[prewalk] summary {"final_status":"completed"}\\\\n\\' >&2\\n');
-          chmodSync(launcher, 0o700);
-          process.env.PI_PREWALK_LAUNCHER = launcher;
-          process.env.PI_PREWALK_CAPTURE = capture;
-          t.after(() => {
-            delete process.env.PI_PREWALK_LAUNCHER;
-            delete process.env.PI_PREWALK_CAPTURE;
-          });
-
-          '''
-          tests = replace_exact(tests, setup_block, "")
+          tests = sub_once(
+              tests,
+              r'\n  const launcher = join\(root, "prewalk"\);.*?\n\n  const actions = \[',
+              '\n\n  const actions = [',
+          )
           tests = replace_exact(tests, '    ["prewalk", undefined],\n', "")
-          branch_block = '''    } else if (action === "prewalk") {
-                assert.equal(readFileSync(capture, "utf8").includes("# prewalk"), true);
-                assert.equal(pi.sentMessages.length, 0);
-          '''
-          tests = replace_exact(tests, branch_block, "")
+          tests = sub_once(
+              tests,
+              r'\n    \} else if \(action === "prewalk"\) \{.*?\n    \} else \{',
+              '\n    } else {',
+          )
           tests = replace_exact(
               tests,
               '    assert.equal(pi.sentMessages.length, action === "prewalk" ? 0 : 1, `${action} is idempotent`);',
@@ -119,11 +102,7 @@ jobs:
           readme = readme_path.read_text()
           readme = replace_exact(readme, '`recommendedMode` (`YOLO`, `ORCHESTRATOR`, or `PREWALK`)', '`recommendedMode` (`YOLO` or `ORCHESTRATOR`)')
           readme = replace_exact(readme, '`Parent recommendation: ORCHESTRATOR` (or `PREWALK`/`YOLO`)', '`Parent recommendation: ORCHESTRATOR` (or `YOLO`)')
-          readme = replace_exact(
-              readme,
-              'before any mode switch, compaction request, or PREWALK launch;',
-              'before any mode switch or compaction request;',
-          )
+          readme = replace_exact(readme, 'before any mode switch, compaction request, or PREWALK launch;', 'before any mode switch or compaction request;')
           readme = replace_exact(
               readme,
               'through the shared executor for all five actions (YOLO/ORCHESTRATOR direct or compact, plus PREWALK),',
