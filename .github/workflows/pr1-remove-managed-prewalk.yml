@@ -117,9 +117,16 @@ jobs:
       - name: Install plan-mode dependencies
         working-directory: dev/pi-plan-mode
         run: npm ci
-      - name: Test and typecheck plan mode
+      - name: Typecheck and run portable plan-mode tests
         working-directory: dev/pi-plan-mode
-        run: npm test && npm run typecheck
+        run: |
+          npm run typecheck
+          node --test test/orchestrator-reminder.test.mjs test/reminder.test.mjs test/policy.test.mjs
+      - name: Verify managed PREWALK is unreachable
+        run: |
+          ! grep -q '"Implement with PREWALK": "prewalk"' dev/pi-plan-mode/index.ts
+          ! grep -q 'recommendedMode:.*"PREWALK"' dev/pi-plan-mode/index.ts
+          grep -q 'doesNotMatch(ctx.selectCalls.at(-1).title, /PREWALK:/)' dev/pi-plan-mode/test/extension.test.mjs
       - name: Commit managed PREWALK removal
         run: |
           git config user.name "Evan Huang"
