@@ -76,24 +76,16 @@ jobs:
 
           test_path = Path("dev/pi-code-review/test/lifecycle.test.ts")
           tests = test_path.read_text()
-          tests = replace_exact(
-              tests,
-              '''    await writeFile(plan, `${await readFile(plan, "utf8")}\n- Changed contract after review.\n`);
-
-            await expect(recordReviewDispositions({
-          ''',
-              '''    await writeFile(plan, `${await readFile(plan, "utf8")}\n- Changed contract after review.\n`);
-            const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
+          needle = '    await writeFile(plan, `${await readFile(plan, "utf8")}\\n- Changed contract after review.\\n`);\n'
+          insertion = '''    const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
               sessionId: initial.sessionId!,
               planPath: plan,
               target: { kind: "current-diff" },
             });
             expect(status?.stale).toBe(true);
             expect(status?.nextAction).toContain("approved plan changed");
-
-            await expect(recordReviewDispositions({
-          ''',
-          )
+          '''
+          tests = replace_exact(tests, needle, needle + insertion)
           test_path.write_text(tests)
           Path(".github/workflows/pr1-plan-status-check.yml").unlink(missing_ok=True)
           PY
