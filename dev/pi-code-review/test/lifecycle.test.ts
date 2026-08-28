@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NodeCommandRunner } from "../src/commands.js";
-import { getReviewStatus, recordReviewDispositions, runManagedReview } from "../src/lifecycle.js";
+import { getReviewStatus, recordReviewDispositions, runManagedReview, withLedgerLock } from "../src/lifecycle.js";
 import type { AgentInvocation, AgentResult, ReviewAgentRunner } from "../src/types.js";
 
 const roots: string[] = [];
@@ -65,9 +66,15 @@ class FakeAgents implements ReviewAgentRunner {
   public candidates = true;
   public candidateSummary = "Exports the wrong value";
   public calls = 0;
+  public readonly prompts: string[] = [];
+  public onRun: (() => void) | undefined;
 
   public run<T>(invocation: AgentInvocation, validate: (value: unknown) => T): Promise<AgentResult<T>> {
     this.calls += 1;
+    this.prompts.push(invocation.prompt);
+    const onRun = this.onRun;
+    this.onRun = undefined;
+    onRun?.();
     let value: unknown;
     if (invocation.role === "summary") value = { summary: "Changes one exported value" };
     else if (invocation.role.startsWith("finder:")) value = this.candidates ? {
@@ -231,8 +238,6 @@ describe("managed review lifecycle", () => {
     await writeFile(plan, `${await readFile(plan, "utf8")}\n- Changed contract after review.\n`);
     const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
     sessionId: initial.sessionId!,
-    planPath: plan,
-    target: { kind: "current-diff" },
   });
   expect(status?.stale).toBe(true);
   expect(status?.nextAction).toContain("approved plan changed");
@@ -256,7 +261,7 @@ describe("managed review lifecycle", () => {
     expect(approved.decision).toBe("approve");
 
     await writeFile(join(repo, "src", "dirty.ts"), "export {};\n");
-    const status = await getReviewStatus(repo, { commands }, { planPath: plan, target: { kind: "current-diff" } });
+    const status = await getReviewStatus(repo, { commands }, { sessionId: approved.sessionId! });
     expect(status?.stale).toBe(true);
     expect(status?.nextAction).toContain("worktree is dirty");
   });
@@ -312,4 +317,71 @@ describe("managed review lifecycle", () => {
     }, dependencies)).rejects.toThrow(/blocked|fourth/i);
     expect(agents.calls).toBe(calls);
   });
+  it("does not delete a live lock owned by another process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-code-review-lock-"));
+    roots.push(root);
+    const ledgerPath = join(root, "session.json");
+    const lockPath = `${ledgerPath}.lock`;
+    await writeFile(lockPath, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}
+`);
+    await expect(withLedgerLock(ledgerPath, async () => undefined)).rejects.toThrow("already active");
+    await expect(access(lockPath)).resolves.toBeUndefined();
+  });
+
+  it("invalidates a pass when the local committed head changes during review", async () => {
+    const { repo, plan } = await fixture();
+    const commands = new NodeCommandRunner();
+    const agents = new FakeAgents();
+    agents.onRun = () => {
+      writeFileSync(join(repo, "src", "a.ts"), "export const value = 99;\n");
+      git(repo, "add", ".");
+      git(repo, "commit", "-m", "concurrent local change");
+    };
+    const result = await runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "medium",
+      planPath: plan,
+    }, { commands, agents });
+    expect(result.status).toBe("incomplete");
+    expect(result.ledger?.completedPasses).toBe(0);
+    expect(result.report).toMatch(/checkout changed|reviewed head/i);
+  });
+
+
+  it("continues a planned review using only the returned session ID", async () => {
+    const { repo, plan } = await fixture();
+    const commands = new NodeCommandRunner();
+    const agents = new FakeAgents();
+    const dependencies = { commands, agents };
+    const initial = await runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "medium",
+      planPath: plan,
+    }, dependencies);
+    await recordReviewDispositions({
+      cwd: repo,
+      sessionId: initial.sessionId!,
+      reviewedSnapshotHash: initial.reviewedSnapshotHash!,
+      dispositions: [{ id: "REV-001", disposition: "confirmed-blocker", parentEvidence: "Focused reproduction." }],
+    }, dependencies);
+    await writeFile(join(repo, "src", "a.ts"), "export const value = 5;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "session-only remediation");
+    const delta = await runManagedReview({
+      cwd: repo,
+      requestedPhase: "auto",
+      effort: "medium",
+      sessionId: initial.sessionId!,
+    }, dependencies);
+    expect(delta.phase).toBe("delta");
+    expect(delta.sessionId).toBe(initial.sessionId);
+    expect(agents.prompts.some((prompt) => prompt.includes("REV-001") && prompt.includes("Importing the module returns the wrong value"))).toBe(true);
+    const status = await getReviewStatus(repo, { commands }, { sessionId: initial.sessionId! });
+    expect(status?.target).toEqual({ kind: "current-diff" });
+  });
+
 });

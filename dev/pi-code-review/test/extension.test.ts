@@ -1,7 +1,11 @@
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   buildManagedImplementationId,
   injectReviewResult,
+  removeLegacyReviewSkills,
   validateFindingDispositionInputs,
 } from "../extensions/code-review.js";
 import type { ReviewResult } from "../src/types.js";
@@ -42,4 +46,16 @@ describe("review extension helpers", () => {
       disposition: "dismissed" as never,
     }])).toThrow("Unknown finding disposition");
   });
+
+  it("removes only the three legacy local review skills", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-code-review-skills-"));
+    for (const name of ["review-fix-loop", "review-loop", "review-pr", "keep-me"]) {
+      await mkdir(join(root, "skills", name), { recursive: true });
+      await writeFile(join(root, "skills", name, "SKILL.md"), name);
+    }
+    expect(await removeLegacyReviewSkills(root)).toEqual(["review-fix-loop", "review-loop", "review-pr"]);
+    await expect(removeLegacyReviewSkills(root)).resolves.toEqual([]);
+    await expect(import("node:fs/promises").then(({ access }) => access(join(root, "skills", "keep-me", "SKILL.md")))).resolves.toBeUndefined();
+  });
+
 });

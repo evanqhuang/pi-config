@@ -51,6 +51,7 @@ export interface ReviewOptions {
   readonly phase?: ReviewPhase;
   readonly contract?: ReviewContract;
   readonly snapshot?: ReviewSnapshot;
+  readonly openFindings?: readonly FindingLedgerEntry[];
 }
 
 export interface ReviewSnapshot {
@@ -130,6 +131,7 @@ export interface FindingLedgerEntry {
 export interface ReviewLedgerSummary {
   readonly sessionId: string;
   readonly implementationId?: string;
+  readonly target: ReviewTarget;
   readonly targetIdentity: string;
   readonly phase: ReviewPhase | "approved" | "blocked";
   readonly decision: ReviewDecision;

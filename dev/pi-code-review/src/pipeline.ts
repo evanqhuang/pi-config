@@ -150,8 +150,17 @@ function phaseContext(options: ReviewOptions): string {
   }
 }
 
+function openFindingContext(options: ReviewOptions): string {
+  const findings = options.openFindings?.slice(0, 3) ?? [];
+  if (findings.length === 0) return "";
+  return [
+    "Open root causes from the prior managed pass. Re-check these invariants while reviewing the remediation delta; the parent still owns final resolution:",
+    ...findings.map((finding) => `- ${finding.id} [${finding.severity}/${finding.confidence}%] ${finding.impact} — trigger: ${finding.trigger}${finding.contractBasis ? ` — contract: ${finding.contractBasis}` : ""}`),
+  ].join("\n");
+}
+
 function appendReviewContext(summary: string, options: ReviewOptions): string {
-  return [summary, phaseContext(options), contractContext(options.contract)].filter(Boolean).join("\n\n");
+  return [summary, phaseContext(options), contractContext(options.contract), openFindingContext(options)].filter(Boolean).join("\n\n");
 }
 
 export async function runCodeReview(options: ReviewOptions, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewResult> {

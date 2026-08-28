@@ -1,8 +1,9 @@
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, matchesKey } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { lstat, realpath, rm } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { parseReviewArgs } from "../src/args.js";
 import { cancelActiveReviews, startReviewCancellation } from "../src/cancellation.js";
@@ -57,6 +58,30 @@ const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
   "not-reproducible",
   "resolved",
 ]);
+
+const LEGACY_REVIEW_SKILLS = ["review-fix-loop", "review-loop", "review-pr"] as const;
+
+function defaultAgentRoot(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+  return configured ? resolve(configured) : resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+}
+
+export async function removeLegacyReviewSkills(agentRoot = defaultAgentRoot()): Promise<string[]> {
+  const removed: string[] = [];
+  for (const name of LEGACY_REVIEW_SKILLS) {
+    const skillPath = join(agentRoot, "skills", name);
+    try {
+      const entry = await lstat(skillPath);
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) throw new Error(`Refusing to remove non-directory legacy skill path: ${skillPath}`);
+      await rm(skillPath, { recursive: true, force: true });
+      removed.push(name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return removed;
+}
 
 function renderProgress(ctx: { ui: ReviewUI }, stage: string, message: string): void {
   const progress = `[${stage}] ${message}`;
@@ -210,7 +235,16 @@ async function executeReview(
     ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
     onProgress: (stage: Parameters<typeof renderProgress>[1], message: string) => renderProgress(ctx, stage, message),
   };
-  const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
+  let target: ReviewTarget;
+  if (params.target?.trim()) {
+    target = await resolveReviewTarget(params.target.trim(), ctx.cwd, commands, ctx.signal);
+  } else if (params.sessionId?.trim()) {
+    const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId: params.sessionId.trim() }, ctx.signal);
+    if (!status) throw new Error(`Review session not found: ${params.sessionId.trim()}`);
+    target = status.target;
+  } else {
+    target = await resolveReviewTarget(undefined, ctx.cwd, commands, ctx.signal);
+  }
   const cwd = operationCwd(ctx, target);
   const targetContext = contextAt(ctx, cwd);
 
@@ -254,8 +288,8 @@ async function executeReview(
   if (!["auto", "initial", "delta", "final", "audit"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
   const managed = phase !== "audit" && Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
   const implementationId = managed
-    ? inferredImplementationId ?? await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal)
-    : undefined;
+  ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal))
+  : undefined;
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   try {
     if (managed) {
@@ -303,7 +337,12 @@ export default function (pi: ExtensionAPI): void {
   const activeReviews = new Set<AbortController>();
 
   pi.on("session_start", (_event, ctx) => {
-    ctx.ui.onTerminalInput((data) => {
+  void removeLegacyReviewSkills().then((removed) => {
+    if (removed.length > 0) ctx.ui.notify(`Removed legacy review skills: ${removed.join(", ")}. Reload Pi once to unload any already-discovered copies.`, "info");
+  }).catch((error) => {
+    ctx.ui.notify(`Could not remove legacy review skills: ${error instanceof Error ? error.message : String(error)}`, "warning");
+  });
+  ctx.ui.onTerminalInput((data) => {
       if (!matchesKey(data, "escape") || cancelActiveReviews(activeReviews) === 0) return;
       ctx.ui.notify("Code review canceled.", "warning");
       return { consume: true };
