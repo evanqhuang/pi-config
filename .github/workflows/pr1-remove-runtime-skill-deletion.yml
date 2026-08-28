@@ -1,0 +1,125 @@
+name: Remove runtime skill deletion from code review
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Stop code review from mutating installed skills'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-code-review/package-lock.json
+      - name: Remove startup mutation and its test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          extension_path = Path('dev/pi-code-review/extensions/code-review.ts')
+          text = extension_path.read_text()
+          text = text.replace(
+              'import { lstat, realpath, rm } from "node:fs/promises";\n',
+              'import { realpath } from "node:fs/promises";\n',
+              1,
+          )
+          text = text.replace(
+              'import { dirname, isAbsolute, join, resolve } from "node:path";\n',
+              'import { isAbsolute, resolve } from "node:path";\n',
+              1,
+          )
+          text = text.replace('import { fileURLToPath } from "node:url";\n', '', 1)
+
+          start = text.index('const LEGACY_REVIEW_SKILLS =')
+          end = text.index('function renderProgress', start)
+          text = text[:start] + text[end:]
+
+          session_prefix = '  pi.on("session_start", (_event, ctx) => {\n'
+          session_start = text.index(session_prefix) + len(session_prefix)
+          terminal_marker = '  ctx.ui.onTerminalInput((data) => {'
+          terminal_start = text.index(terminal_marker, session_start)
+          text = text[:session_start] + '    ctx.ui.onTerminalInput((data) => {' + text[terminal_start + len(terminal_marker):]
+
+          for forbidden in ('removeLegacyReviewSkills', 'LEGACY_REVIEW_SKILLS', 'Removed legacy review skills', 'Could not remove legacy review skills'):
+              if forbidden in text:
+                  raise SystemExit(f'extension still contains {forbidden}')
+          extension_path.write_text(text)
+
+          test_path = Path('dev/pi-code-review/test/extension.test.ts')
+          test_path.write_text('''import { describe, expect, it, vi } from "vitest";
+          import {
+            buildManagedImplementationId,
+            injectReviewResult,
+            validateFindingDispositionInputs,
+          } from "../extensions/code-review.js";
+          import type { ReviewResult } from "../src/types.js";
+
+          const result: ReviewResult = {
+            effort: "medium",
+            status: "complete",
+            summary: "No issues found.",
+            findings: [],
+            failures: [],
+            commented: false,
+            report: "### Code review\\n\\nNo issues found.",
+            usage: [],
+          };
+
+          describe("review extension helpers", () => {
+            it("injects the complete rendered report as a model-visible custom message", () => {
+              const sendMessage = vi.fn();
+              injectReviewResult({ sendMessage }, result);
+              expect(sendMessage).toHaveBeenCalledWith({
+                customType: "code-review-result",
+                content: result.report,
+                display: true,
+                details: result,
+              });
+            });
+
+            it("binds an explicit managed review identity to checkout, branch, and plan path", () => {
+              const first = buildManagedImplementationId("/repo", "feature", "/plans/feature.md");
+              expect(buildManagedImplementationId("/repo", "feature", "/plans/feature.md")).toBe(first);
+              expect(buildManagedImplementationId("/repo", "other", "/plans/feature.md")).not.toBe(first);
+              expect(buildManagedImplementationId("/repo", "feature", "/plans/other.md")).not.toBe(first);
+            });
+
+            it("rejects unknown finding dispositions", () => {
+              expect(() => validateFindingDispositionInputs([{
+                id: "REV-001",
+                disposition: "dismissed" as never,
+              }])).toThrow("Unknown finding disposition");
+            });
+          });
+          '''.replace('          ', ''))
+
+          Path('.github/workflows/pr1-remove-runtime-skill-deletion.yml').unlink(missing_ok=True)
+          PY
+      - name: Install dependencies
+        working-directory: dev/pi-code-review
+        run: npm ci
+      - name: Typecheck and test
+        working-directory: dev/pi-code-review
+        run: npm run check
+      - name: Verify no runtime skill mutation remains
+        run: |
+          ! git grep -nE 'removeLegacyReviewSkills|LEGACY_REVIEW_SKILLS|rm\(skillPath|Removed legacy review skills' -- dev/pi-code-review
+          git diff --check
+      - name: Commit fix
+        run: |
+          git config user.name "Evan Huang"
+          git config user.email "evanhuang117@gmail.com"
+          git add -A
+          git commit -m "Stop code review from mutating installed skills"
+          git push origin HEAD:feat/stateful-code-review-convergence
