@@ -1,0 +1,137 @@
+name: Restore plan-mode boundary
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    if: github.event.head_commit.message != 'Keep plan-mode orchestration unchanged'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-code-review/package-lock.json
+      - name: Restore PLAN, ORCHESTRATOR, YOLO, PREWALK, and verifier behavior
+        run: |
+          git checkout origin/main -- \
+            agents/Plan.md \
+            dev/pi-plan-mode/README.md \
+            dev/pi-plan-mode/index.ts \
+            dev/pi-plan-mode/test/extension.test.mjs \
+            settings.json
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          extension_path = Path('dev/pi-code-review/extensions/code-review.ts')
+          source = extension_path.read_text()
+
+          source, count = re.subn(
+              r'''interface SessionContextLike \{.*?\n\}\n\ninterface ReviewExecutionContext extends SessionContextLike \{\n  readonly signal\?: AbortSignal \| undefined;\n  readonly ui: ReviewUI;\n\}\n\ninterface ContextEventLike \{.*?\n\}\n''',
+              '''interface ReviewExecutionContext {\n  readonly cwd: string;\n  readonly signal?: AbortSignal | undefined;\n  readonly ui: ReviewUI;\n}\n''',
+              source,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f'failed to simplify review execution context: {count}')
+
+          source, count = re.subn(
+              r'''\nconst REVIEW_REMINDER_CUSTOM_TYPE = .*?\nconst REVIEW_TASK = .*?;\n''',
+              '\n',
+              source,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f'failed to remove cross-mode constants: {count}')
+
+          source, count = re.subn(
+              r'''\nfunction branchEntries\(.*?\nfunction reviewTargetIdentity''',
+              '\nfunction reviewTargetIdentity',
+              source,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f'failed to remove plan-mode session readers: {count}')
+
+          old_context = '''function contextAt(ctx: ReviewExecutionContext, cwd: string): ReviewExecutionContext {\n  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.sessionManager ? { sessionManager: ctx.sessionManager } : {}) };\n}\n'''
+          new_context = '''function contextAt(ctx: ReviewExecutionContext, cwd: string): ReviewExecutionContext {\n  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}) };\n}\n'''
+          if source.count(old_context) != 1:
+              raise SystemExit('failed to find contextAt implementation')
+          source = source.replace(old_context, new_context)
+
+          old_plan = '  const planPath = params.planPath?.trim() || latestManagedPlanPath(ctx);\n'
+          if source.count(old_plan) != 1:
+              raise SystemExit('failed to find inferred managed plan path')
+          source = source.replace(old_plan, '  const planPath = params.planPath?.trim();\n')
+
+          source, count = re.subn(
+              r'''\nfunction messageContent\(.*?\nexport default function \(pi: ExtensionAPI\): void \{\n  const activeReviews = new Set<AbortController>\(\);.*?\n  pi\.registerMessageRenderer''',
+              '''\nexport default function (pi: ExtensionAPI): void {\n  const activeReviews = new Set<AbortController>();\n\n  pi.on("session_start", (_event, ctx) => {\n    ctx.ui.onTerminalInput((data) => {\n      if (!matchesKey(data, "escape") || cancelActiveReviews(activeReviews) === 0) return;\n      ctx.ui.notify("Code review canceled.", "warning");\n      return { consume: true };\n    });\n  });\n\n  pi.on("session_shutdown", () => {\n    cancelActiveReviews(activeReviews);\n  });\n\n  pi.registerMessageRenderer''',
+              source,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f'failed to remove cross-mode hooks and Agent interception: {count}')
+
+          old_execute = '''        const sessionManager = (ctx as unknown as SessionContextLike).sessionManager;\n        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}), ...(sessionManager ? { sessionManager } : {}) }, params, activeReviews);\n'''
+          new_execute = '''        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}) }, params, activeReviews);\n'''
+          if source.count(old_execute) != 1:
+              raise SystemExit('failed to find tool execution session-manager bridge')
+          source = source.replace(old_execute, new_execute)
+
+          forbidden = [
+              'latestManagedPlanPath',
+              'latestMode(',
+              'applyReviewAgentPolicy',
+              'REVIEW_REMINDER_CUSTOM_TYPE',
+              'ORCHESTRATOR permits only',
+              'LunaCompliance',
+              'LunaTestVerifier',
+              'pi-plan-mode-plan-context',
+          ]
+          remaining = [item for item in forbidden if item in source]
+          if remaining:
+              raise SystemExit(f'cross-mode integration remains in extension: {remaining}')
+
+          extension_path.write_text(source)
+
+          test_path = Path('dev/pi-code-review/test/extension.test.ts')
+          test_path.write_text('''import { describe, expect, it, vi } from "vitest";\nimport {\n  buildManagedImplementationId,\n  injectReviewResult,\n  validateFindingDispositionInputs,\n} from "../extensions/code-review.js";\nimport type { ReviewResult } from "../src/types.js";\n\nconst result: ReviewResult = {\n  effort: "medium",\n  status: "complete",\n  summary: "No issues found.",\n  findings: [],\n  failures: [],\n  commented: false,\n  report: "### Code review\\n\\nNo issues found.",\n  usage: [],\n};\n\ndescribe("review extension helpers", () => {\n  it("injects the complete rendered report as a model-visible custom message", () => {\n    const sendMessage = vi.fn();\n    injectReviewResult({ sendMessage }, result);\n    expect(sendMessage).toHaveBeenCalledWith({\n      customType: "code-review-result",\n      content: result.report,\n      display: true,\n      details: result,\n    });\n  });\n\n  it("binds an explicit managed review identity to checkout, branch, and plan path", () => {\n    const first = buildManagedImplementationId("/repo", "feature", "/plans/feature.md");\n    expect(buildManagedImplementationId("/repo", "feature", "/plans/feature.md")).toBe(first);\n    expect(buildManagedImplementationId("/repo", "other", "/plans/feature.md")).not.toBe(first);\n    expect(buildManagedImplementationId("/repo", "feature", "/plans/other.md")).not.toBe(first);\n  });\n\n  it("rejects unknown finding dispositions", () => {\n    expect(() => validateFindingDispositionInputs([{\n      id: "REV-001",\n      disposition: "dismissed" as never,\n    }])).toThrow("Unknown finding disposition");\n  });\n});\n''')
+
+          Path('.github/workflows/pr1-restore-plan-mode.yml').unlink(missing_ok=True)
+          PY
+
+      - name: Verify code-review package
+        working-directory: dev/pi-code-review
+        run: |
+          npm ci
+          npm run check
+
+      - name: Verify the PR no longer changes plan-mode orchestration
+        run: |
+          test -z "$(git diff --name-only origin/main -- agents/Plan.md dev/pi-plan-mode settings.json)"
+          ! grep -qE 'latestManagedPlanPath|applyReviewAgentPolicy|LunaCompliance|LunaTestVerifier|pi-plan-mode-plan-context' dev/pi-code-review/extensions/code-review.ts
+
+      - name: Commit the corrected boundary
+        run: |
+          git config user.name "Evan Huang"
+          git config user.email "evanhuang117@gmail.com"
+          git add agents/Plan.md dev/pi-plan-mode settings.json dev/pi-code-review/extensions/code-review.ts dev/pi-code-review/test/extension.test.ts .github/workflows
+          git commit -m "Keep plan-mode orchestration unchanged"
+          git push origin HEAD:feat/stateful-code-review-convergence
