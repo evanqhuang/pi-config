@@ -1,0 +1,92 @@
+name: Apply final managed review safety fixes
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Fix managed review lifecycle safety'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-code-review/package-lock.json
+      - name: Apply lifecycle patch
+        run: |
+          git show 896ee8a0ce0c8fd79efecd8e3d51cb3921b3c3ac:.github/workflows/pr1-final-lifecycle-fixes.yml > /tmp/original-workflow.yml
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          workflow = Path('/tmp/original-workflow.yml').read_text()
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "          PY\n      - name: Install dependencies"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          script = textwrap.dedent(workflow[start:end])
+          old_function = '''def replace_exact(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one occurrence, found {count}")
+              return text.replace(old, new)
+          '''
+          new_function = '''def replace_exact(text: str, old: str, new: str, label: str) -> str:
+              special_patterns = {
+                  "session implementation continuity": re.compile(
+                      r'  const implementationId = managed\\n\\s+\\? inferredImplementationId \\?\\? await managedImplementationId\\(cwd, planPath, params\\.implementationId, commands, ctx\\.signal\\)\\n\\s+: undefined;\\n'
+                  ),
+                  "startup skill cleanup": re.compile(
+                      r'  pi\\.on\\("session_start", \\(_event, ctx\\) => \\{\\n\\s+ctx\\.ui\\.onTerminalInput\\(\\(data\\) => \\{\\n'
+                  ),
+              }
+              pattern = special_patterns.get(label)
+              if pattern is not None:
+                  text, count = pattern.subn(lambda _match: new, text)
+                  if count != 1:
+                      raise SystemExit(f"{label}: expected one regex occurrence, found {count}")
+                  return text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one occurrence, found {count}")
+              return text.replace(old, new)
+          '''
+          if old_function not in script:
+              raise SystemExit('replace_exact function was not found in archived workflow')
+          script = 'import re\n' + script.replace(old_function, new_function, 1)
+          cleanup_line = 'Path(".github/workflows/pr1-final-lifecycle-fixes.yml").unlink(missing_ok=True)'
+          cleanup_replacement = cleanup_line + '\n' + '\n'.join([
+              'Path(".github/workflows/pr1-final-lifecycle-fixes-retry.yml").unlink(missing_ok=True)',
+              'Path(".github/workflows/pr1-final-lifecycle-fixes-final.yml").unlink(missing_ok=True)',
+          ])
+          script = script.replace(cleanup_line, cleanup_replacement, 1)
+          exec(compile(script, '<archived-lifecycle-patch>', 'exec'))
+          PY
+      - name: Install dependencies
+        working-directory: dev/pi-code-review
+        run: npm ci
+      - name: Typecheck and test
+        working-directory: dev/pi-code-review
+        run: npm run check
+      - name: Verify scope and formatting
+        run: |
+          git diff --check
+          test -z "$(git diff --name-only origin/main...HEAD -- agents/Plan.md dev/pi-plan-mode settings.json)"
+      - name: Commit fixes
+        run: |
+          git config user.name "Evan Huang"
+          git config user.email "evanhuang117@gmail.com"
+          git add -A
+          git commit -m "Fix managed review lifecycle safety"
+          git push origin HEAD:feat/stateful-code-review-convergence
