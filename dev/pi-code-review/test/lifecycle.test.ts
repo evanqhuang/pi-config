@@ -63,6 +63,7 @@ function candidateIds(prompt: string): string[] {
 
 class FakeAgents implements ReviewAgentRunner {
   public candidates = true;
+  public candidateSummary = "Exports the wrong value";
   public calls = 0;
 
   public run<T>(invocation: AgentInvocation, validate: (value: unknown) => T): Promise<AgentResult<T>> {
@@ -74,7 +75,7 @@ class FakeAgents implements ReviewAgentRunner {
         id: "exported-value-regression",
         file: "src/a.ts",
         line: 1,
-        summary: "Exports the wrong value",
+        summary: this.candidateSummary,
         failureScenario: "Importing the module returns the wrong value",
         evidence: "The changed line sets the incorrect constant",
         category: "correctness",
@@ -156,6 +157,37 @@ describe("managed review lifecycle", () => {
     expect(approved.ledger?.remediationBatches).toBe(1);
   });
 
+  it("rejects an unknown disposition in the core ledger API", async () => {
+    const { repo, plan } = await fixture();
+    const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
+    const initial = await runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
+    }, dependencies);
+
+    await expect(recordReviewDispositions({
+      cwd: repo,
+      sessionId: initial.sessionId!,
+      reviewedSnapshotHash: initial.reviewedSnapshotHash!,
+      dispositions: [{ id: "REV-001", disposition: "dismissed" as never }],
+    }, dependencies)).rejects.toThrow("Unknown finding disposition");
+  });
+
+  it("rejects dispositions when the approved plan changes after review", async () => {
+    const { repo, plan } = await fixture();
+    const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
+    const initial = await runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
+    }, dependencies);
+    await writeFile(plan, `${await (await import("node:fs/promises")).readFile(plan, "utf8")}\n- Changed contract after review.\n`);
+
+    await expect(recordReviewDispositions({
+      cwd: repo,
+      sessionId: initial.sessionId!,
+      reviewedSnapshotHash: initial.reviewedSnapshotHash!,
+      dispositions: [{ id: "REV-001", disposition: "non-blocking" }],
+    }, dependencies)).rejects.toThrow("approved plan changed");
+  });
+
   it("refuses to advance a managed lifecycle from a dirty worktree", async () => {
     const { repo, plan } = await fixture();
     await writeFile(join(repo, "src", "dirty.ts"), "export {};\n");
@@ -187,10 +219,12 @@ describe("managed review lifecycle", () => {
       await writeFile(join(repo, "src", "a.ts"), `export const value = ${index + 3};\n`);
       git(repo, "add", ".");
       git(repo, "commit", "-m", `remediation ${index + 1}`);
+      agents.candidateSummary = index === 0 ? "Cold import returns the wrong exported value" : "The exported value remains incorrect";
       result = await runManagedReview({
         cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
       }, dependencies);
       expect(result.phase).toBe(expectedPhase);
+      expect(result.findings[0]?.id).toBe("REV-001");
       result = await recordReviewDispositions({
         cwd: repo, sessionId: result.sessionId!, reviewedSnapshotHash: result.reviewedSnapshotHash!,
         dispositions: [{ id: "REV-001", disposition: "confirmed-blocker", parentEvidence: "Still reproduced." }],
