@@ -158,6 +158,40 @@ describe("managed review lifecycle", () => {
     expect(approved.ledger?.remediationBatches).toBe(1);
   });
 
+  it("rejects an unknown session ID instead of silently starting over", async () => {
+    const { repo, plan } = await fixture();
+    const agents = new FakeAgents();
+    const calls = agents.calls;
+    await expect(runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "medium",
+      planPath: plan,
+      sessionId: "deadbeefcafe",
+    }, { commands: new NodeCommandRunner(), agents })).rejects.toThrow("Review session not found");
+    expect(agents.calls).toBe(calls);
+  });
+
+  it("does not let explicit phases repeat the comprehensive initial review", async () => {
+    const { repo, plan } = await fixture();
+    const commands = new NodeCommandRunner();
+    const agents = new FakeAgents();
+    agents.candidates = false;
+    await runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
+    }, { commands, agents });
+    await writeFile(join(repo, "src", "a.ts"), "export const value = 4;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "follow-up change");
+    const calls = agents.calls;
+
+    await expect(runManagedReview({
+      cwd: repo, target: { kind: "current-diff" }, requestedPhase: "initial", effort: "medium", planPath: plan,
+    }, { commands, agents })).rejects.toThrow("next permitted phase is delta");
+    expect(agents.calls).toBe(calls);
+  });
+
   it("rejects an unknown disposition in the core ledger API", async () => {
     const { repo, plan } = await fixture();
     const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
