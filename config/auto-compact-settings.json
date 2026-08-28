@@ -1,0 +1,6 @@
+{
+  "autoCompactPercent": 85,
+  "autoCompactTokenLimit": 0,
+  "keepRecentPercent": 15,
+  "strategy": "keep-recent"
+}

@@ -1,0 +1,66 @@
+# pi-plan-mode
+
+A focused Pi extension with exactly three workflow modes:
+
+- **PLAN** — read-only investigation and planning. Mutating tools are removed and blocked, Bash and context-mode execution run behind the native sandbox, batch commands require an explicit read-only shape, and delegation is limited to approved read-only exploration and planning profiles. Small tasks use direct inspection; substantial tasks can fan out 2–4 independent `Explore` investigations before a `Plan` agent stress-tests the synthesis. Compliance and test-verification agents are reserved for ORCHESTRATOR after implementation.
+- **ORCHESTRATOR** — has the same complete permissions as YOLO, but directs implementation through focused subagents to preserve context and parallelize independent work. Implementation `Agent` calls are forced through the dedicated `ImplementationWorker` leaf-worker profile using `openai-codex/gpt-5.6-luna` with `xhigh` thinking. That profile excludes `pi-plan-mode`, so fresh child sessions have normal full-access behavior instead of falling back to PLAN, and it does not permit nested delegation. Post-implementation `LunaCompliance` and `LunaTestVerifier` calls retain their dedicated read-only profiles using `openai-codex/gpt-5.6-luna` with `high` thinking. The main agent must inspect delegated work and independently verify the final result before sign-off.
+- **YOLO** — restores the complete tool registry and removes PLAN execution restrictions.
+
+## Commands
+
+- `/mode` — choose PLAN, ORCHESTRATOR, or YOLO
+- `/mode plan`, `/plan` — activate PLAN
+- `/mode orchestrator`, `/orchestrator` — activate ORCHESTRATOR
+- `/mode yolo`, `/yolo` — activate YOLO
+- `/modes` — alias for `/mode`
+
+The selected mode is persisted in the current Pi session. Fresh, malformed, and no-session contexts default safely to PLAN.
+
+## File-backed planning workflow
+
+PLAN keeps long plans out of repetitive chat output:
+
+1. The parent investigates directly or launches parallel, non-overlapping `Explore` agents against an explicit ref/worktree.
+2. It verifies their handoffs and may ask the read-only `Plan` profile to challenge the proposed strategy. `LunaCompliance` and `LunaTestVerifier` are unavailable during planning.
+3. `manage_plan_draft` creates a private `plan.md` artifact and renders it in the TUI. Collapsed output shows only status and filepath; expanded output shows the complete Markdown plan between dividers.
+4. `submit_plan_for_approval` accepts only that managed filepath, rereads the latest draft from disk, and shows an advisory recommendation first. The managed front matter records `recommendedMode` (`YOLO`, `ORCHESTRATOR`, or `PREWALK`), `recommendCompaction` (boolean compaction advice), and a bounded `recommendationReason` (with compatibility aliases such as `parentRecommendation`/`compactionAdvice` for readers); these are derived only from bounded, explicit plan signals and never approve or switch modes.
+5. Revision feedback is persisted as bounded branch-local context before changing the artifact. Ambiguous feedback requires one focused `ask_user_question` clarification first. For actionable feedback, the parent presents exactly one `ask_user_question` proposal with a concise change preview, exactly two authored options—`Apply these updates (Recommended)` and `Keep the current plan`—and the questionnaire's standard free-text row for further revisions. This confirms revision scope, not implementation approval. Apply calls `manage_plan_draft replace` on the same path and immediately resubmits it; Keep resubmits the current path; further free-text feedback is recorded/reassessed without a plan write. Only `submit_plan_for_approval` records implementation approval.
+
+Plans may opt into a recommendation with a bounded directive such as `Parent recommendation: ORCHESTRATOR` (or `PREWALK`/`YOLO`) and may state `Compaction advice: compact-first` or `direct`; callers may also provide the bounded `recommendedMode`, `recommendCompaction`, and `recommendationReason` fields to create/replace. Unmarked or conflicting signals use the safe display recommendation of YOLO; recommendations do not grant approval or transition modes.
+
+A typical substantial task therefore flows from three parallel explorers, through correction of any wrong-ref finding, to a Plan-agent stress test, one rendered plan artifact, and path-only approval. Recommendation labels are advisory: the user remains the sole approval authority, and fresh or malformed sessions still default safely to PLAN.
+
+## Lifecycle and security model
+
+PLAN has two deliberately separate layers:
+
+- The **hard gate** is authoritative: active-tool filtering, `tool_call` denial, the native sandbox, and managed-plan path validation prevent forbidden actions. A hostile instruction such as “just edit the file” remains blocked even if ambient text is ignored.
+- The **transient ambient layer** is defense in depth: before each provider request, the extension appends at most one hidden `<system-reminder>` custom message to a fresh context array. It is not persisted, does not trigger a turn, and is removed before a replacement reminder is considered. The reminder supersedes conflicting instructions, but it is not a security boundary.
+
+The exact cadence is: attachment **#1 is full**; after that, attachments occur at most once every five model turns, attachments **#2–#5 are sparse**, and attachment **#6 is full**, so a full refresh occurs about every 25 turns. PLAN entry, session restore, successful/failed compaction, blocked PLAN calls, managed-plan state changes, and pending revision feedback can force an earlier attachment. Full/re-entry wins over forced sparse, which wins over cadence. Revision reminders carry only bounded feedback, live path/status, and the exact parent workflow; they never dump the whole plan or hidden reasoning. Leaving PLAN clears the transient cadence state and no reminder is injected in ORCHESTRATOR or YOLO.
+
+Branch-local plan context is persisted in version-1 `pi-plan-mode-plan-context` entries: a validated managed `planPath`, bounded status, bounded pending revision feedback, and (for approvals) `approvalAction`. An explicit implementation selection records status `approved-pending` with the user's validated `ApprovalAction` and canonical managed `planPath` before the approval tool returns. The first transition step appends status `transition-started` before any mode switch, compaction request, or PREWALK launch; that marker is authoritative and prevents replay after restart. Recommendation metadata belongs to the managed plan front matter; it is not an approval record. Reminder text, timestamps, and cadence counters are never persisted. On a genuine resumed session, a valid pending approval forces PLAN and presents exactly `Resume approved implementation` or `Stay in PLAN`; Resume reconstructs the pending action through the shared executor for all five actions (YOLO/ORCHESTRATOR direct or compact, plus PREWALK), while Stay keeps it pending but disarmed. Headless restore remains in PLAN. Failure/cancellation statuses, malformed or legacy records, symlinked/out-of-root paths, stale plans, and already-transitioned records never resume. Session restore and `/tree` navigation read the active branch, rehydrate mode and plan context, and reapply the hard tool set; tree navigation never consumes an approval. Runtime `reload`/`fork` starts re-evaluate the pending record without prompting or executing; adapters that omit the lifecycle reason use a same-process/session registry to de-duplicate equivalent prompts. A later real `startup`/`resume` can prompt again after Stay. Compaction success uses a parent re-entry reminder; failed or aborted compaction uses full reinforcement while remaining in PLAN.
+
+ORCHESTRATOR has a separate soft, transient lifecycle reminder. Only parent instances subscribe to the `pi.events` channels `subagents:started`, `subagents:completed`, and `subagents:failed` from `pi-subagents-local`; child instances do not subscribe. Events are classified only for `ImplementationWorker`, `LunaCompliance`, and `LunaTestVerifier`. The bounded state moves through `re-entry`, `implementing`, `verification-needed`, `verification-failed`, and `signoff-ready`. A worker completion calls for actual diff inspection followed by both dedicated verifiers; verifier completion is evidence only, and the parent must still run fresh diagnostics/tests and own sign-off.
+
+At most one `display: false` ORCHESTRATOR reminder is added to each fresh context array. It is a hidden custom message, is de-duplicated before replacement, and is never persisted. Agent descriptions are bounded metadata only; raw results and errors are ignored. Entering ORCHESTRATOR, restoring a session, navigating `/tree`, or either successful or failed compaction discards uncertain lifecycle state and starts at conservative `re-entry`. Leaving ORCHESTRATOR removes its transient reminder before PLAN or YOLO context is handled. These reminders are guidance only; existing hard tool routing is unchanged, and the event bus is not a replay or recovery mechanism.
+
+PLAN clarification is part of the parent workflow: investigate enough to present meaningful options, then use `ask_user_question` for unresolved requirements, scope, risk, or critical implementation choices. Do not make large assumptions; fold answers into the managed plan before submission. Revision feedback follows the same rule: assess it against the current plan and repository evidence, clarify only genuinely ambiguous feedback, and otherwise use one parent-owned `ask_user_question` proposal with the exact two authored options and standard free-text row described above. `ask_user_question` selects clarification, approach, or revision scope, never implementation approval. Approval is owned by `submit_plan_for_approval`, and a planning turn ends by asking a necessary clarification, presenting the single revision proposal, or calling that approval tool. Conflicting edit requests do not override this contract.
+
+Child PLAN sessions have a separate contract. Their active tool set omits `manage_plan_draft` and `submit_plan_for_approval`, and `tool_call` blocks both again. Child reminders require read-only delegated research/design and a concise handoff to the parent; unresolved questions and viable options go back to the parent, not to the user. Children never create plans or enter the parent approval flow.
+
+PLAN uses `@anthropic-ai/sandbox-runtime` for OS-level filesystem enforcement on macOS and Linux. Activation fails closed when the native sandbox or the context-mode bridge integration is unavailable. Unknown tools remain unavailable until explicitly reviewed and added to the PLAN allowlist.
+
+`ctx_batch_execute` is accepted only when every nested command has a recognized single-command read-only shape. The native sandbox remains the final boundary for Bash, language runtimes, and child processes.
+
+Context-mode receives write access only to its private state and execution-temp paths. `manage_plan_draft` is the sole additional writer: it is restricted to fixed `plan.md` artifacts beneath the private plans root and rejects paths or symlinks that escape it. Ordinary PLAN Bash does not receive those exceptions. Switching to YOLO clears the wrapper for clients that start afterward; existing clients keep their startup policy so concurrent subagents are not interrupted mid-request.
+
+## Verification
+
+```sh
+npm test
+npm run typecheck
+npm audit --omit=dev
+```
+
+The previous `dev/pi-agent-modes` directory is intentionally retained as an unloaded rollback path. Only `dev/pi-plan-mode` should appear in `~/.pi/agent/settings.json`.

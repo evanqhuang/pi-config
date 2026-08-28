@@ -1,0 +1,218 @@
+{
+  "lastChangelogVersion": "0.84.3",
+  "theme": "dark",
+  "packages": [
+    "npm:@pandi-coding-agent/goal",
+    "npm:pi-prewalk",
+    "dev/pi-plan-mode",
+    "npm:pi-rtk-rewrite",
+    {
+      "source": "npm:pi-playwright",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    },
+    "npm:@juicesharp/rpiv-todo",
+    "npm:@petechu/pi-extension-toggle",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "dev/pi-subagents-local",
+    "npm:pi-lens",
+    "npm:pi-web-access",
+    "npm:context-mode",
+    "npm:@narumitw/pi-usage",
+    {
+      "source": "git:github.com/elpapi42/pi-observational-memory@37986b6faa1e39eb5aa1d03a4ca6379ecaf3148d",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    },
+    "git:github.com/tmustier/pi-auto-compact",
+    "npm:pi-chrome",
+    "npm:pi-vimmode",
+    "dev/pi-code-review",
+    "npm:pi-skill-manager",
+    "npm:pi-btw"
+  ],
+  "defaultProvider": "qwen38-subagent",
+  "defaultModel": "qwen3.8-27b",
+  "enabledModels": [
+    "openai-codex/gpt-5.6-sol",
+    "openai-codex/gpt-5.6-luna",
+    "openai-codex/gpt-5.6-terra"
+  ],
+  "thinkingBudgets": {
+    "low": 4096,
+    "medium": 8192,
+    "high": 16384
+  },
+  "piVimMode": {
+    "keymap": {
+      "motions": {
+        "up": [
+          "k"
+        ],
+        "down": [
+          "j"
+        ]
+      }
+    }
+  },
+  "observational-memory": {
+    "model": {
+      "provider": "qwopus-subagent",
+      "id": "qwopus3.5-9b-coder-mtp",
+      "thinking": "medium"
+    },
+    "showWorkerNotifications": false,
+    "compactAfterTokensMode": "ratio",
+    "compactAfterTokensRatio": 0.55
+  },
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 25000,
+    "keepRecentTokens": 20000
+  },
+  "subagents": {
+    "agentOverrides": {
+      "advisor": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "context-builder": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "write",
+          "web_search",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "delegate": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "edit",
+          "write",
+          "contact_supervisor",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "oracle": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "planner": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "researcher": {
+        "tools": [
+          "read",
+          "write",
+          "web_search",
+          "fetch_content",
+          "get_search_content",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "reviewer": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "edit",
+          "write",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "scout": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "write",
+          "intercom",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      },
+      "worker": {
+        "tools": [
+          "read",
+          "grep",
+          "find",
+          "ls",
+          "bash",
+          "edit",
+          "write",
+          "contact_supervisor",
+          "compress",
+          "decompress",
+          "search_context",
+          "acp_status"
+        ]
+      }
+    }
+  },
+  "extensions": [
+    "+extensions/pr-worktree-guard/index.ts"
+  ]
+}

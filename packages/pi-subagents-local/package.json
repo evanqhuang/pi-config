@@ -1,0 +1,35 @@
+{
+  "name": "pi-subagents-local",
+  "version": "0.18.2-local.0",
+  "private": true,
+  "description": "Local durable-routing variant of @tintinweb/pi-subagents.",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.81.0",
+    "@earendil-works/pi-coding-agent": ">=0.81.0",
+    "@earendil-works/pi-tui": ">=0.81.0"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "croner": "^10.0.1",
+    "nanoid": "^5.1.16"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

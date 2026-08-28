@@ -1,0 +1,11 @@
+{
+  "name": "pi-plan-mode",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": { "test": "node --test test/*.test.mjs", "typecheck": "tsc --noEmit" },
+  "dependencies": { "@anthropic-ai/sandbox-runtime": "0.0.73" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" },
+  "devDependencies": { "typescript": "^5.9.3" }
+}

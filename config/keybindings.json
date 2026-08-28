@@ -1,0 +1,7 @@
+{
+  "app.model.cycleForward": "alt+tab",
+  "app.message.dequeue": "alt+up",
+  "app.thinking.cycle": [],
+  "tui.editor.historyPrevious": "up",
+  "tui.editor.historyNext": "down"
+}

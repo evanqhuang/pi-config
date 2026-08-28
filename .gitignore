@@ -1,0 +1,15 @@
+.DS_Store
+*.log
+
+# Generated local package dependencies and output.
+**/node_modules/
+**/dist/
+**/coverage/
+
+# Pi runtime and private state.
+sessions/
+plans/
+prompt-history.jsonl
+auth.json
+trust.json
+models-store.json
