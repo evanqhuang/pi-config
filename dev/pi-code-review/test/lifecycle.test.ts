@@ -72,7 +72,8 @@ class FakeAgents implements ReviewAgentRunner {
     if (invocation.role === "summary") value = { summary: "Changes one exported value" };
     else if (invocation.role.startsWith("finder:")) value = this.candidates ? {
       candidates: [{
-        id: "exported-value-regression",
+        id: "candidate-1",
+        rootCauseKey: "exports:wrong-value",
         file: "src/a.ts",
         line: 1,
         summary: this.candidateSummary,
