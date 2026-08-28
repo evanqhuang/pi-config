@@ -36,6 +36,16 @@ export type FindingDisposition =
   | "not-reproducible"
   | "resolved";
 
+const FINDING_DISPOSITIONS = new Set<FindingDisposition>([
+  "confirmed-blocker",
+  "non-blocking",
+  "accepted-risk",
+  "product-decision",
+  "follow-up",
+  "not-reproducible",
+  "resolved",
+]);
+
 export interface FindingDispositionInput {
   readonly id: string;
   readonly disposition: FindingDisposition;
@@ -254,6 +264,13 @@ async function baseSha(cwd: string, commands: CommandRunner, signal?: AbortSigna
   return (await command(commands, cwd, "git", ["merge-base", "HEAD", main.trim()], signal)).trim();
 }
 
+async function observedBaseSha(input: ManagedReviewRunInput, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<string> {
+  if (input.target.kind !== "pull-request") return baseSha(input.cwd, dependencies.commands, signal);
+  const snapshot = await captureReviewSnapshot(input.target, input.cwd, dependencies.commands, signal);
+  if (!snapshot.baseSha) throw new Error("Pull-request review could not resolve the current base SHA");
+  return snapshot.baseSha;
+}
+
 async function requireClean(cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<void> {
   if ((await command(commands, cwd, "git", ["status", "--porcelain"], signal)).trim()) {
     throw new Error("Managed review requires a clean committed worktree. Commit the intended implementation or remediation first.");
@@ -314,6 +331,7 @@ function summary(ledger: Ledger): ReviewLedgerSummary {
   return {
     sessionId: ledger.sessionId,
     ...(ledger.implementationId ? { implementationId: ledger.implementationId } : {}),
+    targetIdentity: ledger.targetIdentity,
     phase: ledger.phase,
     decision: ledger.decision,
     baseSha: ledger.baseSha,
@@ -385,7 +403,7 @@ function selectPhase(ledger: Ledger, requested: ManagedReviewRunInput["requested
 function rootKey(finding: VerifiedFinding): string {
   const parts = finding.id.split(":");
   const stable = parts.length > 2 ? parts.slice(1, -1).join(":") : finding.id;
-  return `root:${hash(`${finding.category}|${normalize(stable)}|${normalize(finding.summary)}`).slice(0, 20)}`;
+  return `root:${hash(`${finding.category}|${normalize(stable)}`).slice(0, 20)}`;
 }
 
 function mergeFindings(ledger: Ledger, findings: readonly VerifiedFinding[], head: string, phase: Exclude<ReviewPhase, "audit">): VerifiedFinding[] {
@@ -467,15 +485,21 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
   const plan = await planData(input.planPath, input.contract);
   const implementationId = input.implementationId ?? (plan.planPath ? await deriveImplementationId(input.cwd, plan.planPath, dependencies.commands) : undefined);
   const existing = await findLedger(directory, input.sessionId, implementationId);
-  const initialBase = existing?.ledger.baseSha ?? await baseSha(input.cwd, dependencies.commands, signal);
-  const ledger = existing?.ledger ?? newLedger(root, input.target, initialBase, implementationId, plan);
+  const observedBase = await observedBaseSha(input, dependencies, signal);
+  const ledger = existing?.ledger ?? newLedger(root, input.target, observedBase, implementationId, plan);
   const path = existing?.path ?? pathFor(directory, ledger.sessionId);
 
   return withLock(path, async () => {
     const current = await readLedger(path) ?? ledger;
     if (current.repositoryRoot !== root || current.targetIdentity !== targetIdentity(input.target)
-      || current.planHash !== plan.planHash || current.baseSha !== initialBase) {
-      throw new Error("Existing review state does not match this repository, target, base, or approved plan");
+      || current.planHash !== plan.planHash) {
+      throw new Error("Existing review state does not match this repository, target, or approved plan");
+    }
+    if (current.baseSha !== observedBase) {
+      current.phase = "blocked";
+      current.decision = "blocked";
+      await writeLedger(path, current);
+      return resultFromLedger(current, "The review base changed after the session started; explicit reset is required.");
     }
     if (input.requestedPhase === "auto" && (current.decision === "approve" || current.decision === "comment") && current.lastReviewedHead) {
       const head = input.target.kind === "pull-request"
@@ -508,9 +532,20 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
       effort: phase === "initial" ? input.effort : "low", phase, contract: current.contract, snapshot,
     };
     const pass = await runCodeReview(options, dependencies, signal);
-    const currentHead = input.target.kind === "pull-request"
-      ? (await captureReviewSnapshot(input.target, input.cwd, dependencies.commands, signal)).headSha
-      : (await command(dependencies.commands, snapshot.cwd, "git", ["rev-parse", "HEAD"], signal)).trim();
+    let currentHead: string | undefined;
+    try {
+      if (input.target.kind === "pull-request") {
+        const currentSnapshot = await captureReviewSnapshot(input.target, input.cwd, dependencies.commands, signal);
+        if (currentSnapshot.baseSha !== current.baseSha) {
+          return markIncomplete(path, current, phase, "The pull-request base changed during review");
+        }
+        currentHead = currentSnapshot.headSha;
+      } else {
+        currentHead = (await command(dependencies.commands, snapshot.cwd, "git", ["rev-parse", "HEAD"], signal)).trim();
+      }
+    } catch (error) {
+      return markIncomplete(path, current, phase, error instanceof Error ? error.message : String(error));
+    }
     if (!snapshot.headSha || currentHead !== snapshot.headSha) return markIncomplete(path, current, phase, "The committed target changed during review");
     if (pass.status !== "complete") return markIncomplete(path, current, phase, pass.failures.map((failure) => `${failure.stage}: ${failure.message}`).join("; ") || pass.summary);
     if (phase !== "initial") current.remediationBatches += 1;
@@ -553,9 +588,16 @@ export async function recordReviewDispositions(input: RecordReviewInput, depende
   return withLock(path, async () => {
     const ledger = await readLedger(path);
     if (!ledger) throw new Error(`Review session not found: ${input.sessionId}`);
+    if (ledger.planPath) {
+      const currentPlan = await planData(ledger.planPath);
+      if (currentPlan.planHash !== ledger.planHash) throw new Error("The approved plan changed after review; stale dispositions were not recorded");
+    }
     if (!ledger.awaitingAdjudication || ledger.lastReviewedSnapshotHash !== input.reviewedSnapshotHash) throw new Error("Adjudication is stale or this session is not awaiting it");
     const seen = new Set<string>();
     for (const disposition of input.dispositions) {
+      if (!FINDING_DISPOSITIONS.has(disposition.disposition)) {
+        throw new Error(`Unknown finding disposition for ${disposition.id}: ${String(disposition.disposition)}`);
+      }
       if (seen.has(disposition.id)) throw new Error(`Duplicate disposition for ${disposition.id}`);
       seen.add(disposition.id);
       const finding = ledger.findings.find((item) => item.id === disposition.id);
