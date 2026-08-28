@@ -20,43 +20,48 @@ import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
 import type { ReviewDecision, ReviewPhase, ReviewResult, ReviewTarget } from "../src/types.js";
 
 interface ReviewToolParams {
-  readonly action?: "run" | "record" | "status" | "reset";
-  readonly target?: string;
-  readonly comment?: boolean;
-  readonly effort?: ReviewEffort;
-  readonly model?: string;
-  readonly phase?: "auto" | ReviewPhase;
-  readonly planPath?: string;
-  readonly implementationId?: string;
-  readonly sessionId?: string;
-  readonly reviewedSnapshotHash?: string;
-  readonly dispositions?: readonly FindingDispositionInput[];
-  readonly confirmReset?: boolean;
+  readonly action?: "run" | "record" | "status" | "reset" | undefined;
+  readonly target?: string | undefined;
+  readonly comment?: boolean | undefined;
+  readonly effort?: string | undefined;
+  readonly model?: string | undefined;
+  readonly phase?: "auto" | ReviewPhase | undefined;
+  readonly planPath?: string | undefined;
+  readonly implementationId?: string | undefined;
+  readonly sessionId?: string | undefined;
+  readonly reviewedSnapshotHash?: string | undefined;
+  readonly dispositions?: readonly FindingDispositionInput[] | undefined;
+  readonly confirmReset?: boolean | undefined;
 }
 
 interface ReviewUI {
   notify(message: string, level: "info" | "warning" | "error"): void;
-  setStatus?: (key: string, text: string | undefined) => void;
-  setWorkingMessage?: (message: string | undefined) => void;
+  setStatus?: ((key: string, text: string | undefined) => void) | undefined;
+  setWorkingMessage?: ((message: string | undefined) => void) | undefined;
 }
 
 interface SessionContextLike {
   readonly cwd: string;
   readonly sessionManager?: {
-    getBranch?: () => readonly unknown[];
-    getEntries?: () => readonly unknown[];
-  };
+    getBranch?: (() => readonly unknown[]) | undefined;
+    getEntries?: (() => readonly unknown[]) | undefined;
+  } | undefined;
 }
 
 interface ReviewExecutionContext extends SessionContextLike {
-  readonly signal?: AbortSignal;
+  readonly signal?: AbortSignal | undefined;
   readonly ui: ReviewUI;
+}
+
+interface ContextEventLike {
+  readonly messages: readonly any[];
 }
 
 const REVIEW_REMINDER_CUSTOM_TYPE = "pi-code-review-lifecycle-reminder";
 const PLAN_CONTEXT_TYPE = "pi-plan-mode-plan-context";
 const MODE_STATE_TYPES = new Set(["pi-plan-mode-state", "mode-state"]);
 const IMPLEMENTATION_ALIASES = new Set(["implementationworker", "implementation-worker", "implementation", "worker"]);
+const PLAN_AGENT_TYPES = new Set(["plan", "explore"]);
 const REVIEW_AGENT_TYPES = new Set(["review", "reviewer", "code-review", "compliance", "lunacompliance", "test-verifier", "lunatestverifier"]);
 const REVIEW_TASK = /\b(?:code[- ]?review|review this|review the (?:diff|implementation|pull request|pr)|security review|spec(?:ification)? compliance review|test evidence review)\b/iu;
 const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
@@ -370,11 +375,13 @@ export function applyReviewAgentPolicy(
 ): { block: true; reason: string } | undefined {
   const requestText = agentRequestText(input);
   const requestedType = String(input.subagent_type ?? "").trim().toLowerCase();
-  if (REVIEW_AGENT_TYPES.has(requestedType) || REVIEW_TASK.test(requestText)) {
+  const explicitImplementation = mode === "ORCHESTRATOR" && IMPLEMENTATION_ALIASES.has(requestedType);
+  if (mode === "PLAN" && PLAN_AGENT_TYPES.has(requestedType)) return undefined;
+  if (REVIEW_AGENT_TYPES.has(requestedType) || (REVIEW_TASK.test(requestText) && !explicitImplementation)) {
     return { block: true, reason: "Use code_review as the only review authority; reviewer/compliance/test-verifier subagents are disabled." };
   }
   if (mode === "ORCHESTRATOR") {
-    if (!IMPLEMENTATION_ALIASES.has(requestedType)) {
+    if (!explicitImplementation) {
       return { block: true, reason: "ORCHESTRATOR permits only a bounded ImplementationWorker unit. Use code_review for review work." };
     }
     input.subagent_type = "ImplementationWorker";
@@ -408,7 +415,11 @@ export default function (pi: ExtensionAPI): void {
       };
     });
 
-    pi.on("context", async (event) => {
+    const registerContextHook = pi.on as unknown as (
+      event: "context",
+      handler: (event: ContextEventLike) => Promise<{ messages: readonly any[] }>,
+    ) => void;
+    registerContextHook("context", async (event) => {
       activeMode = latestMode(activeContext);
       const planPath = latestManagedPlanPath(activeContext);
       const ordinaryMessages = event.messages.filter((message) => !isLifecycleReminder(message));
@@ -523,7 +534,7 @@ export default function (pi: ExtensionAPI): void {
     execute: async (_toolCallId, params: ReviewToolParams, signal, _onUpdate, ctx) => {
       try {
         const sessionManager = (ctx as unknown as SessionContextLike).sessionManager;
-        const result = await executeReview({ cwd: ctx.cwd, signal, ui: ctx.ui, ...(sessionManager ? { sessionManager } : {}) }, params, activeReviews);
+        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}), ...(sessionManager ? { sessionManager } : {}) }, params, activeReviews);
         return {
           content: [{ type: "text", text: result.report }],
           details: {
