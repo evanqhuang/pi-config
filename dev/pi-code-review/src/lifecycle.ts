@@ -633,8 +633,9 @@ async function locate(cwd: string, commands: CommandRunner, options: { sessionId
   return findLedger(directory, options.sessionId, implementationId);
 }
 
-function nextAction(ledger: Ledger, stale: boolean): string {
+function nextAction(ledger: Ledger, stale: boolean, planChanged = false): string {
   if (ledger.decision === "blocked") return "Stop for architecture/product attention or explicitly reset the session.";
+  if (planChanged) return "The approved plan changed after review; reapprove it and explicitly reset before another managed review.";
   if (ledger.awaitingAdjudication) return "Inspect candidates and record parent dispositions before editing.";
   if (ledger.decision === "request-changes") return "Apply one coherent remediation commit, then run phase=auto.";
   if (ledger.decision === "incomplete") return "Fix the target/reviewer problem, then retry the same phase.";
@@ -649,8 +650,10 @@ export async function getReviewStatus(cwd: string, dependencies: Pick<ReviewDepe
     ? (await captureReviewSnapshot(options.target, cwd, dependencies.commands, signal)).headSha
     : (await optionalCommand(dependencies.commands, cwd, "git", ["rev-parse", "HEAD"], signal))?.trim();
   const dirty = Boolean((await optionalCommand(dependencies.commands, cwd, "git", ["status", "--porcelain"], signal))?.trim());
-  const stale = dirty || Boolean(currentHead && found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
-  return { ...summary(found.ledger), ...(currentHead ? { currentHead } : {}), stale, nextAction: nextAction(found.ledger, stale) };
+  const currentPlan = options.planPath ? await planData(options.planPath) : undefined;
+  const planChanged = Boolean(options.planPath && currentPlan?.planHash !== found.ledger.planHash);
+  const stale = planChanged || dirty || Boolean(currentHead && found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
+  return { ...summary(found.ledger), ...(currentHead ? { currentHead } : {}), stale, nextAction: nextAction(found.ledger, stale, planChanged) };
 }
 
 export async function resetReviewSession(cwd: string, dependencies: Pick<ReviewDependencies, "commands">, options: { sessionId?: string; implementationId?: string; planPath?: string; confirm: boolean }): Promise<string> {

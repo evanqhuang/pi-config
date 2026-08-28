@@ -229,6 +229,13 @@ describe("managed review lifecycle", () => {
       cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "medium", planPath: plan,
     }, dependencies);
     await writeFile(plan, `${await readFile(plan, "utf8")}\n- Changed contract after review.\n`);
+    const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
+    sessionId: initial.sessionId!,
+    planPath: plan,
+    target: { kind: "current-diff" },
+  });
+  expect(status?.stale).toBe(true);
+  expect(status?.nextAction).toContain("approved plan changed");
 
     await expect(recordReviewDispositions({
       cwd: repo,
