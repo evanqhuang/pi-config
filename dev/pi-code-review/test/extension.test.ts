@@ -40,6 +40,26 @@ describe("review session context", () => {
     expect(worker.subagent_type).toBe("ImplementationWorker");
   });
 
+  it("allows remediation workers to reference confirmed code-review findings", () => {
+    const worker: Record<string, unknown> = {
+      subagent_type: "ImplementationWorker",
+      task: "Fix the two confirmed blockers from code review and run the focused test.",
+    };
+    expect(applyReviewAgentPolicy("ORCHESTRATOR", worker)).toBeUndefined();
+    expect(worker.subagent_type).toBe("ImplementationWorker");
+  });
+
+  it("keeps read-only PLAN stress testing available", () => {
+    expect(applyReviewAgentPolicy("PLAN", {
+      subagent_type: "Plan",
+      task: "Review this implementation plan for missing risks and contract gaps.",
+    })).toBeUndefined();
+    expect(applyReviewAgentPolicy("PLAN", {
+      subagent_type: "Explore",
+      task: "Review the relevant implementation paths and report evidence.",
+    })).toBeUndefined();
+  });
+
   it("rejects unknown finding dispositions instead of treating them as approval", () => {
     expect(() => validateFindingDispositionInputs([{
       id: "REV-001",
