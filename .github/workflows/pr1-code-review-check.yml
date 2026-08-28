@@ -1,0 +1,27 @@
+name: PR 1 code-review package check
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-code-review/package-lock.json
+      - name: Install dependencies
+        working-directory: dev/pi-code-review
+        run: npm ci
+      - name: Typecheck and test
+        working-directory: dev/pi-code-review
+        run: npm run check
