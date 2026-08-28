@@ -1,6 +1,8 @@
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, matchesKey } from "@earendil-works/pi-tui";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { Type } from "typebox";
 import { parseReviewArgs } from "../src/args.js";
 import { cancelActiveReviews, startReviewCancellation } from "../src/cancellation.js";
@@ -165,6 +167,10 @@ export function validateFindingDispositionInputs(dispositions: readonly FindingD
   }
 }
 
+export function buildManagedImplementationId(repositoryRoot: string, branchIdentity: string, planPath = ""): string {
+  return createHash("sha256").update(`${repositoryRoot}|${branchIdentity}|${planPath}`).digest("hex").slice(0, 32);
+}
+
 async function checkedCommand(
   commands: NodeCommandRunner,
   cwd: string,
@@ -177,6 +183,25 @@ async function checkedCommand(
   if (result.truncated) throw new Error(`${name} ${args.join(" ")} output was truncated`);
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `${name} ${args.join(" ")} exited ${result.exitCode}`);
   return result.stdout;
+}
+
+async function managedImplementationId(
+  cwd: string,
+  planPath: string | undefined,
+  supplied: string | undefined,
+  commands: NodeCommandRunner,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (supplied?.trim()) return supplied.trim();
+  const repositoryRoot = await realpath((await checkedCommand(commands, cwd, "git", ["rev-parse", "--show-toplevel"], signal)).trim());
+  const shortRef = (await checkedCommand(commands, cwd, "git", ["rev-parse", "--abbrev-ref", "HEAD"], signal)).trim();
+  const branchIdentity = shortRef === "HEAD"
+    ? (await checkedCommand(commands, cwd, "git", ["rev-parse", "HEAD"], signal)).trim()
+    : shortRef;
+  const canonicalPlan = planPath
+    ? await realpath(isAbsolute(planPath) ? planPath : resolve(cwd, planPath))
+    : "";
+  return buildManagedImplementationId(repositoryRoot, branchIdentity, canonicalPlan);
 }
 
 async function requireManagedTargetCheckout(
@@ -260,10 +285,14 @@ async function executeReview(
     }, dependencies);
   }
 
+  const inferredImplementationId = planPath || params.implementationId?.trim()
+    ? await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal)
+    : undefined;
+
   if (action === "status") {
     const status = await getReviewStatus(cwd, dependencies, {
       ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
-      ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+      ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
       ...(planPath ? { planPath } : {}),
       target,
     }, ctx.signal);
@@ -272,7 +301,7 @@ async function executeReview(
   if (action === "reset") {
     const message = await resetReviewSession(cwd, dependencies, {
       ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
-      ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+      ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
       ...(planPath ? { planPath } : {}),
       confirm: params.confirmReset === true,
     });
@@ -282,6 +311,9 @@ async function executeReview(
   const phase = params.phase ?? "auto";
   if (!["auto", "initial", "delta", "final", "audit"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
   const managed = phase !== "audit" && Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
+  const implementationId = managed
+    ? inferredImplementationId ?? await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal)
+    : undefined;
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   try {
     if (managed) {
@@ -291,7 +323,7 @@ async function executeReview(
         target,
         requestedPhase: phase,
         effort,
-        ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
+        ...(implementationId ? { implementationId } : {}),
         ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
         ...(planPath ? { planPath } : {}),
       }, dependencies, cancellation.signal);
@@ -428,7 +460,8 @@ export default function (pi: ExtensionAPI): void {
       let statusText: string;
       try {
         const commands = new NodeCommandRunner();
-        const status = await getReviewStatus(activeContext.cwd, { commands }, { planPath, target: { kind: "current-diff" } });
+        const implementationId = await managedImplementationId(activeContext.cwd, planPath, undefined, commands);
+        const status = await getReviewStatus(activeContext.cwd, { commands }, { implementationId, planPath, target: { kind: "current-diff" } });
         statusText = status
           ? `Review status: ${status.decision}; phase=${status.phase}; passes=${status.completedPasses}/3; remediation=${status.remediationBatches}/2. ${status.nextAction}`
           : "Review status: not started. After implementation is committed and checks are run, call code_review with phase=auto and the managed plan path.";
