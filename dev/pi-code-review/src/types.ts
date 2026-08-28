@@ -69,6 +69,7 @@ export type FindingSeverity = "critical" | "high" | "medium" | "low";
 
 export interface ReviewCandidate {
   readonly id: string;
+  readonly rootCauseKey: string;
   readonly file: string;
   readonly line: number;
   readonly summary: string;
