@@ -15,8 +15,8 @@ import {
   runManagedReview,
   type FindingDispositionInput,
 } from "../src/lifecycle.js";
-import { resolveReviewTarget } from "../src/targets.js";
-import type { ReviewDecision, ReviewPhase, ReviewResult } from "../src/types.js";
+import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
+import type { ReviewDecision, ReviewPhase, ReviewResult, ReviewTarget } from "../src/types.js";
 
 interface ReviewToolParams {
   readonly action?: "run" | "record" | "status" | "reset";
@@ -58,6 +58,15 @@ const MODE_STATE_TYPES = new Set(["pi-plan-mode-state", "mode-state"]);
 const IMPLEMENTATION_ALIASES = new Set(["implementationworker", "implementation-worker", "implementation", "worker"]);
 const REVIEW_AGENT_TYPES = new Set(["review", "reviewer", "code-review", "compliance", "lunacompliance", "test-verifier", "lunatestverifier"]);
 const REVIEW_TASK = /\b(?:code[- ]?review|review this|review the (?:diff|implementation|pull request|pr)|security review|spec(?:ification)? compliance review|test evidence review)\b/iu;
+const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
+  "confirmed-blocker",
+  "non-blocking",
+  "accepted-risk",
+  "product-decision",
+  "follow-up",
+  "not-reproducible",
+  "resolved",
+]);
 
 function renderProgress(ctx: { ui: ReviewUI }, stage: string, message: string): void {
   const progress = `[${stage}] ${message}`;
@@ -88,13 +97,14 @@ function customEntry(value: unknown): { customType?: string; data?: Record<strin
   };
 }
 
-function latestManagedPlanPath(ctx: SessionContextLike | undefined): string | undefined {
+export function latestManagedPlanPath(ctx: SessionContextLike | undefined): string | undefined {
   for (const raw of [...branchEntries(ctx)].reverse()) {
     const entry = customEntry(raw);
-    if (entry?.customType !== PLAN_CONTEXT_TYPE || typeof entry.data?.planPath !== "string") continue;
-    const status = String(entry.data.status ?? "");
-    if (!["approved-pending", "transition-started", "approved"].includes(status)) continue;
-    return entry.data.planPath;
+    if (entry?.customType !== PLAN_CONTEXT_TYPE) continue;
+    const status = String(entry.data?.status ?? "");
+    const planPath = entry.data?.planPath;
+    if (typeof planPath !== "string") return undefined;
+    return ["approved-pending", "transition-started", "approved"].includes(status) ? planPath : undefined;
   }
   return undefined;
 }
@@ -123,6 +133,63 @@ function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDeci
   };
 }
 
+export function validateFindingDispositionInputs(dispositions: readonly FindingDispositionInput[]): void {
+  for (const disposition of dispositions) {
+    if (!FINDING_DISPOSITIONS.has(disposition.disposition)) {
+      throw new Error(`Unknown finding disposition for ${disposition.id}: ${String(disposition.disposition)}`);
+    }
+  }
+}
+
+async function checkedCommand(
+  commands: NodeCommandRunner,
+  cwd: string,
+  name: string,
+  args: readonly string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const result = await commands.run(name, args, { cwd, signal });
+  if (result.canceled) throw new Error(`${name} ${args.join(" ")} was canceled`);
+  if (result.truncated) throw new Error(`${name} ${args.join(" ")} output was truncated`);
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `${name} ${args.join(" ")} exited ${result.exitCode}`);
+  return result.stdout;
+}
+
+async function requireManagedPrCheckout(
+  ctx: ReviewExecutionContext,
+  target: ReviewTarget,
+  commands: NodeCommandRunner,
+): Promise<Awaited<ReturnType<typeof captureReviewSnapshot>> | undefined> {
+  if (target.kind !== "pull-request") return undefined;
+  const snapshot = await captureReviewSnapshot(target, ctx.cwd, commands, ctx.signal);
+  const status = await checkedCommand(commands, ctx.cwd, "git", ["status", "--porcelain"], ctx.signal);
+  if (status.trim()) throw new Error("Managed pull-request review requires a clean local checkout of the pull-request head.");
+  const localHead = (await checkedCommand(commands, ctx.cwd, "git", ["rev-parse", "HEAD"], ctx.signal)).trim();
+  if (!snapshot.headSha || localHead !== snapshot.headSha) {
+    throw new Error(`Managed pull-request review requires the local checkout at PR head ${snapshot.headSha ?? "unknown"}; current HEAD is ${localHead}.`);
+  }
+  return snapshot;
+}
+
+async function requireCurrentAdjudicationTarget(
+  ctx: ReviewExecutionContext,
+  target: ReviewTarget,
+  params: ReviewToolParams,
+  dependencies: { commands: NodeCommandRunner },
+): Promise<void> {
+  const sessionId = params.sessionId?.trim();
+  if (!sessionId) throw new Error("record requires sessionId");
+  const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId, target }, ctx.signal);
+  if (!status) throw new Error(`Review session not found: ${sessionId}`);
+  if (status.stale) throw new Error("The target changed after review; run the next managed review phase before recording dispositions.");
+  if (target.kind === "pull-request") {
+    const snapshot = await requireManagedPrCheckout(ctx, target, dependencies.commands);
+    if (!snapshot?.pullRequest || snapshot.pullRequest.baseSha !== status.baseSha || snapshot.headSha !== status.lastReviewedHead) {
+      throw new Error("The pull-request base or head changed after review; dispositions for the stale snapshot were not recorded.");
+    }
+  }
+}
+
 async function executeReview(
   ctx: ReviewExecutionContext,
   params: ReviewToolParams,
@@ -139,20 +206,21 @@ async function executeReview(
     ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
     onProgress: (stage: Parameters<typeof renderProgress>[1], message: string) => renderProgress(ctx, stage, message),
   };
+  const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
 
   if (action === "record") {
-    if (!params.sessionId?.trim()) throw new Error("record requires sessionId");
     if (!params.reviewedSnapshotHash?.trim()) throw new Error("record requires reviewedSnapshotHash");
     if (!params.dispositions || params.dispositions.length === 0) throw new Error("record requires at least one finding disposition");
+    validateFindingDispositionInputs(params.dispositions);
+    await requireCurrentAdjudicationTarget(ctx, target, params, dependencies);
     return recordReviewDispositions({
       cwd: ctx.cwd,
-      sessionId: params.sessionId.trim(),
+      sessionId: params.sessionId!.trim(),
       reviewedSnapshotHash: params.reviewedSnapshotHash.trim(),
       dispositions: params.dispositions,
     }, dependencies);
   }
 
-  const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
   if (action === "status") {
     const status = await getReviewStatus(ctx.cwd, dependencies, {
       ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
@@ -178,6 +246,7 @@ async function executeReview(
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   try {
     if (managed) {
+      await requireManagedPrCheckout(ctx, target, commands);
       return runManagedReview({
         cwd: ctx.cwd,
         target,
@@ -390,19 +459,27 @@ export default function (pi: ExtensionAPI): void {
     label: "Code Review",
     description: "Run, adjudicate, inspect, or explicitly reset the bounded initial/delta/final code-review lifecycle. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ description: "run, record, status, or reset; defaults to run" })),
+      action: Type.Optional(Type.Union([Type.Literal("run"), Type.Literal("record"), Type.Literal("status"), Type.Literal("reset")])),
       target: Type.Optional(Type.String({ description: "Pull request number/URL, branch, path, worktree, or omit for current diff" })),
       comment: Type.Optional(Type.Boolean({ description: "Publish only for an explicit one-shot pull-request review" })),
       effort: Type.Optional(Type.String({ description: "Review depth: low, medium, high, xhigh, max, or ultra" })),
       model: Type.Optional(Type.String({ description: "Reviewer model provider/id override" })),
-      phase: Type.Optional(Type.String({ description: "auto, initial, delta, final, or audit" })),
+      phase: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("initial"), Type.Literal("delta"), Type.Literal("final"), Type.Literal("audit")])),
       planPath: Type.Optional(Type.String({ description: "Managed plan path whose review contract and implementation identity should be used" })),
       implementationId: Type.Optional(Type.String({ description: "Stable approved implementation identity" })),
       sessionId: Type.Optional(Type.String({ description: "Review session ID returned by a prior managed run" })),
       reviewedSnapshotHash: Type.Optional(Type.String({ description: "Exact snapshot hash returned by the managed review being adjudicated" })),
       dispositions: Type.Optional(Type.Array(Type.Object({
         id: Type.String(),
-        disposition: Type.String(),
+        disposition: Type.Union([
+          Type.Literal("confirmed-blocker"),
+          Type.Literal("non-blocking"),
+          Type.Literal("accepted-risk"),
+          Type.Literal("product-decision"),
+          Type.Literal("follow-up"),
+          Type.Literal("not-reproducible"),
+          Type.Literal("resolved"),
+        ]),
         parentEvidence: Type.Optional(Type.String()),
         deterministic: Type.Optional(Type.Boolean()),
         contractBasis: Type.Optional(Type.String()),
