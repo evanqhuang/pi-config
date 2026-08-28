@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import registerCodeReview, { applyReviewAgentPolicy, injectReviewResult } from "../extensions/code-review.js";
+import registerCodeReview, {
+  applyReviewAgentPolicy,
+  injectReviewResult,
+  latestManagedPlanPath,
+  validateFindingDispositionInputs,
+} from "../extensions/code-review.js";
 import type { ReviewResult } from "../src/types.js";
 
 const result: ReviewResult = {
@@ -33,6 +38,21 @@ describe("review session context", () => {
     const worker: Record<string, unknown> = { subagent_type: "worker", task: "implement the bounded fix" };
     expect(applyReviewAgentPolicy("ORCHESTRATOR", worker)).toBeUndefined();
     expect(worker.subagent_type).toBe("ImplementationWorker");
+  });
+
+  it("rejects unknown finding dispositions instead of treating them as approval", () => {
+    expect(() => validateFindingDispositionInputs([{
+      id: "REV-001",
+      disposition: "dismissed" as never,
+    }])).toThrow("Unknown finding disposition");
+  });
+
+  it("does not fall back to an older approved plan after a newer terminal plan state", () => {
+    const branch = [
+      { type: "custom", customType: "pi-plan-mode-plan-context", data: { status: "transition-started", planPath: "/plans/old/plan.md" } },
+      { type: "custom", customType: "pi-plan-mode-plan-context", data: { status: "failed", planPath: "/plans/new/plan.md" } },
+    ];
+    expect(latestManagedPlanPath({ cwd: "/repo", sessionManager: { getBranch: () => branch } })).toBeUndefined();
   });
 
   it("registers PLAN and implementation guidance after session startup", async () => {
