@@ -1,0 +1,150 @@
+name: Remove managed PREWALK approval
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Remove PREWALK from managed PLAN approval'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-plan-mode/package-lock.json
+      - name: Remove PREWALK from managed PLAN approval
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(text: str, old: str, new: str, expected: int = 1) -> str:
+              actual = text.count(old)
+              if actual != expected:
+                  raise SystemExit(f"expected {expected} occurrence(s), found {actual}: {old[:120]!r}")
+              return text.replace(old, new)
+
+          index_path = Path("dev/pi-plan-mode/index.ts")
+          index = index_path.read_text()
+          index = replace_exact(
+              index,
+              "YOLO for localized/tightly coupled work, ORCHESTRATOR for independent slices or parallel work, and PREWALK only when guided exploration is specifically useful;",
+              "YOLO for localized/tightly coupled work and ORCHESTRATOR for independent slices or parallel work;",
+          )
+          index = replace_exact(index, '  "Implement with PREWALK": "prewalk",\n', "")
+          index = replace_exact(index, "(YOLO|ORCHESTRATOR|PREWALK)", "(YOLO|ORCHESTRATOR)", 2)
+          index = replace_exact(index, '    { recommendation: "PREWALK" as const, pattern: /(?:^|[\\n*#-])\\s*(?:prewalk|checklist[- ]first|walkthrough[- ]first|guided\\s+exploration)\\b/i, signal: "explicit:prewalk" },\n', "")
+          index = replace_exact(
+              index,
+              '  const recommendedMode = modeValue === "YOLO" || modeValue === "ORCHESTRATOR" || modeValue === "PREWALK"\n',
+              '  const recommendedMode = modeValue === "YOLO" || modeValue === "ORCHESTRATOR"\n',
+          )
+          index = replace_exact(index, '    "PREWALK: runs the external prewalk checklist/executor and does not switch this parent session\'s mode.",\n', "")
+          index = replace_exact(
+              index,
+              'recommendedMode: { type: "string", enum: ["YOLO", "ORCHESTRATOR", "PREWALK"], description: "Optional bounded display recommendation signal; never approval" },',
+              'recommendedMode: { type: "string", enum: ["YOLO", "ORCHESTRATOR"], description: "Optional bounded display recommendation signal; never approval" },',
+          )
+          index_path.write_text(index)
+
+          test_path = Path("dev/pi-plan-mode/test/extension.test.mjs")
+          tests = test_path.read_text()
+          prewalk_block = '''  const prewalkPath = await createDraft("# Prewalk plan\\n\\n1. Guide then execute.");
+          ctx.selections.push("Implement with PREWALK");
+          await approvalTool.execute("approval-prewalk", { planPath: prewalkPath }, undefined, undefined, ctx);
+          await pi.handlers.get("agent_settled")({}, ctx);
+          assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /# Prewalk plan/);
+          assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /full planning chat snapshot/);
+          assert.match(pi.customMessages.at(-1).content, /"final_status": "completed"/);
+          assert.equal(pi.active.includes("write"), false, "PREWALK does not switch the parent session mode");
+
+          writeFileSync(process.env.PI_PREWALK_LAUNCHER, "#!/bin/sh\\ncat >/dev/null\\necho '[prewalk] startup failed' >&2\\nexit 7\\n");
+          chmodSync(process.env.PI_PREWALK_LAUNCHER, 0o700);
+          const failingPrewalkPath = await createDraft("# Failing prewalk");
+          ctx.selections.push("Implement with PREWALK");
+          await approvalTool.execute("approval-prewalk-failure", { planPath: failingPrewalkPath }, undefined, undefined, ctx);
+          await pi.handlers.get("agent_settled")({}, ctx);
+          assert.equal(pi.active.includes("write"), false);
+          assert.match(pi.customMessages.at(-1).content, /PREWALK failed/);
+          assert.match(ctx.notifications.at(-1).message, /no fallback implementation/);
+
+          '''
+          tests = replace_exact(tests, prewalk_block, "")
+          tests = replace_exact(
+              tests,
+              '  assert.match(ctx.selectCalls.at(-1).title, /PREWALK:/);',
+              '  assert.doesNotMatch(ctx.selectCalls.at(-1).title, /PREWALK:/);\n  assert.equal(ctx.selectCalls.at(-1).options.some((option) => /PREWALK/.test(option)), false);',
+          )
+          tests = replace_exact(
+              tests,
+              'test("resume executes each approved action once, including compact callbacks and PREWALK", async (t) => {',
+              'test("resume executes each managed YOLO/ORCHESTRATOR action once, including compact callbacks", async (t) => {',
+          )
+          setup_block = '''  const launcher = join(root, "prewalk");
+          const capture = join(root, "prewalk-task");
+          writeFileSync(launcher, '#!/bin/sh\\ncat > "$PI_PREWALK_CAPTURE"\\nprintf \\'[prewalk] summary {"final_status":"completed"}\\\\n\\' >&2\\n');
+          chmodSync(launcher, 0o700);
+          process.env.PI_PREWALK_LAUNCHER = launcher;
+          process.env.PI_PREWALK_CAPTURE = capture;
+          t.after(() => {
+            delete process.env.PI_PREWALK_LAUNCHER;
+            delete process.env.PI_PREWALK_CAPTURE;
+          });
+
+          '''
+          tests = replace_exact(tests, setup_block, "")
+          tests = replace_exact(tests, '    ["prewalk", undefined],\n', "")
+          branch_block = '''    } else if (action === "prewalk") {
+                assert.equal(readFileSync(capture, "utf8").includes("# prewalk"), true);
+                assert.equal(pi.sentMessages.length, 0);
+          '''
+          tests = replace_exact(tests, branch_block, "")
+          tests = replace_exact(
+              tests,
+              '    assert.equal(pi.sentMessages.length, action === "prewalk" ? 0 : 1, `${action} is idempotent`);',
+              '    assert.equal(pi.sentMessages.length, 1, `${action} is idempotent`);',
+          )
+          test_path.write_text(tests)
+
+          readme_path = Path("dev/pi-plan-mode/README.md")
+          readme = readme_path.read_text()
+          readme = replace_exact(readme, '`recommendedMode` (`YOLO`, `ORCHESTRATOR`, or `PREWALK`)', '`recommendedMode` (`YOLO` or `ORCHESTRATOR`)')
+          readme = replace_exact(readme, '`Parent recommendation: ORCHESTRATOR` (or `PREWALK`/`YOLO`)', '`Parent recommendation: ORCHESTRATOR` (or `YOLO`)')
+          readme = replace_exact(
+              readme,
+              'before any mode switch, compaction request, or PREWALK launch;',
+              'before any mode switch or compaction request;',
+          )
+          readme = replace_exact(
+              readme,
+              'through the shared executor for all five actions (YOLO/ORCHESTRATOR direct or compact, plus PREWALK),',
+              'through the shared executor for all four managed actions (YOLO/ORCHESTRATOR direct or compact),',
+          )
+          readme += '\nManaged plan approval intentionally offers only YOLO and ORCHESTRATOR. PREWALK remains available only as a separately invoked manual tool and is not a managed-plan execution route.\n'
+          readme_path.write_text(readme)
+
+          Path(".github/workflows/pr1-inspect-prewalk.yml").unlink(missing_ok=True)
+          Path(".github/workflows/pr1-remove-managed-prewalk.yml").unlink(missing_ok=True)
+          PY
+      - name: Install plan-mode dependencies
+        working-directory: dev/pi-plan-mode
+        run: npm ci
+      - name: Test and typecheck plan mode
+        working-directory: dev/pi-plan-mode
+        run: npm test && npm run typecheck
+      - name: Commit managed PREWALK removal
+        run: |
+          git config user.name "Evan Huang"
+          git config user.email "evanhuang117@gmail.com"
+          git add dev/pi-plan-mode/index.ts dev/pi-plan-mode/test/extension.test.mjs dev/pi-plan-mode/README.md .github/workflows
+          git commit -m "Remove PREWALK from managed PLAN approval"
+          git push origin HEAD:feat/stateful-code-review-convergence
