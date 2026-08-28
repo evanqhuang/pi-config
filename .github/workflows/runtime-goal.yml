@@ -1,0 +1,35 @@
+name: Runtime goal verification
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/runtime-goal.yml"
+      - "agents/GoalJudge.md"
+      - "dev/pi-goal-local/**"
+      - "dev/pi-runtime-tasks/**"
+      - "settings.json"
+      - "tests/runtime-goal-config.test.mjs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check runtime task package
+        run: |
+          npm install --prefix dev/pi-runtime-tasks
+          npm run check --prefix dev/pi-runtime-tasks
+      - name: Check goal package
+        run: |
+          npm install --prefix dev/pi-goal-local
+          npm run check --prefix dev/pi-goal-local
+      - name: Check configuration migration
+        run: node --test tests/runtime-goal-config.test.mjs

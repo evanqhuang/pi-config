@@ -27,7 +27,14 @@ git clone git@github.com:evanqhuang/pi-config.git ~/.pi/agent
 npm install --prefix ~/.pi/agent/dev/pi-code-review
 npm install --prefix ~/.pi/agent/dev/pi-plan-mode
 npm install --prefix ~/.pi/agent/dev/pi-subagents-local
+npm install --prefix ~/.pi/agent/dev/pi-runtime-tasks
+npm install --prefix ~/.pi/agent/dev/pi-goal-local
 ```
+
+`pi-runtime-tasks-local` manages executing shell and subagent jobs. These runtime
+jobs intentionally remain separate from `rpiv-todo` work items. `pi-goal-local`
+provides the persistent `/goal` loop and uses the existing local subagent runtime
+for its isolated completion judge.
 
 If `~/.pi/agent` already contains runtime state, back it up first, clone the
 repository, and restore only ignored private/runtime files. Do not commit
