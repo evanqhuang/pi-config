@@ -21,6 +21,11 @@ the requested target. Publishing requires explicit user authorization through
 When an approved managed plan is active, pass its `planPath` (or allow the tool
 to discover it from session context) and use `phase=auto`.
 
+For a pull-request target, run the managed lifecycle only from a clean local
+checkout whose `HEAD` exactly matches the PR head. Use the same explicit PR
+target again when recording dispositions or requesting status so base/head
+drift cannot be mistaken for approval.
+
 The lifecycle is fixed:
 
 1. one comprehensive initial review;
@@ -37,7 +42,7 @@ that a candidate is introduced, reachable, impactful, contract-violating, and
 evidenced before it can block.
 
 Record every candidate with `action=record`, the exact session/snapshot values,
-and one disposition:
+the same target used for the run, and one disposition:
 
 - `confirmed-blocker`
 - `non-blocking`
@@ -52,6 +57,10 @@ critical/high findings with high confidence may block. Medium findings block
 only when deterministic and explicitly contract-based. Low, plausible,
 medium/low-confidence, style, speculative, intentional, pre-existing, and
 check-caught concerns do not block.
+
+Record dispositions before editing. If the target or approved plan changed after
+the review, do not record against the stale snapshot; commit the intended state
+and run the next bounded phase.
 
 Fix all confirmed blockers in one coherent remediation commit, run relevant
 checks, and call `code_review` again with `phase=auto`. If the final pass still
