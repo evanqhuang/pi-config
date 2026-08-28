@@ -1,0 +1,771 @@
+name: Apply final code-review lifecycle fixes
+
+on:
+  push:
+    branches:
+      - feat/stateful-code-review-convergence
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Fix managed review lifecycle safety'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-code-review/package-lock.json
+      - name: Patch lifecycle, extension, skill, and tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one occurrence, found {count}")
+              return text.replace(old, new)
+
+          def replace_between(text: str, start: str, end: str, new: str, label: str) -> str:
+              start_index = text.find(start)
+              if start_index < 0:
+                  raise SystemExit(f"{label}: start marker not found")
+              end_index = text.find(end, start_index)
+              if end_index < 0:
+                  raise SystemExit(f"{label}: end marker not found")
+              return text[:start_index] + new + text[end_index:]
+
+          # Types: persist the canonical target and pass bounded open findings into delta/final review.
+          path = Path("dev/pi-code-review/src/types.ts")
+          text = path.read_text()
+          text = replace_exact(
+              text,
+              "  readonly snapshot?: ReviewSnapshot;\n",
+              "  readonly snapshot?: ReviewSnapshot;\n  readonly openFindings?: readonly FindingLedgerEntry[];\n",
+              "types openFindings",
+          )
+          text = replace_exact(
+              text,
+              "  readonly targetIdentity: string;\n",
+              "  readonly target: ReviewTarget;\n  readonly targetIdentity: string;\n",
+              "types ledger target",
+          )
+          path.write_text(text)
+
+          # Lifecycle: durable target identity, safe cross-process lock ownership, exact revalidation,
+          # session-id-only continuity, and open-finding context.
+          path = Path("dev/pi-code-review/src/lifecycle.ts")
+          text = path.read_text()
+          text = replace_exact(text, "const VERSION = 1;", "const VERSION = 2;", "lifecycle version")
+          text = replace_exact(text, "  readonly target: ReviewTarget;\n", "  readonly target?: ReviewTarget;\n", "optional managed target")
+          text = replace_exact(text, "  version: 1;\n  policyVersion: 1;", "  version: 2;\n  policyVersion: 2;", "ledger version")
+          text = replace_exact(
+              text,
+              "  repositoryRoot: string;\n  targetIdentity: string;\n",
+              "  repositoryRoot: string;\n  target: ReviewTarget;\n  targetIdentity: string;\n",
+              "ledger target field",
+          )
+
+          target_helpers = '''function canonicalTarget(target: ReviewTarget): ReviewTarget {
+            switch (target.kind) {
+              case "pull-request": return { kind: "pull-request", value: target.value };
+              case "branch": return { kind: "branch", ref: target.ref };
+              case "worktree": return { kind: "worktree", path: resolve(target.path) };
+              case "path": return { kind: "path", path: target.path };
+              case "current-diff": return { kind: "current-diff" };
+            }
+          }
+
+          function isReviewTarget(value: unknown): value is ReviewTarget {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const target = value as Partial<ReviewTarget>;
+            switch (target.kind) {
+              case "pull-request": return typeof (target as { value?: unknown }).value === "string";
+              case "branch": return typeof (target as { ref?: unknown }).ref === "string";
+              case "worktree":
+              case "path": return typeof (target as { path?: unknown }).path === "string";
+              case "current-diff": return true;
+              default: return false;
+            }
+          }
+
+          '''
+          text = replace_exact(
+              text,
+              "async function command(commands: CommandRunner, cwd: string, name: string, args: readonly string[], signal?: AbortSignal): Promise<string> {",
+              target_helpers + "async function command(commands: CommandRunner, cwd: string, name: string, args: readonly string[], signal?: AbortSignal): Promise<string> {",
+              "target helpers",
+          )
+          text = replace_exact(
+              text,
+              "    || typeof ledger.repositoryRoot !== \"string\" || typeof ledger.targetIdentity !== \"string\"\n    || typeof ledger.baseSha !== \"string\" || !Array.isArray(ledger.findings)) {",
+              "    || typeof ledger.repositoryRoot !== \"string\" || !isReviewTarget(ledger.target) || typeof ledger.targetIdentity !== \"string\"\n    || typeof ledger.baseSha !== \"string\" || !Array.isArray(ledger.findings)) {",
+              "ledger validation",
+          )
+
+          lock_impl = '''export async function withLedgerLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+            const lockPath = `${path}.lock`;
+            if (locks.has(lockPath)) throw new Error("A review operation is already active for this session");
+            locks.add(lockPath);
+            let handle: Awaited<ReturnType<typeof open>> | undefined;
+            let acquired = false;
+            try {
+              for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                  handle = await open(lockPath, "wx", 0o600);
+                  acquired = true;
+                  await handle.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+                  break;
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+                  let stale = false;
+                  try {
+                    const metadata = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
+                    if (Number.isInteger(metadata.pid) && (metadata.pid as number) > 0) {
+                      try { process.kill(metadata.pid as number, 0); }
+                      catch (probeError) { stale = (probeError as NodeJS.ErrnoException).code === "ESRCH"; }
+                    }
+                  } catch {}
+                  if (!stale || attempt > 0) throw new Error("A review operation is already active for this session");
+                  await unlink(lockPath);
+                }
+              }
+              if (!handle) throw new Error("Could not acquire the review session lock");
+              return await fn();
+            } finally {
+              try { await handle?.close(); } catch {}
+              if (acquired) {
+                try { await unlink(lockPath); } catch {}
+              }
+              locks.delete(lockPath);
+            }
+          }
+
+          '''
+          text = replace_between(text, "async function withLock<T>", "function cleanItems", lock_impl, "lock implementation")
+          text = text.replace("withLock(path,", "withLedgerLock(path,")
+
+          derive_impl = '''export async function deriveImplementationId(cwd: string, planPath: string, commands: CommandRunner): Promise<string> {
+            const root = await repositoryRoot(cwd, commands);
+            const canonicalPlan = await realpath(isAbsolute(planPath) ? planPath : resolve(cwd, planPath));
+            const shortRef = (await command(commands, cwd, "git", ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+            const branchIdentity = shortRef === "HEAD"
+              ? (await command(commands, cwd, "git", ["rev-parse", "HEAD"])).trim()
+              : shortRef;
+            return hash(`${root}|${branchIdentity}|${canonicalPlan}`).slice(0, 32);
+          }
+
+          '''
+          text = replace_between(text, "export async function deriveImplementationId", "async function baseSha", derive_impl, "stable implementation id")
+
+          observed_base = '''async function observedBaseSha(target: ReviewTarget, cwd: string, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<string> {
+            if (target.kind !== "pull-request") return baseSha(cwd, dependencies.commands, signal);
+            const snapshot = await captureReviewSnapshot(target, cwd, dependencies.commands, signal);
+            if (!snapshot.baseSha) throw new Error("Pull-request review could not resolve the current base SHA");
+            return snapshot.baseSha;
+          }
+
+          '''
+          text = replace_between(text, "async function observedBaseSha", "async function requireClean", observed_base, "observed base")
+          text = replace_exact(
+              text,
+              "    targetIdentity: ledger.targetIdentity,\n",
+              "    target: ledger.target,\n    targetIdentity: ledger.targetIdentity,\n",
+              "summary target",
+          )
+
+          new_ledger = '''function newLedger(root: string, target: ReviewTarget, base: string, implementationId: string | undefined, plan: Awaited<ReturnType<typeof planData>>): Ledger {
+            const created = new Date().toISOString();
+            const canonical = canonicalTarget(target);
+            const identity = targetIdentity(canonical);
+            const sessionId = hash(`${root}|${identity}|${base}|${implementationId ?? ""}|${plan.planHash ?? ""}`).slice(0, 32);
+            return {
+              version: 2,
+              policyVersion: 2,
+              sessionId,
+              ...(implementationId ? { implementationId } : {}),
+              repositoryRoot: root,
+              target: canonical,
+              targetIdentity: identity,
+              baseSha: base,
+              ...(plan.planPath ? { planPath: plan.planPath } : {}),
+              ...(plan.planHash ? { planHash: plan.planHash } : {}),
+              contract: plan.contract,
+              phase: "initial",
+              decision: "incomplete",
+              completedPasses: 0,
+              remediationBatches: 0,
+              incompleteAttemptsThisPhase: 0,
+              awaitingAdjudication: false,
+              findings: [],
+              createdAt: created,
+              updatedAt: created,
+            };
+          }
+
+          '''
+          text = replace_between(text, "function newLedger", "function selectPhase", new_ledger, "new ledger")
+
+          run_impl = '''async function revalidateManagedSnapshot(
+            target: ReviewTarget,
+            snapshot: ReviewSnapshot,
+            ledger: Ledger,
+            dependencies: ReviewDependencies,
+            signal?: AbortSignal,
+          ): Promise<string | undefined> {
+            try {
+              await requireClean(snapshot.cwd, dependencies.commands, signal);
+              const localHead = (await command(dependencies.commands, snapshot.cwd, "git", ["rev-parse", "HEAD"], signal)).trim();
+              if (!snapshot.headSha || localHead !== snapshot.headSha) return "The local checkout changed or no longer matches the reviewed head";
+              if (target.kind === "branch") {
+                const branchHead = (await command(dependencies.commands, snapshot.cwd, "git", ["rev-parse", `${target.ref}^{commit}`], signal)).trim();
+                if (branchHead !== snapshot.headSha) return "The reviewed branch ref changed during review";
+              }
+              if (target.kind === "pull-request") {
+                const remote = await captureReviewSnapshot(target, snapshot.cwd, dependencies.commands, signal);
+                if (remote.baseSha !== ledger.baseSha) return "The pull-request base changed during review";
+                if (remote.headSha !== snapshot.headSha) return "The pull-request head changed during review";
+              }
+              if (ledger.planPath) {
+                const currentPlan = await planData(ledger.planPath);
+                if (currentPlan.planHash !== ledger.planHash) return "The approved plan changed during review";
+              }
+              return undefined;
+            } catch (error) {
+              return error instanceof Error ? error.message : String(error);
+            }
+          }
+
+          async function approvedHeadStillCurrent(
+            target: ReviewTarget,
+            ledger: Ledger,
+            cwd: string,
+            dependencies: ReviewDependencies,
+            signal?: AbortSignal,
+          ): Promise<boolean> {
+            if (!ledger.lastReviewedHead) return false;
+            const targetCwd = target.kind === "worktree" ? target.path : cwd;
+            await requireClean(targetCwd, dependencies.commands, signal);
+            const localHead = (await command(dependencies.commands, targetCwd, "git", ["rev-parse", "HEAD"], signal)).trim();
+            if (localHead !== ledger.lastReviewedHead) return false;
+            if (target.kind === "branch") {
+              const branchHead = (await command(dependencies.commands, targetCwd, "git", ["rev-parse", `${target.ref}^{commit}`], signal)).trim();
+              if (branchHead !== ledger.lastReviewedHead) return false;
+            }
+            if (target.kind === "pull-request") {
+              const remote = await captureReviewSnapshot(target, targetCwd, dependencies.commands, signal);
+              return remote.baseSha === ledger.baseSha && remote.headSha === ledger.lastReviewedHead;
+            }
+            return true;
+          }
+
+          export async function runManagedReview(input: ManagedReviewRunInput, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewResult> {
+            const root = await repositoryRoot(input.cwd, dependencies.commands, signal);
+            const directory = await stateDirectory(input.cwd, dependencies.commands);
+            const requestedPlan = input.planPath !== undefined || input.contract !== undefined
+              ? await planData(input.planPath, input.contract)
+              : undefined;
+            const requestedImplementationId = input.implementationId
+              ?? (input.planPath ? await deriveImplementationId(input.cwd, input.planPath, dependencies.commands) : undefined);
+            const existing = await findLedger(directory, input.sessionId, requestedImplementationId);
+            if (input.sessionId && !existing) throw new Error(`Review session not found: ${input.sessionId}`);
+            if (existing && input.implementationId && existing.ledger.implementationId !== input.implementationId) {
+              throw new Error("The supplied implementation ID does not match the review session");
+            }
+            const target = canonicalTarget(input.target ?? existing?.ledger.target ?? (() => { throw new Error("Managed review requires a target or existing session ID"); })());
+            if (target.kind === "path") throw new Error("Managed review does not support path-only targets");
+            if (existing && existing.ledger.targetIdentity !== targetIdentity(target)) {
+              throw new Error("The supplied target does not match the review session");
+            }
+            const plan: Awaited<ReturnType<typeof planData>> = requestedPlan
+              ?? (existing?.ledger.planPath
+                ? await planData(existing.ledger.planPath)
+                : existing
+                  ? { contract: existing.ledger.contract }
+                  : await planData(undefined, input.contract));
+            const observedBase = await observedBaseSha(target, input.cwd, dependencies, signal);
+            const ledger = existing?.ledger ?? newLedger(root, target, observedBase, requestedImplementationId, plan);
+            const path = existing?.path ?? pathFor(directory, ledger.sessionId);
+
+            return withLedgerLock(path, async () => {
+              const current = await readLedger(path) ?? ledger;
+              if (current.repositoryRoot !== root || current.targetIdentity !== targetIdentity(target)
+                || current.planHash !== plan.planHash) {
+                throw new Error("Existing review state does not match this repository, target, or approved plan");
+              }
+              if (current.baseSha !== observedBase) {
+                current.phase = "blocked";
+                current.decision = "blocked";
+                await writeLedger(path, current);
+                return resultFromLedger(current, "The review base changed after the session started; explicit reset is required.");
+              }
+              if (input.requestedPhase === "auto" && (current.decision === "approve" || current.decision === "comment")) {
+                try {
+                  if (await approvedHeadStillCurrent(target, current, input.cwd, dependencies, signal)) {
+                    return resultFromLedger(current, "The current committed head is already review-complete.");
+                  }
+                } catch (error) {
+                  return markIncomplete(path, current, current.completedPasses === 0 ? "initial" : current.completedPasses === 1 ? "delta" : "final", error instanceof Error ? error.message : String(error));
+                }
+              }
+              const phase = selectPhase(current, input.requestedPhase);
+              if (phase !== "initial" && current.remediationBatches >= MAX_REMEDIATIONS) {
+                current.phase = "blocked";
+                current.decision = "blocked";
+                await writeLedger(path, current);
+                return resultFromLedger(current, "The two-remediation-batch budget is exhausted.");
+              }
+
+              let snapshot: ReviewSnapshot;
+              try {
+                snapshot = await managedSnapshot({ ...input, target }, phase, current.lastReviewedHead, dependencies, signal);
+              } catch (error) {
+                return markIncomplete(path, current, phase, error instanceof Error ? error.message : String(error));
+              }
+              const beforeError = await revalidateManagedSnapshot(target, snapshot, current, dependencies, signal);
+              if (beforeError) return markIncomplete(path, current, phase, beforeError);
+              const options: ReviewOptions = {
+                cwd: snapshot.cwd,
+                target,
+                comment: false,
+                effort: phase === "initial" ? input.effort : "low",
+                phase,
+                contract: current.contract,
+                snapshot,
+                openFindings: current.findings.filter((finding) => finding.status === "open").slice(0, 3),
+              };
+              const pass = await runCodeReview(options, dependencies, signal);
+              const afterError = await revalidateManagedSnapshot(target, snapshot, current, dependencies, signal);
+              if (afterError) return markIncomplete(path, current, phase, afterError);
+              if (pass.status !== "complete") {
+                return markIncomplete(path, current, phase, pass.failures.map((failure) => `${failure.stage}: ${failure.message}`).join("; ") || pass.summary);
+              }
+              if (phase !== "initial") current.remediationBatches += 1;
+
+              current.phase = phase;
+              current.decision = "awaiting-adjudication";
+              current.completedPasses += 1;
+              current.incompleteAttemptsThisPhase = 0;
+              current.lastReviewedHead = snapshot.headSha;
+              current.lastReviewedSnapshotHash = snapshot.snapshotHash;
+              current.initialReviewedHead ??= snapshot.headSha;
+              const mapped = mergeFindings(current, pass.findings, snapshot.headSha!, phase);
+              current.awaitingAdjudication = mapped.length > 0 || current.findings.some((finding) => finding.status === "open");
+              if (!current.awaitingAdjudication) {
+                current.phase = "approved";
+                current.decision = current.findings.some((finding) => ["non-blocking", "accepted-risk", "product-decision", "follow-up"].includes(finding.status)) ? "comment" : "approve";
+              }
+              await writeLedger(path, current);
+              return {
+                ...pass,
+                findings: mapped,
+                report: managedReport(current.decision, current, phase, mapped),
+                phase,
+                decision: current.decision,
+                sessionId: current.sessionId,
+                reviewedSnapshotHash: snapshot.snapshotHash,
+                ledger: summary(current),
+              };
+            });
+          }
+
+          '''
+          text = replace_between(text, "export async function runManagedReview", "function statusFor", run_impl, "managed review implementation")
+
+          # Revalidate target and plan in the core disposition path, not only the extension wrapper.
+          text = replace_exact(
+              text,
+              "    if (ledger.planPath) {\n      const currentPlan = await planData(ledger.planPath);\n      if (currentPlan.planHash !== ledger.planHash) throw new Error(\"The approved plan changed after review; stale dispositions were not recorded\");\n    }\n",
+              "    const status = await getReviewStatus(input.cwd, dependencies, { sessionId: input.sessionId, target: ledger.target });\n    if (!status || status.stale) throw new Error(\"The target or approved plan changed after review; stale dispositions were not recorded\");\n",
+              "core disposition revalidation",
+          )
+
+          status_impl = '''export async function getReviewStatus(cwd: string, dependencies: Pick<ReviewDependencies, "commands">, options: { sessionId?: string; implementationId?: string; planPath?: string; target?: ReviewTarget }, signal?: AbortSignal): Promise<ReviewStatus | undefined> {
+            const found = await locate(cwd, dependencies.commands, options);
+            if (!found) return undefined;
+            const target = canonicalTarget(options.target ?? found.ledger.target);
+            if (targetIdentity(target) !== found.ledger.targetIdentity) throw new Error("The supplied status target does not match the review session");
+            const targetCwd = target.kind === "worktree" ? target.path : cwd;
+            const localHead = (await command(dependencies.commands, targetCwd, "git", ["rev-parse", "HEAD"], signal)).trim();
+            const dirty = Boolean((await command(dependencies.commands, targetCwd, "git", ["status", "--porcelain"], signal)).trim());
+            let currentHead = localHead;
+            let targetMismatch = false;
+            if (target.kind === "branch") {
+              const branchHead = (await command(dependencies.commands, targetCwd, "git", ["rev-parse", `${target.ref}^{commit}`], signal)).trim();
+              targetMismatch = branchHead !== localHead;
+            } else if (target.kind === "pull-request") {
+              const remote = await captureReviewSnapshot(target, targetCwd, dependencies.commands, signal);
+              currentHead = remote.headSha ?? "";
+              targetMismatch = remote.baseSha !== found.ledger.baseSha || remote.headSha !== localHead;
+            }
+            const planPath = options.planPath ?? found.ledger.planPath;
+            const currentPlan = planPath ? await planData(planPath) : undefined;
+            const planChanged = Boolean(planPath && currentPlan?.planHash !== found.ledger.planHash);
+            const stale = planChanged || dirty || targetMismatch || !currentHead
+              || Boolean(found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
+            return { ...summary(found.ledger), currentHead, stale, nextAction: nextAction(found.ledger, stale, planChanged) };
+          }
+
+          '''
+          text = replace_between(text, "export async function getReviewStatus", "export async function resetReviewSession", status_impl, "status implementation")
+          path.write_text(text)
+
+          # Pipeline: give delta/final reviewers bounded context for open root causes.
+          path = Path("dev/pi-code-review/src/pipeline.ts")
+          text = path.read_text()
+          old = '''function appendReviewContext(summary: string, options: ReviewOptions): string {
+            return [summary, phaseContext(options), contractContext(options.contract)].filter(Boolean).join("\\n\\n");
+          }
+          '''
+          new = '''function openFindingContext(options: ReviewOptions): string {
+            const findings = options.openFindings?.slice(0, 3) ?? [];
+            if (findings.length === 0) return "";
+            return [
+              "Open root causes from the prior managed pass. Re-check these invariants while reviewing the remediation delta; the parent still owns final resolution:",
+              ...findings.map((finding) => `- ${finding.id} [${finding.severity}/${finding.confidence}%] ${finding.impact} — trigger: ${finding.trigger}${finding.contractBasis ? ` — contract: ${finding.contractBasis}` : ""}`),
+            ].join("\\n");
+          }
+
+          function appendReviewContext(summary: string, options: ReviewOptions): string {
+            return [summary, phaseContext(options), contractContext(options.contract), openFindingContext(options)].filter(Boolean).join("\\n\\n");
+          }
+          '''
+          text = replace_exact(text, old, new, "open finding context")
+          path.write_text(text)
+
+          # Extension: session-id-only continuity plus exact, narrowly scoped cleanup of the three ignored legacy skills.
+          path = Path("dev/pi-code-review/extensions/code-review.ts")
+          text = path.read_text()
+          text = replace_exact(
+              text,
+              'import { realpath } from "node:fs/promises";\nimport { isAbsolute, resolve } from "node:path";\n',
+              'import { lstat, realpath, rm } from "node:fs/promises";\nimport { dirname, isAbsolute, join, resolve } from "node:path";\nimport { fileURLToPath } from "node:url";\n',
+              "extension imports",
+          )
+          cleanup = '''
+          const LEGACY_REVIEW_SKILLS = ["review-fix-loop", "review-loop", "review-pr"] as const;
+
+          function defaultAgentRoot(): string {
+            const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+            return configured ? resolve(configured) : resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+          }
+
+          export async function removeLegacyReviewSkills(agentRoot = defaultAgentRoot()): Promise<string[]> {
+            const removed: string[] = [];
+            for (const name of LEGACY_REVIEW_SKILLS) {
+              const skillPath = join(agentRoot, "skills", name);
+              try {
+                const entry = await lstat(skillPath);
+                if (!entry.isDirectory() && !entry.isSymbolicLink()) throw new Error(`Refusing to remove non-directory legacy skill path: ${skillPath}`);
+                await rm(skillPath, { recursive: true, force: true });
+                removed.push(name);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+                throw error;
+              }
+            }
+            return removed;
+          }
+          '''
+          text = replace_exact(text, "]);\n\nfunction renderProgress", "]);\n" + cleanup + "\nfunction renderProgress", "legacy skill cleanup")
+
+          target_resolution_old = '''  const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
+            const cwd = operationCwd(ctx, target);
+            const targetContext = contextAt(ctx, cwd);
+          '''
+          target_resolution_new = '''  let target: ReviewTarget;
+            if (params.target?.trim()) {
+              target = await resolveReviewTarget(params.target.trim(), ctx.cwd, commands, ctx.signal);
+            } else if (params.sessionId?.trim()) {
+              const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId: params.sessionId.trim() }, ctx.signal);
+              if (!status) throw new Error(`Review session not found: ${params.sessionId.trim()}`);
+              target = status.target;
+            } else {
+              target = await resolveReviewTarget(undefined, ctx.cwd, commands, ctx.signal);
+            }
+            const cwd = operationCwd(ctx, target);
+            const targetContext = contextAt(ctx, cwd);
+          '''
+          text = replace_exact(text, target_resolution_old, target_resolution_new, "session target resolution")
+          text = replace_exact(
+              text,
+              '''  const implementationId = managed
+            ? inferredImplementationId ?? await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal)
+            : undefined;
+          ''',
+              '''  const implementationId = managed
+            ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal))
+            : undefined;
+          ''',
+              "session implementation continuity",
+          )
+          text = replace_exact(
+              text,
+              '''  pi.on("session_start", (_event, ctx) => {
+            ctx.ui.onTerminalInput((data) => {
+          ''',
+              '''  pi.on("session_start", (_event, ctx) => {
+            void removeLegacyReviewSkills().then((removed) => {
+              if (removed.length > 0) ctx.ui.notify(`Removed legacy review skills: ${removed.join(", ")}. Reload Pi once to unload any already-discovered copies.`, "info");
+            }).catch((error) => {
+              ctx.ui.notify(`Could not remove legacy review skills: ${error instanceof Error ? error.message : String(error)}`, "warning");
+            });
+            ctx.ui.onTerminalInput((data) => {
+          ''',
+              "startup skill cleanup",
+          )
+          path.write_text(text)
+
+          # Replace the bundled skill with wording that respects the unchanged PLAN verifier workflow.
+          Path("dev/pi-code-review/skills/code-review/SKILL.md").write_text('''---
+          name: code-review
+          description: Use the pi-code-review extension for one-shot reviews or its explicit bounded initial/delta/final managed lifecycle.
+          compatibility: Requires the installed pi-code-review package and gh for pull-request targets.
+          ---
+
+          # Code review
+
+          Use `code_review` as the review engine for this code-review request. Do not recreate its finder fan-out or batched candidate verification in the parent conversation.
+
+          This skill does not replace or disable `pi-plan-mode` orchestration, PREWALK, `LunaCompliance`, or `LunaTestVerifier`. Those existing workflows remain independent.
+
+          ## One-shot review
+
+          For a normal report-only review, call `code_review` once with `action=run` and the requested target. Publishing requires explicit user authorization through `comment=true`.
+
+          ## Managed implementation review
+
+          Managed review is opt-in. Explicitly provide at least one of:
+
+          - `phase=initial|delta|final`
+          - `planPath`
+          - `implementationId`
+          - `sessionId`
+
+          The extension does not discover `pi-plan-mode` state or infer an approved plan from session context.
+
+          The lifecycle is fixed:
+
+          1. one comprehensive initial review;
+          2. one focused remediation-delta review;
+          3. at most one focused final confirmation review.
+
+          The implementation must be committed and the worktree clean before each managed pass. Never request a fourth pass or reset automatically.
+
+          A managed run returns stable finding IDs, a session ID, and an exact reviewed snapshot hash. Treat findings as candidate evidence only. The primary agent must inspect changed lines, guidance, history, tests, and current intent and establish that a candidate is introduced, reachable, impactful, contract-violating, and evidenced before it can block.
+
+          Record every candidate with `action=record`, the exact session/snapshot values, and one disposition:
+
+          - `confirmed-blocker`
+          - `non-blocking`
+          - `accepted-risk`
+          - `product-decision`
+          - `follow-up`
+          - `not-reproducible`
+          - `resolved`
+
+          A confirmed blocker requires concise parent evidence. Critical/high findings with high confidence may block. Medium findings block only when deterministic and explicitly contract-based. Low, plausible, medium/low-confidence, stylistic, speculative, intentional, pre-existing, and check-caught concerns do not block.
+
+          Record dispositions before editing. Fix confirmed blockers in one coherent remediation commit, run relevant checks, and call `code_review` again with `phase=auto` and the returned `sessionId`. If the final pass still has a blocker, stop for architecture or product attention.
+
+          `APPROVE` is a code-review decision only. It does not claim that required project checks ran or replace the parent or existing plan-mode verifier workflows. Use `action=status` to inspect the lifecycle without running reviewers. Use `action=reset` only with explicit user authorization and `confirmReset=true`.
+          ''')
+
+          # Tests.
+          path = Path("dev/pi-code-review/test/lifecycle.test.ts")
+          text = path.read_text()
+          text = replace_exact(
+              text,
+              'import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";',
+              'import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";',
+              "test fs imports",
+          )
+          text = replace_exact(
+              text,
+              'import { getReviewStatus, recordReviewDispositions, runManagedReview } from "../src/lifecycle.js";',
+              'import { getReviewStatus, recordReviewDispositions, runManagedReview, withLedgerLock } from "../src/lifecycle.js";',
+              "test lifecycle imports",
+          )
+          text = replace_exact(
+              text,
+              '''class FakeAgents implements ReviewAgentRunner {
+            public candidates = true;
+            public candidateSummary = "Exports the wrong value";
+            public calls = 0;
+
+            public run<T>(invocation: AgentInvocation, validate: (value: unknown) => T): Promise<AgentResult<T>> {
+              this.calls += 1;
+          ''',
+              '''class FakeAgents implements ReviewAgentRunner {
+            public candidates = true;
+            public candidateSummary = "Exports the wrong value";
+            public calls = 0;
+            public readonly prompts: string[] = [];
+            public onRun?: () => void;
+
+            public run<T>(invocation: AgentInvocation, validate: (value: unknown) => T): Promise<AgentResult<T>> {
+              this.calls += 1;
+              this.prompts.push(invocation.prompt);
+              const onRun = this.onRun;
+              this.onRun = undefined;
+              onRun?.();
+          ''',
+              "fake agent hooks",
+          )
+          text = replace_exact(
+              text,
+              '''    const delta = await runManagedReview({
+              cwd: repo,
+              target: { kind: "current-diff" },
+              requestedPhase: "auto",
+              effort: "medium",
+              planPath: plan,
+            }, dependencies);
+            expect(delta.phase).toBe("delta");
+            expect(delta.decision).toBe("awaiting-adjudication");
+          ''',
+              '''    const delta = await runManagedReview({
+              cwd: repo,
+              requestedPhase: "auto",
+              effort: "medium",
+              sessionId: initial.sessionId,
+            }, dependencies);
+            expect(delta.phase).toBe("delta");
+            expect(delta.decision).toBe("awaiting-adjudication");
+            expect(agents.prompts.some((prompt) => prompt.includes("REV-001") && prompt.includes("Importing the module returns the wrong value"))).toBe(true);
+          ''',
+              "session-only delta",
+          )
+          text = replace_exact(
+              text,
+              '''    const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
+              sessionId: initial.sessionId!,
+              planPath: plan,
+              target: { kind: "current-diff" },
+            });
+          ''',
+              '''    const status = await getReviewStatus(repo, { commands: dependencies.commands }, {
+              sessionId: initial.sessionId!,
+            });
+          ''',
+              "session-only stale plan status",
+          )
+          text = replace_exact(
+              text,
+              '''    const status = await getReviewStatus(repo, { commands }, { planPath: plan, target: { kind: "current-diff" } });
+          ''',
+              '''    const status = await getReviewStatus(repo, { commands }, { sessionId: approved.sessionId! });
+          ''',
+              "session-only dirty status",
+          )
+          insertion = '''
+            it("does not delete a live lock owned by another process", async () => {
+              const root = await mkdtemp(join(tmpdir(), "pi-code-review-lock-"));
+              roots.push(root);
+              const ledgerPath = join(root, "session.json");
+              const lockPath = `${ledgerPath}.lock`;
+              await writeFile(lockPath, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+              await expect(withLedgerLock(ledgerPath, async () => undefined)).rejects.toThrow("already active");
+              await expect(access(lockPath)).resolves.toBeUndefined();
+            });
+
+            it("invalidates a pass when the local committed head changes during review", async () => {
+              const { repo, plan } = await fixture();
+              const commands = new NodeCommandRunner();
+              const agents = new FakeAgents();
+              agents.onRun = () => {
+                writeFileSync(join(repo, "src", "a.ts"), "export const value = 99;\\n");
+                git(repo, "add", ".");
+                git(repo, "commit", "-m", "concurrent local change");
+              };
+              const result = await runManagedReview({
+                cwd: repo,
+                target: { kind: "current-diff" },
+                requestedPhase: "auto",
+                effort: "medium",
+                planPath: plan,
+              }, { commands, agents });
+              expect(result.status).toBe("incomplete");
+              expect(result.ledger?.completedPasses).toBe(0);
+              expect(result.report).toMatch(/checkout changed|reviewed head/i);
+            });
+          '''
+          # Add writeFileSync import and append tests before the final describe close.
+          text = replace_exact(
+              text,
+              'import { execFileSync } from "node:child_process";',
+              'import { execFileSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";',
+              "writeFileSync import",
+          )
+          last = text.rfind("\n});\n")
+          if last < 0:
+              raise SystemExit("lifecycle test: closing marker not found")
+          text = text[:last] + insertion + text[last:]
+          path.write_text(text)
+
+          path = Path("dev/pi-code-review/test/extension.test.ts")
+          text = path.read_text()
+          text = replace_exact(
+              text,
+              'import { describe, expect, it, vi } from "vitest";\n',
+              'import { mkdir, mkdtemp, writeFile } from "node:fs/promises";\nimport { tmpdir } from "node:os";\nimport { join } from "node:path";\nimport { describe, expect, it, vi } from "vitest";\n',
+              "extension test imports",
+          )
+          text = replace_exact(
+              text,
+              '''  buildManagedImplementationId,
+            injectReviewResult,
+            validateFindingDispositionInputs,
+          ''',
+              '''  buildManagedImplementationId,
+            injectReviewResult,
+            removeLegacyReviewSkills,
+            validateFindingDispositionInputs,
+          ''',
+              "cleanup helper import",
+          )
+          extension_test = '''
+
+            it("removes only the three legacy local review skills", async () => {
+              const root = await mkdtemp(join(tmpdir(), "pi-code-review-skills-"));
+              for (const name of ["review-fix-loop", "review-loop", "review-pr", "keep-me"]) {
+                await mkdir(join(root, "skills", name), { recursive: true });
+                await writeFile(join(root, "skills", name, "SKILL.md"), name);
+              }
+              expect(await removeLegacyReviewSkills(root)).toEqual(["review-fix-loop", "review-loop", "review-pr"]);
+              await expect(removeLegacyReviewSkills(root)).resolves.toEqual([]);
+              await expect(import("node:fs/promises").then(({ access }) => access(join(root, "skills", "keep-me", "SKILL.md")))).resolves.toBeUndefined();
+            });
+          '''
+          last = text.rfind("\n});\n")
+          if last < 0:
+              raise SystemExit("extension test: closing marker not found")
+          text = text[:last] + extension_test + text[last:]
+          path.write_text(text)
+
+          Path(".github/workflows/pr1-final-lifecycle-fixes.yml").unlink(missing_ok=True)
+          PY
+      - name: Install dependencies
+        working-directory: dev/pi-code-review
+        run: npm ci
+      - name: Typecheck and test
+        working-directory: dev/pi-code-review
+        run: npm run check
+      - name: Verify scope and formatting
+        run: |
+          git diff --check
+          test -z "$(git diff --name-only origin/main...HEAD -- agents/Plan.md dev/pi-plan-mode settings.json)"
+      - name: Commit fixes
+        run: |
+          git config user.name "Evan Huang"
+          git config user.email "evanhuang117@gmail.com"
+          git add -A
+          git commit -m "Fix managed review lifecycle safety"
+          git push origin HEAD:feat/stateful-code-review-convergence
