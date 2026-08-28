@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -70,6 +70,50 @@ describe("disposable manager worktree terminal paths", () => {
     expect(() => spawnDisposable(manager, root)).toThrow("runner startup failed");
     expect(worktrees(root)).toBe(before);
     expect(manager.listAgents()).toHaveLength(0);
+    await manager.dispose();
+  });
+
+  it("aborts and releases a disposable verifier when onSpawned throws", async () => {
+    const root = repository();
+    const before = worktrees(root);
+    let failedId!: string;
+    let failedRecord: any;
+    let failedWorktreePath!: string;
+    let aborted = false;
+    mocks.runAgent.mockImplementation(async (_ctx: unknown, _type: string, _prompt: string, options: any) => {
+      const child = session(options);
+      return new Promise(resolve => {
+        options.signal.addEventListener("abort", () => {
+          aborted = true;
+          resolve({ responseText: "stopped", session: child, aborted: true, steered: false });
+        }, { once: true });
+      });
+    });
+    const complete = vi.fn();
+    const manager = new AgentManager(complete, 1);
+
+    expect(() => manager.spawn({} as any, { cwd: root } as any, "LunaTestVerifier", "verify", {
+      description: "verify tests",
+      isBackground: true,
+      onSpawned: id => {
+        failedId = id;
+        failedRecord = manager.getRecord(id);
+        failedWorktreePath = failedRecord.worktree.path;
+        throw new Error("output wiring failed");
+      },
+    })).toThrow("output wiring failed");
+
+    expect(aborted).toBe(true);
+    expect(failedRecord).toBeDefined();
+    expect(manager.getRecord(failedId)).toBeUndefined();
+    expect(manager.listAgents()).toHaveLength(0);
+    expect(existsSync(failedWorktreePath)).toBe(false);
+    expect(worktrees(root)).toBe(before);
+    expect((manager as any).runningBackground).toBe(0);
+    expect((manager as any).queue).toHaveLength(0);
+    expect(complete).not.toHaveBeenCalled();
+
+    await failedRecord.promise;
     await manager.dispose();
   });
 

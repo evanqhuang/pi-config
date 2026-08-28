@@ -1,36 +1,34 @@
 # Pi configuration
 
-Version-controlled custom Pi configuration, extensions, agent profiles, and
-local Pi packages.
+Version-controlled Pi configuration, extensions, agent profiles, and local Pi
+packages. The repository is designed to live directly at `~/.pi/agent`, so the
+tracked tree is the active Pi installation rather than a separately copied
+mirror.
 
 ## Repository layout
 
-| Repository path | Pi location |
+| Repository path | Purpose |
 | --- | --- |
-| `config/` | `~/.pi/agent/` |
-| `agents/` | `~/.pi/agent/agents/` |
-| `extensions/` | `~/.pi/agent/extensions/` |
-| `packages/` | `~/.pi/agent/dev/` |
-| `tests/` | Focused tests for the custom extensions |
+| `agents/` | Global agent profiles |
+| `dev/` | Local Pi packages and extensions under development |
+| `extensions/` | Standalone Pi extensions |
+| `tests/` | Focused integration tests for custom extensions |
+| Root JSON files | Pi settings and extension configuration |
 
-The checked-in `config/settings.json` references the local packages under
-`~/.pi/agent/dev/`:
+Generated dependencies, credentials, sessions, plans, history, caches, backups,
+and other machine-local runtime state are excluded by `.gitignore`.
 
-- `pi-code-review`
-- `pi-plan-mode`
-- `pi-subagents-local`
+## Installing on another machine
 
-## Restoring on another machine
-
-Copy or symlink each repository directory to the matching location in the
-mapping above, then install dependencies in each local package:
+Clone directly into the Pi agent directory, then install package dependencies:
 
 ```sh
+git clone git@github.com:evanqhuang/pi-config.git ~/.pi/agent
 npm install --prefix ~/.pi/agent/dev/pi-code-review
 npm install --prefix ~/.pi/agent/dev/pi-plan-mode
 npm install --prefix ~/.pi/agent/dev/pi-subagents-local
 ```
 
-Pi's generated and private state is intentionally not tracked: authentication,
-trusted-project state, session/history/plan data, model catalog caches, and
-installed dependency directories.
+If `~/.pi/agent` already contains runtime state, back it up first, clone the
+repository, and restore only ignored private/runtime files. Do not commit
+credentials, session history, managed plans, caches, or generated dependencies.

@@ -35,8 +35,8 @@ function installTabThinkingHook(): TabThinkingState {
 	prototype.__hostelhawkTabThinkingState = state;
 	prototype.handleInput = function (this: CustomEditor, data: string): void {
 		const normalizedData = normalizeTerminalInput(data);
-		if (state.cycle && matchesKey(normalizedData, "tab") && this.getText().trim().length === 0) {
-			state.cycle();
+		if (matchesKey(normalizedData, "tab") && this.getText().trim().length === 0) {
+			state.cycle?.();
 			return;
 		}
 

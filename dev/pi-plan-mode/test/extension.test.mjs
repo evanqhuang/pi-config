@@ -366,11 +366,24 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   }
   const orchestratorStart = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
   assert.match(orchestratorStart.systemPrompt, /ORCHESTRATOR MODE IS ACTIVE/);
+  assert.match(orchestratorStart.systemPrompt, /Each delegated implementation unit must fit comfortably in one fresh worker context without compaction/);
+  assert.match(orchestratorStart.systemPrompt, /normally one objective, one subsystem boundary, no more than 3-5 closely related implementation files plus focused tests, and one focused verification command/);
+  assert.match(orchestratorStart.systemPrompt, /Do not bundle discovery, design, implementation, testing, and review into one worker/);
+  assert.match(orchestratorStart.systemPrompt, /Dependent units run sequentially only after the prerequisite handoff is inspected and its contract\/tests pass/);
+  assert.match(orchestratorStart.systemPrompt, /Parallelize only truly independent units with disjoint files and no dependency edge/);
+  assert.match(orchestratorStart.systemPrompt, /If scope expands or a worker approaches its context limit or needs compaction, the worker must stop with a concise handoff; the parent starts a fresh worker for the next unit rather than extending or resuming a context-heavy session/);
+  assert.match(orchestratorStart.systemPrompt, /The parent owns integration and must avoid overlapping ownership/);
   assert.match(orchestratorStart.systemPrompt, /verify the complete result/i);
   assert.match(orchestratorStart.systemPrompt, /ImplementationWorker leaf-worker profile/);
   assert.match(orchestratorStart.systemPrompt, /cannot create, launch, steer, or wait on subagents/);
   assert.match(orchestratorStart.systemPrompt, /After the approved plan has been implemented, use LunaCompliance/);
   assert.match(orchestratorStart.systemPrompt, /use LunaTestVerifier to independently inspect/);
+  assert.match(orchestratorStart.systemPrompt, /Every verifier delegation names the exact absolute target roots and ref\/snapshot/);
+  assert.match(orchestratorStart.systemPrompt, /every substantive citation, cwd, and source metadata is under those roots and on the requested ref/);
+  assert.match(orchestratorStart.systemPrompt, /off-root, mirror, stale-copy, or wrong-ref report is invalid evidence and must not trigger edits or a fix loop/);
+  assert.match(orchestratorStart.systemPrompt, /On provenance failure, inspect the requested live paths directly, explain why the report is invalid, and do not automatically relaunch a verifier merely to obtain PASS/);
+  assert.match(orchestratorStart.systemPrompt, /A new verifier is justified only after actual implementation changes require fresh evidence or the user explicitly requests a corrected rerun/);
+  assert.match(orchestratorStart.systemPrompt, /Scope findings to approved criteria\/non-goals; classify out-of-scope suggestions instead of fixing them/);
   assert.equal(pi.handlers.get("user_bash")({}, ctx), undefined);
 
   const orchestratorReminder = () => pi.handlers.get("context")({ messages: [] });

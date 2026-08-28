@@ -6,10 +6,17 @@
 **/dist/
 **/coverage/
 
-# Pi runtime and private state.
-sessions/
-plans/
-prompt-history.jsonl
-auth.json
-trust.json
-models-store.json
+# Pi runtime, private state, and machine-local installations.
+/sessions/
+/plans/
+/prompt-history.jsonl
+/auth.json
+/trust.json
+/models-store.json
+/.billion-context-pi-update-check
+/*.acp-bak
+/extension-tests/
+/git/
+/npm/
+/skills/
+/.worktrees/

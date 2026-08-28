@@ -405,6 +405,10 @@ export class AgentManager {
    * settles after receiving an abort, especially during shutdown.
    */
   private disposableCleanupPromises = new Map<string, Promise<void>>();
+  /** Pool slots released while a run promise is still settling. */
+  private releasedPoolSlots = new WeakSet<AgentRecord>();
+  /** Fresh runs whose caller wiring failed in onSpawned. */
+  private failedSpawnCallbacks = new WeakSet<AgentRecord>();
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -751,8 +755,7 @@ export class AgentManager {
       // release both the acquired slot and any disposable worktree before the
       // error reaches the caller or queued-record error path.
       cleanupAgentWorktree();
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
+      this.releasePoolSlot(record, pool);
       throw error;
     }
 
@@ -777,8 +780,7 @@ export class AgentManager {
     if ((record as AgentRecord).status === "stopped") {
       detach();
       cleanupAgentWorktree();
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
+      this.releasePoolSlot(record, pool);
       return;
     }
 
@@ -868,7 +870,16 @@ export class AgentManager {
           }
           record.pendingSteers = undefined;
         }
-        options.onSessionCreated?.(session);
+        try {
+          options.onSessionCreated?.(session);
+        } finally {
+          // onSpawned runs before a real runner's session is created. If its
+          // callback failed, stop and dispose a session that arrives later.
+          if (this.failedSpawnCallbacks.has(record)) {
+            try { session.abort?.(); } catch { /* ignore */ }
+            void shutdownChildSession(session);
+          }
+        }
         },
       });
       if (!runPromise || typeof runPromise.then !== "function") {
@@ -881,8 +892,7 @@ export class AgentManager {
       detach();
       cleanupAgentWorktree();
       void shutdownChildSession(record.session);
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
+      this.releasePoolSlot(record, pool);
       throw error;
     }
 
@@ -963,16 +973,47 @@ export class AgentManager {
     // Used by spawnAndWait to let the caller set up output files before streaming
     // starts. Read off the options, so a spawn that started from a queue drain
     // still reaches the caller that queued it.
-    options.onSpawned?.(id);
+    try {
+      options.onSpawned?.(id);
+    } catch (error) {
+      // The callback runs after the run and its worktree have started. Treat a
+      // wiring failure as a failed spawn: stop the run, synchronously discard a
+      // disposable checkout, release its slot, and hide the record. The runner
+      // promise may still settle later, so settleRun has an idempotent release
+      // guard and suppresses completion for this failed invocation.
+      this.failedSpawnCallbacks.add(record);
+      detach();
+      this.abort(id);
+      if (record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* ignore */ }
+        record.outputCleanup = undefined;
+      }
+      this.cleanupDisposableRecord(record);
+      this.disposableCleanupPromises.delete(record.id);
+      this.abortOwnedChildren(id);
+      void shutdownChildSession(record.session);
+      this.releasePoolSlot(record, pool);
+      this.agents.delete(id);
+      this.drainQueue();
+      throw error;
+    }
+  }
+
+  /** Release a charged pool slot at most once, including early teardown paths. */
+  private releasePoolSlot(record: AgentRecord, pool: Pool | undefined): void {
+    if (this.releasedPoolSlots.has(record)) return;
+    this.releasedPoolSlots.add(record);
+    if (pool === "background") this.runningBackground--;
+    else if (pool === "foreground") this.runningForeground--;
   }
 
   /**
    * The shared tail of both settle paths: release whatever pool slot the run
    * held, notify, and let the queue drain into the freed slot.
    *
-   * The decrement lives HERE and nowhere else. `abort()` on a running record
-   * only fires its controller and leaves the run to settle normally, so
-   * decrementing there too would double-free — permanently lifting the limit.
+   * Pool release is idempotent because the onSpawned failure path can tear
+   * down a run before its promise settles; a later settle must not double-free
+   * the limit.
    *
    * Foreground agents fire `onComplete` for lifecycle symmetry, with
    * `resultConsumed` set so the callback skips notifications the inline result
@@ -986,8 +1027,12 @@ export class AgentManager {
    */
   private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
     if (!record.isBackground) record.resultConsumed = true;
-    if (pool === "background") this.runningBackground--;
-    else if (pool === "foreground") this.runningForeground--;
+    this.releasePoolSlot(record, pool);
+
+    // A throwing onSpawned callback already hid this record and performed its
+    // completion-side teardown. Its promise is still allowed to settle so the
+    // runner can stop cleanly, but it must not notify or drain a second time.
+    if (this.failedSpawnCallbacks.has(record)) return;
 
     if (guardCallback) {
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }

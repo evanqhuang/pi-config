@@ -58,3 +58,26 @@ test("plain Tab cycles thinking for empty and whitespace-only editor text", asyn
 		{ data: normalizedAltTab, text: "" },
 	]);
 });
+
+test("empty Tab is consumed while the thinking callback is unavailable", async () => {
+	const jiti = createPiImporter();
+	const [{ default: registerTabThinking }, { CustomEditor }] = await Promise.all([
+		jiti.import("/Users/evanhuang/.pi/agent/extensions/tab-thinking.ts"),
+		jiti.import("@earendil-works/pi-coding-agent"),
+	]);
+
+	registerTabThinking({ on() {} });
+
+	const state = CustomEditor.prototype.__hostelhawkTabThinkingState;
+	assert.ok(state, "Tab-thinking hook should be installed");
+
+	state.cycle = undefined;
+	let delegated = false;
+	state.originalHandleInput = function () {
+		delegated = true;
+	};
+
+	CustomEditor.prototype.handleInput.call({ getText: () => "" }, "\t");
+
+	assert.equal(delegated, false, "empty Tab must not reach the original editor handler");
+});

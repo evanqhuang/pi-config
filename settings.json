@@ -33,7 +33,8 @@
     "npm:pi-vimmode",
     "dev/pi-code-review",
     "npm:pi-skill-manager",
-    "npm:pi-btw"
+    "npm:pi-btw",
+    "npm:@upstash/context7-pi"
   ],
   "defaultProvider": "qwen38-subagent",
   "defaultModel": "qwen3.8-27b",

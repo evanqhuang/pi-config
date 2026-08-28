@@ -13,7 +13,7 @@ import {
 	rewriteShellCommand,
 	selectMatchingWorktree,
 	shellQuote,
-} from "../extensions/pr-worktree-guard/core.ts";
+} from "../../extensions/pr-worktree-guard/core.ts";
 
 test("extracts and deduplicates canonical GitHub pull request URLs", () => {
 	assert.deepEqual(
