@@ -79,7 +79,7 @@ function resultWithoutSnapshot(status: ReviewResult["status"], message: string, 
 function candidateWithFinder(candidate: FinderOutput["candidates"][number], finder: string, index: number): ReviewCandidate {
   return {
     ...candidate,
-    id: `${finder}:${candidate.id}:${index}`,
+    id: `${finder}:${candidate.rootCauseKey}:${index}`,
     finder,
   };
 }
