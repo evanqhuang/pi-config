@@ -480,6 +480,7 @@ async function markIncomplete(path: string, ledger: Ledger, phase: Exclude<Revie
 }
 
 export async function runManagedReview(input: ManagedReviewRunInput, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewResult> {
+  if (input.target.kind === "path") throw new Error("Managed review does not support path-only targets");
   const root = await repositoryRoot(input.cwd, dependencies.commands, signal);
   const directory = await stateDirectory(input.cwd, dependencies.commands);
   const plan = await planData(input.planPath, input.contract);
@@ -605,6 +606,10 @@ export async function recordReviewDispositions(input: RecordReviewInput, depende
       if (disposition.disposition === "confirmed-blocker" && !blockerAllowed(finding, disposition)) {
         throw new Error(`${finding.id} does not meet the blocker evidence/severity gate`);
       }
+      if (disposition.disposition === "resolved"
+        && (finding.status !== "open" || ledger.completedPasses < 2 || !text(disposition.parentEvidence, 2_000))) {
+        throw new Error(`${finding.id} can be resolved only after an open blocker has a reviewed remediation and parent evidence`);
+      }
       finding.status = statusFor(disposition.disposition);
       if (disposition.parentEvidence) finding.parentEvidence = text(disposition.parentEvidence, 2_000);
       if (disposition.contractBasis) finding.contractBasis = text(disposition.contractBasis);
@@ -639,7 +644,7 @@ function nextAction(ledger: Ledger, stale: boolean): string {
   if (ledger.awaitingAdjudication) return "Inspect candidates and record parent dispositions before editing.";
   if (ledger.decision === "request-changes") return "Apply one coherent remediation commit, then run phase=auto.";
   if (ledger.decision === "incomplete") return "Fix the target/reviewer problem, then retry the same phase.";
-  if (stale) return "The committed head changed; run phase=auto.";
+  if (stale) return "The target changed or the worktree is dirty; commit the intended state and run phase=auto.";
   return "The reviewed committed head is complete; run required project checks before sign-off.";
 }
 
@@ -649,7 +654,8 @@ export async function getReviewStatus(cwd: string, dependencies: Pick<ReviewDepe
   const currentHead = options.target?.kind === "pull-request"
     ? (await captureReviewSnapshot(options.target, cwd, dependencies.commands, signal)).headSha
     : (await optionalCommand(dependencies.commands, cwd, "git", ["rev-parse", "HEAD"], signal))?.trim();
-  const stale = Boolean(currentHead && found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
+  const dirty = Boolean((await optionalCommand(dependencies.commands, cwd, "git", ["status", "--porcelain"], signal))?.trim());
+  const stale = dirty || Boolean(currentHead && found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
   return { ...summary(found.ledger), ...(currentHead ? { currentHead } : {}), stale, nextAction: nextAction(found.ledger, stale) };
 }
 
