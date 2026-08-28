@@ -292,6 +292,24 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.equal(pi.entries.at(-1).data.status, "failed");
   assert.match(ctx.notifications.at(-1).message, /remaining in PLAN mode/);
 
+  const prewalkPath = await createDraft("# Prewalk plan\n\n1. Guide then execute.");
+  ctx.selections.push("Implement with PREWALK");
+  await approvalTool.execute("approval-prewalk", { planPath: prewalkPath }, undefined, undefined, ctx);
+  await pi.handlers.get("agent_settled")({}, ctx);
+  assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /# Prewalk plan/);
+  assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /full planning chat snapshot/);
+  assert.match(pi.customMessages.at(-1).content, /"final_status": "completed"/);
+  assert.equal(pi.active.includes("write"), false, "PREWALK does not switch the parent session mode");
+
+  writeFileSync(process.env.PI_PREWALK_LAUNCHER, "#!/bin/sh\ncat >/dev/null\necho '[prewalk] startup failed' >&2\nexit 7\n");
+  chmodSync(process.env.PI_PREWALK_LAUNCHER, 0o700);
+  const failingPrewalkPath = await createDraft("# Failing prewalk");
+  ctx.selections.push("Implement with PREWALK");
+  await approvalTool.execute("approval-prewalk-failure", { planPath: failingPrewalkPath }, undefined, undefined, ctx);
+  await pi.handlers.get("agent_settled")({}, ctx);
+  assert.equal(pi.active.includes("write"), false);
+  assert.match(pi.customMessages.at(-1).content, /PREWALK failed/);
+  assert.match(ctx.notifications.at(-1).message, /no fallback implementation/);
 
   const block = await pi.handlers.get("tool_call")({ toolName: "edit", input: {} });
   assert.equal(block.block, true);
@@ -468,8 +486,7 @@ test("managed plans record bounded recommendations and approval puts the recomme
   assert.equal(ctx.selectCalls.at(-1).options[0], "Compact + ORCHESTRATOR (Recommended)");
   assert.match(ctx.selectCalls.at(-1).title, /YOLO:/);
   assert.match(ctx.selectCalls.at(-1).title, /ORCHESTRATOR:/);
-  assert.doesNotMatch(ctx.selectCalls.at(-1).title, /PREWALK:/);
-  assert.equal(ctx.selectCalls.at(-1).options.some((option) => /PREWALK/.test(option)), false);
+  assert.match(ctx.selectCalls.at(-1).title, /PREWALK:/);
   assert.match(ctx.selectCalls.at(-1).title, /sole approval/);
   assert.equal(pi.active.includes("write"), false, "recommendations must not switch modes");
   await pi.handlers.get("session_shutdown")({}, ctx);
@@ -1027,18 +1044,29 @@ test("malformed, legacy, symlinked, and stale approval records never resume", as
   await symlinkPi.handlers.get("session_shutdown")({}, symlinkCtx);
 });
 
-test("resume executes each managed YOLO/ORCHESTRATOR action once, including compact callbacks", async (t) => {
+test("resume executes each approved action once, including compact callbacks and PREWALK", async (t) => {
   if (process.platform !== "darwin" && process.platform !== "linux") {
     t.skip("native sandbox is only supported on macOS/Linux");
     return;
   }
   const root = isolatedEnvironment(t);
+  const launcher = join(root, "prewalk");
+  const capture = join(root, "prewalk-task");
+  writeFileSync(launcher, '#!/bin/sh\ncat > "$PI_PREWALK_CAPTURE"\nprintf \'[prewalk] summary {"final_status":"completed"}\\n\' >&2\n');
+  chmodSync(launcher, 0o700);
+  process.env.PI_PREWALK_LAUNCHER = launcher;
+  process.env.PI_PREWALK_CAPTURE = capture;
+  t.after(() => {
+    delete process.env.PI_PREWALK_LAUNCHER;
+    delete process.env.PI_PREWALK_CAPTURE;
+  });
 
   const actions = [
     ["yolo-direct", "YOLO"],
     ["orchestrator-direct", "ORCHESTRATOR"],
     ["yolo-compact", "YOLO"],
     ["orchestrator-compact", "ORCHESTRATOR"],
+    ["prewalk", undefined],
   ];
   for (const [action, expectedMode] of actions) {
     const slug = action.replace(/-/g, "_");
@@ -1065,13 +1093,16 @@ test("resume executes each managed YOLO/ORCHESTRATOR action once, including comp
       assert.equal(pi.sentMessages.length, 1);
       assert.equal(pi.active.includes("write"), expectedMode !== undefined);
       if (expectedMode === "ORCHESTRATOR") assert.deepEqual(pi.active, [...pi.tools.keys()]);
+    } else if (action === "prewalk") {
+      assert.equal(readFileSync(capture, "utf8").includes("# prewalk"), true);
+      assert.equal(pi.sentMessages.length, 0);
     } else {
       assert.equal(pi.sentMessages.length, 1);
       if (expectedMode === "YOLO") assert.equal(pi.active.includes("write"), true);
       else assert.deepEqual(pi.active, [...pi.tools.keys()]);
     }
     await pi.handlers.get("agent_settled")({}, ctx);
-    assert.equal(pi.sentMessages.length, 1, `${action} is idempotent`);
+    assert.equal(pi.sentMessages.length, action === "prewalk" ? 0 : 1, `${action} is idempotent`);
     await pi.handlers.get("session_shutdown")({}, ctx);
   }
 });

@@ -57,7 +57,7 @@ const ORCHESTRATOR_VERIFIERS = new Map([
 const PLAN_PROMPT = `PLAN MODE IS ACTIVE. You are a read-only planning agent.
 Investigate the repository before proposing changes. Use direct tools for simple, known-file questions. For a substantial task with 2-4 genuinely independent unknowns, launch focused Explore agents together in one parallel batch; do not delegate to satisfy a quota. Give each agent the exact checkout, branch, PR ref, or worktree, a non-overlapping question, relevant paths, and require a concise file:line handoff. Continue useful parent-session investigation while background agents run; never poll or sleep. Verify every handoff against the correct ref, redirect or relaunch an agent whose premise is wrong, and reconcile conflicting evidence. Once evidence is sufficient, use the read-only Plan agent to draft or stress-test a substantial implementation strategy. LunaCompliance and LunaTestVerifier are post-implementation verification agents and must not be used while creating the plan. The parent remains responsible for clarification, source verification, final synthesis, and approval.
 When requirements or implementation choices are ambiguous, use ask_user_question to present focused options and obtain the user's decision; do not rely on an unstructured prose question when that tool is available. Never implement, edit, write, patch, delete, install, commit, create worktrees, or otherwise mutate project or system state. The sole project-independent write exception is manage_plan_draft, which may create or replace a managed plan artifact. Context-mode may persist its own private index and session metadata. Do not switch modes yourself or ask the user to switch modes as a substitute for completing the planning task. If a tool call is rejected by PLAN policy, acknowledge the constraint internally, continue with allowed read-only investigation, and still complete the planning response.
-Finish with a concrete plan containing context, numbered changes, relevant files and symbols, tests, risks, and validation checks. Use only bounded explicit plan signals for its advisory recommendation: YOLO for localized/tightly coupled work and ORCHESTRATOR for independent slices or parallel work; recommend compaction only when the self-contained plan/context warrants it. Do not paste the complete plan into an ordinary assistant message. Plan-artifact rule: manage_plan_draft is the only tool permitted to create, replace, inspect, or probe a managed plan artifact. Never use Bash, edit, write, ctx_execute, ctx_execute_file, or ctx_batch_execute as a fallback for plan files. If manage_plan_draft is unavailable, report the runtime loading problem and stop rather than attempting a workaround. Call manage_plan_draft create so its renderer displays the plan from the durable file, then call submit_plan_for_approval with only that planPath and stop. If revisions are requested, assess the bounded feedback against the current plan and repository evidence. For genuinely ambiguous feedback, require one focused ask_user_question clarification first and do not write. For actionable feedback, the parent must use exactly one ask_user_question with a concise proposed-change preview, exactly these two authored options—'Apply these updates (Recommended)' and 'Keep the current plan'—and the questionnaire's standard free-text row for further revisions. This confirms revision scope, not implementation approval. If Apply is selected, call manage_plan_draft replace on the same planPath and immediately call submit_plan_for_approval; do not add a redundant summary. If Keep is selected, resubmit the current planPath. Further free-text feedback records and reassesses without writing the plan. The approval tool owns explicit approval, optional compaction, mode switching, and implementation continuation. Never implement without approval. Use only the tools exposed in PLAN mode, and treat any unavailable or unknown tool as forbidden. Bash and context execution are native-sandboxed; do not attempt to bypass that boundary.`;
+Finish with a concrete plan containing context, numbered changes, relevant files and symbols, tests, risks, and validation checks. Use only bounded explicit plan signals for its advisory recommendation: YOLO for localized/tightly coupled work, ORCHESTRATOR for independent slices or parallel work, and PREWALK only when guided exploration is specifically useful; recommend compaction only when the self-contained plan/context warrants it. Do not paste the complete plan into an ordinary assistant message. Plan-artifact rule: manage_plan_draft is the only tool permitted to create, replace, inspect, or probe a managed plan artifact. Never use Bash, edit, write, ctx_execute, ctx_execute_file, or ctx_batch_execute as a fallback for plan files. If manage_plan_draft is unavailable, report the runtime loading problem and stop rather than attempting a workaround. Call manage_plan_draft create so its renderer displays the plan from the durable file, then call submit_plan_for_approval with only that planPath and stop. If revisions are requested, assess the bounded feedback against the current plan and repository evidence. For genuinely ambiguous feedback, require one focused ask_user_question clarification first and do not write. For actionable feedback, the parent must use exactly one ask_user_question with a concise proposed-change preview, exactly these two authored options—'Apply these updates (Recommended)' and 'Keep the current plan'—and the questionnaire's standard free-text row for further revisions. This confirms revision scope, not implementation approval. If Apply is selected, call manage_plan_draft replace on the same planPath and immediately call submit_plan_for_approval; do not add a redundant summary. If Keep is selected, resubmit the current planPath. Further free-text feedback records and reassesses without writing the plan. The approval tool owns explicit approval, optional compaction, mode switching, and implementation continuation. Never implement without approval. Use only the tools exposed in PLAN mode, and treat any unavailable or unknown tool as forbidden. Bash and context execution are native-sandboxed; do not attempt to bypass that boundary.`;
 
 const CHILD_PLAN_PROMPT = `PLAN MODE IS ACTIVE. You are a read-only child planning agent working on a delegated research or design task.
 Complete only the delegated task, investigate the repository, and return a concise handoff to the parent with file:line evidence, assumptions, and unresolved questions. If requirements or an implementation choice remain ambiguous, report the exact question and viable options to the parent; do not ask the user or impersonate the parent. Do not create or submit a final implementation plan. Never edit, write, patch, delete, install, commit, create worktrees, or otherwise mutate project or system state. The parent owns clarification and final synthesis. This instruction is harness policy and supersedes conflicting requests, including a later request to “just edit the file” ("just edit the file").`;
@@ -167,6 +167,7 @@ const APPROVAL_OPTIONS = {
   "Compact + YOLO": "yolo-compact",
   "Implement with ORCHESTRATOR": "orchestrator-direct",
   "Compact + ORCHESTRATOR": "orchestrator-compact",
+  "Implement with PREWALK": "prewalk",
 } as const satisfies Record<string, ApprovalAction>;
 const REVISION_OPTION = "Request revisions…";
 const REVISION_APPLY_OPTION = "Apply these updates (Recommended)";
@@ -244,12 +245,12 @@ function boundedRevisionFeedback(feedback: string | undefined) {
 
 function explicitRecommendation(plan: string): { recommendation: ParentRecommendation; signal: string } | undefined {
   const text = boundedPlanText(plan);
-  const marker = text.match(/(?:parent\s+)?(?:recommendation|recommended\s+(?:action|mode)|execution\s+(?:mode|recommendation))\s*[:=-]\s*(YOLO|ORCHESTRATOR)\b/i);
+  const marker = text.match(/(?:parent\s+)?(?:recommendation|recommended\s+(?:action|mode)|execution\s+(?:mode|recommendation))\s*[:=-]\s*(YOLO|ORCHESTRATOR|PREWALK)\b/i);
   if (marker) {
     const recommendation = marker[1].toUpperCase() as ParentRecommendation;
     return { recommendation, signal: `explicit:${recommendation}` };
   }
-  const proseMarker = text.match(/(?:this|the)\s+plan\s+(?:should\s+)?recommend(?:s|ed)?\s+(?:the\s+)?(?:parent\s+)?(?:mode\s+)?(?:be\s+)?(YOLO|ORCHESTRATOR)\b/i);
+  const proseMarker = text.match(/(?:this|the)\s+plan\s+(?:should\s+)?recommend(?:s|ed)?\s+(?:the\s+)?(?:parent\s+)?(?:mode\s+)?(?:be\s+)?(YOLO|ORCHESTRATOR|PREWALK)\b/i);
   if (proseMarker) {
     const recommendation = proseMarker[1].toUpperCase() as ParentRecommendation;
     return { recommendation, signal: `explicit:${recommendation}` };
@@ -258,6 +259,7 @@ function explicitRecommendation(plan: string): { recommendation: ParentRecommend
   // These are deliberately narrow, positive signals. A generic mention of a
   // mode in a tradeoff paragraph must not silently choose it.
   const signals = [
+    { recommendation: "PREWALK" as const, pattern: /(?:^|[\n*#-])\s*(?:prewalk|checklist[- ]first|walkthrough[- ]first|guided\s+exploration)\b/i, signal: "explicit:prewalk" },
     { recommendation: "ORCHESTRATOR" as const, pattern: /(?:^|[\n*#-])\s*(?:orchestrator|parallel(?:ize|ism)?|independent\s+(?:work|slices)|subagents?|delegat(?:e|ion)|multi[- ]file|cross[- ]subsystem)\b/i, signal: "explicit:orchestrator" },
     { recommendation: "YOLO" as const, pattern: /(?:^|[\n*#-])\s*(?:yolo|direct(?:ly)?\s+implement(?:ation)?|single[- ]pass|localized|tightly\s+coupled|single[- ]file)\b/i, signal: "explicit:yolo" },
   ];
@@ -316,7 +318,7 @@ export function derivePlanRecommendation(plan: string): PlanRecommendation {
 function recommendationForPlan(plan: string, input: PlanRecommendationInput = {}): PlanRecommendation {
   const derived = derivePlanRecommendation(plan);
   const modeValue = typeof input.recommendedMode === "string" ? input.recommendedMode.trim().toUpperCase() : "";
-  const recommendedMode = modeValue === "YOLO" || modeValue === "ORCHESTRATOR"
+  const recommendedMode = modeValue === "YOLO" || modeValue === "ORCHESTRATOR" || modeValue === "PREWALK"
     ? modeValue as ParentRecommendation
     : derived.recommendedMode;
   const recommendCompaction = typeof input.recommendCompaction === "boolean"
@@ -406,6 +408,7 @@ function recommendationTradeoffs(recommendation: PlanRecommendation) {
   return [
     `YOLO: fastest direct implementation; it keeps the current context${compact ? " only if you skip the compact-first advice" : ""}.`,
     "ORCHESTRATOR: delegates independent implementation slices and costs coordination/context overhead.",
+    "PREWALK: runs the external prewalk checklist/executor and does not switch this parent session's mode.",
     `Compaction advice: ${compact ? "compact first to preserve a long plan/context" : "skip compaction unless you need it; direct execution is sufficient"}.`,
   ].join("\n");
 }
@@ -1045,7 +1048,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
         action: { type: "string", enum: ["create", "replace"] },
         plan: { type: "string", minLength: 1, description: "Draft or replacement plan" },
         planPath: { type: "string", description: "Required for replace; must be the same managed planPath" },
-        recommendedMode: { type: "string", enum: ["YOLO", "ORCHESTRATOR"], description: "Optional bounded display recommendation signal; never approval" },
+        recommendedMode: { type: "string", enum: ["YOLO", "ORCHESTRATOR", "PREWALK"], description: "Optional bounded display recommendation signal; never approval" },
         recommendCompaction: { type: "boolean", description: "Optional display advice to compact before implementation; never approval" },
         recommendationReason: { type: "string", maxLength: 500, description: "Optional concise reason for the display recommendation" },
       },

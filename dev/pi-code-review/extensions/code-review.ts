@@ -42,30 +42,12 @@ interface ReviewUI {
   setWorkingMessage?: ((message: string | undefined) => void) | undefined;
 }
 
-interface SessionContextLike {
+interface ReviewExecutionContext {
   readonly cwd: string;
-  readonly sessionManager?: {
-    getBranch?: (() => readonly unknown[]) | undefined;
-    getEntries?: (() => readonly unknown[]) | undefined;
-  } | undefined;
-}
-
-interface ReviewExecutionContext extends SessionContextLike {
   readonly signal?: AbortSignal | undefined;
   readonly ui: ReviewUI;
 }
 
-interface ContextEventLike {
-  readonly messages: readonly any[];
-}
-
-const REVIEW_REMINDER_CUSTOM_TYPE = "pi-code-review-lifecycle-reminder";
-const PLAN_CONTEXT_TYPE = "pi-plan-mode-plan-context";
-const MODE_STATE_TYPES = new Set(["pi-plan-mode-state", "mode-state"]);
-const IMPLEMENTATION_ALIASES = new Set(["implementationworker", "implementation-worker", "implementation", "worker"]);
-const PLAN_AGENT_TYPES = new Set(["plan", "explore"]);
-const REVIEW_AGENT_TYPES = new Set(["review", "reviewer", "code-review", "compliance", "lunacompliance", "test-verifier", "lunatestverifier"]);
-const REVIEW_TASK = /\b(?:code[- ]?review|review this|review the (?:diff|implementation|pull request|pr)|security review|spec(?:ification)? compliance review|test evidence review)\b/iu;
 const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
   "confirmed-blocker",
   "non-blocking",
@@ -87,46 +69,6 @@ function clearProgress(ctx: { ui: ReviewUI }): void {
   ctx.ui.setWorkingMessage?.(undefined);
 }
 
-function branchEntries(ctx: SessionContextLike | undefined): readonly unknown[] {
-  if (!ctx?.sessionManager) return [];
-  const branch = ctx.sessionManager.getBranch?.();
-  if (Array.isArray(branch)) return branch;
-  const entries = ctx.sessionManager.getEntries?.();
-  return Array.isArray(entries) ? entries : [];
-}
-
-function customEntry(value: unknown): { customType?: string; data?: Record<string, unknown> } | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const entry = value as { type?: unknown; customType?: unknown; data?: unknown };
-  if (entry.type !== "custom" || typeof entry.customType !== "string") return undefined;
-  return {
-    customType: entry.customType,
-    ...(entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? { data: entry.data as Record<string, unknown> } : {}),
-  };
-}
-
-export function latestManagedPlanPath(ctx: SessionContextLike | undefined): string | undefined {
-  for (const raw of [...branchEntries(ctx)].reverse()) {
-    const entry = customEntry(raw);
-    if (entry?.customType !== PLAN_CONTEXT_TYPE) continue;
-    const status = String(entry.data?.status ?? "");
-    const planPath = entry.data?.planPath;
-    if (typeof planPath !== "string") return undefined;
-    return ["approved-pending", "transition-started", "approved"].includes(status) ? planPath : undefined;
-  }
-  return undefined;
-}
-
-function latestMode(ctx: SessionContextLike | undefined): "PLAN" | "ORCHESTRATOR" | "YOLO" {
-  for (const raw of [...branchEntries(ctx)].reverse()) {
-    const entry = customEntry(raw);
-    if (!entry?.customType || !MODE_STATE_TYPES.has(entry.customType)) continue;
-    const mode = String(entry.data?.mode ?? "").toUpperCase();
-    if (mode === "PLAN" || mode === "ORCHESTRATOR" || mode === "YOLO") return mode;
-  }
-  return "PLAN";
-}
-
 function reviewTargetIdentity(target: ReviewTarget): string {
   switch (target.kind) {
     case "pull-request": return `pr:${target.value}`;
@@ -142,7 +84,7 @@ function operationCwd(ctx: ReviewExecutionContext, target: ReviewTarget): string
 }
 
 function contextAt(ctx: ReviewExecutionContext, cwd: string): ReviewExecutionContext {
-  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.sessionManager ? { sessionManager: ctx.sessionManager } : {}) };
+  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}) };
 }
 
 function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDecision, status: ReviewResult["status"] = "complete"): ReviewResult {
@@ -261,7 +203,7 @@ async function executeReview(
   const action = params.action ?? "run";
   if (!["run", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
   const effort = parseReviewEffort(params.effort);
-  const planPath = params.planPath?.trim() || latestManagedPlanPath(ctx);
+  const planPath = params.planPath?.trim();
   const dependencies = {
     commands,
     agents: new PiReviewAgentRunner(),
@@ -357,125 +299,10 @@ export function injectReviewResult(pi: ReviewMessageSender, result: ReviewResult
   });
 }
 
-function messageContent(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const value = message as { content?: unknown };
-  if (typeof value.content === "string") return value.content;
-  if (!Array.isArray(value.content)) return "";
-  return value.content.map((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "").join("\n");
-}
-
-function isLifecycleReminder(message: unknown): boolean {
-  if (!message || typeof message !== "object") return false;
-  const value = message as { customType?: unknown };
-  return value.customType === REVIEW_REMINDER_CUSTOM_TYPE || messageContent(message).includes(`[${REVIEW_REMINDER_CUSTOM_TYPE}]`);
-}
-
-function isOldOrchestratorReminder(message: unknown): boolean {
-  return Boolean(message && typeof message === "object" && (message as { customType?: unknown }).customType === "pi-plan-mode-orchestrator-reminder");
-}
-
-function lifecycleReminder(mode: "ORCHESTRATOR" | "YOLO", planPath: string, statusReport: string): Record<string, unknown> {
-  return {
-    role: "custom",
-    customType: REVIEW_REMINDER_CUSTOM_TYPE,
-    display: false,
-    content: [
-      "<system-reminder>",
-      `[${REVIEW_REMINDER_CUSTOM_TYPE}]`,
-      `${mode} approved-plan review policy: pi-code-review is the only code-review authority.`,
-      "Do not launch reviewer, LunaCompliance, LunaTestVerifier, compliance, audit, or test-verifier subagents.",
-      "Implementation workers may edit only bounded implementation/remediation units. The parent inspects changes, runs project checks, commits the intended state, calls code_review with phase=auto, adjudicates candidates, and records dispositions before fixing anything.",
-      "A normal session permits one initial review, one delta review, and at most one final review. Never start a fourth review pass.",
-      `Managed plan: ${planPath}`,
-      statusReport,
-      "</system-reminder>",
-    ].join("\n"),
-    timestamp: Date.now(),
-  };
-}
-
-function agentRequestText(input: Record<string, unknown>): string {
-  return [input.subagent_type, input.task, input.prompt, input.description, input.name]
-    .filter((value): value is string => typeof value === "string")
-    .join("\n");
-}
-
-export function applyReviewAgentPolicy(
-  mode: "PLAN" | "ORCHESTRATOR" | "YOLO",
-  input: Record<string, unknown>,
-): { block: true; reason: string } | undefined {
-  const requestText = agentRequestText(input);
-  const requestedType = String(input.subagent_type ?? "").trim().toLowerCase();
-  const explicitImplementation = mode === "ORCHESTRATOR" && IMPLEMENTATION_ALIASES.has(requestedType);
-  if (mode === "PLAN" && PLAN_AGENT_TYPES.has(requestedType)) return undefined;
-  if (REVIEW_AGENT_TYPES.has(requestedType) || (REVIEW_TASK.test(requestText) && !explicitImplementation)) {
-    return { block: true, reason: "Use code_review as the only review authority; reviewer/compliance/test-verifier subagents are disabled." };
-  }
-  if (mode === "ORCHESTRATOR") {
-    if (!explicitImplementation) {
-      return { block: true, reason: "ORCHESTRATOR permits only a bounded ImplementationWorker unit. Use code_review for review work." };
-    }
-    input.subagent_type = "ImplementationWorker";
-  }
-  return undefined;
-}
-
 export default function (pi: ExtensionAPI): void {
   const activeReviews = new Set<AbortController>();
-  let activeContext: SessionContextLike | undefined;
-  let activeMode: "PLAN" | "ORCHESTRATOR" | "YOLO" = "PLAN";
-  let lateModeHooksRegistered = false;
-
-  const registerLateModeHooks = () => {
-    if (lateModeHooksRegistered) return;
-    lateModeHooksRegistered = true;
-    // pi-code-review is loaded before pi-plan-mode so its Agent guard sees the
-    // original request. Register prompt/context hooks after all session-start
-    // handlers so this policy remains the final mode guidance.
-    pi.on("before_agent_start", (event) => {
-      const planPath = latestManagedPlanPath(activeContext);
-      activeMode = latestMode(activeContext);
-      if (activeMode === "PLAN") {
-        return {
-          systemPrompt: `${event.systemPrompt}\n\nFor every non-trivial managed implementation plan, include a bounded \`## Review contract\` with \`### Guarantees\`, \`### Non-goals\`, \`### Risk areas\`, and \`### Required checks\`. These sections define the supported review boundary; they do not authorize implementation.`,
-        };
-      }
-      if (!planPath || (activeMode !== "ORCHESTRATOR" && activeMode !== "YOLO")) return undefined;
-      return {
-        systemPrompt: `${event.systemPrompt}\n\nApproved-plan implementation is active. Use pi-code-review as the only review authority. Commit the intended implementation before each managed review pass. Run project checks, call code_review phase=auto, independently adjudicate every candidate, record dispositions, and fix only confirmed blockers in one coherent batch. Do not launch LunaCompliance, LunaTestVerifier, reviewer, compliance, audit, or test-verifier agents. Stop after initial, delta, and at most one final review pass.`,
-      };
-    });
-
-    const registerContextHook = pi.on as unknown as (
-      event: "context",
-      handler: (event: ContextEventLike) => Promise<{ messages: readonly any[] }>,
-    ) => void;
-    registerContextHook("context", async (event) => {
-      activeMode = latestMode(activeContext);
-      const planPath = latestManagedPlanPath(activeContext);
-      const ordinaryMessages = event.messages.filter((message) => !isLifecycleReminder(message));
-      if (!planPath || (activeMode !== "ORCHESTRATOR" && activeMode !== "YOLO") || !activeContext) return { messages: ordinaryMessages };
-      const messages = ordinaryMessages.filter((message) => !isOldOrchestratorReminder(message));
-      let statusText: string;
-      try {
-        const commands = new NodeCommandRunner();
-        const implementationId = await managedImplementationId(activeContext.cwd, planPath, undefined, commands);
-        const status = await getReviewStatus(activeContext.cwd, { commands }, { implementationId, planPath, target: { kind: "current-diff" } });
-        statusText = status
-          ? `Review status: ${status.decision}; phase=${status.phase}; passes=${status.completedPasses}/3; remediation=${status.remediationBatches}/2. ${status.nextAction}`
-          : "Review status: not started. After implementation is committed and checks are run, call code_review with phase=auto and the managed plan path.";
-      } catch (error) {
-        statusText = `Review status unavailable: ${error instanceof Error ? error.message : String(error)}. Do not claim sign-off until code_review status succeeds.`;
-      }
-      return { messages: [...messages, lifecycleReminder(activeMode, planPath, statusText)] };
-    });
-  };
 
   pi.on("session_start", (_event, ctx) => {
-    activeContext = ctx;
-    activeMode = latestMode(ctx);
-    registerLateModeHooks();
     ctx.ui.onTerminalInput((data) => {
       if (!matchesKey(data, "escape") || cancelActiveReviews(activeReviews) === 0) return;
       ctx.ui.notify("Code review canceled.", "warning");
@@ -483,20 +310,8 @@ export default function (pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("session_tree", (_event, ctx) => {
-    activeContext = ctx;
-    activeMode = latestMode(ctx);
-  });
-
   pi.on("session_shutdown", () => {
     cancelActiveReviews(activeReviews);
-    activeContext = undefined;
-  });
-
-  pi.on("tool_call", (event) => {
-    if (event.toolName !== "Agent" || !event.input || typeof event.input !== "object" || Array.isArray(event.input)) return undefined;
-    const input = event.input as Record<string, unknown>;
-    return applyReviewAgentPolicy(activeMode, input);
   });
 
   pi.registerMessageRenderer<ReviewResult>("code-review-result", (message, _options, _theme) => {
@@ -566,8 +381,7 @@ export default function (pi: ExtensionAPI): void {
     }),
     execute: async (_toolCallId, params: ReviewToolParams, signal, _onUpdate, ctx) => {
       try {
-        const sessionManager = (ctx as unknown as SessionContextLike).sessionManager;
-        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}), ...(sessionManager ? { sessionManager } : {}) }, params, activeReviews);
+        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}) }, params, activeReviews);
         return {
           content: [{ type: "text", text: result.report }],
           details: {

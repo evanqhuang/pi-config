@@ -4,7 +4,6 @@
   "packages": [
     "npm:@pandi-coding-agent/goal",
     "npm:pi-prewalk",
-    "dev/pi-code-review",
     "dev/pi-plan-mode",
     "npm:pi-rtk-rewrite",
     {
@@ -32,6 +31,7 @@
     "git:github.com/tmustier/pi-auto-compact",
     "npm:pi-chrome",
     "npm:pi-vimmode",
+    "dev/pi-code-review",
     "npm:pi-skill-manager",
     "npm:pi-btw",
     "npm:@upstash/context7-pi"
@@ -171,6 +171,8 @@
           "find",
           "ls",
           "bash",
+          "edit",
+          "write",
           "intercom",
           "compress",
           "decompress",
