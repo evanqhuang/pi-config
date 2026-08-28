@@ -129,6 +129,7 @@ export interface FindingLedgerEntry {
 export interface ReviewLedgerSummary {
   readonly sessionId: string;
   readonly implementationId?: string;
+  readonly targetIdentity: string;
   readonly phase: ReviewPhase | "approved" | "blocked";
   readonly decision: ReviewDecision;
   readonly baseSha: string;
