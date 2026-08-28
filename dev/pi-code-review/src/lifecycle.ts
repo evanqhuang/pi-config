@@ -388,22 +388,18 @@ function newLedger(root: string, target: ReviewTarget, base: string, implementat
 }
 
 function selectPhase(ledger: Ledger, requested: ManagedReviewRunInput["requestedPhase"]): Exclude<ReviewPhase, "audit"> {
-  if (requested !== "auto") return requested;
-  if (ledger.completedPasses === 0) return "initial";
-  if (ledger.awaitingAdjudication) throw new Error("Record parent dispositions for the last review before running another pass");
-  if (ledger.phase === "approved" || ledger.decision === "approve" || ledger.decision === "comment") {
-    if (ledger.completedPasses >= MAX_PASSES) throw new Error("The approved head changed after the three-pass budget; reset requires explicit authorization");
-    return ledger.completedPasses === 1 ? "delta" : "final";
-  }
-  if (ledger.decision === "request-changes") return ledger.completedPasses === 1 ? "delta" : "final";
   if (ledger.phase === "blocked" || ledger.decision === "blocked") throw new Error("This review session is blocked; do not run another pass");
-  return ledger.completedPasses === 1 ? "delta" : "final";
+  if (ledger.awaitingAdjudication) throw new Error("Record parent dispositions for the last review before running another pass");
+  if (ledger.completedPasses >= MAX_PASSES) throw new Error("No fourth review pass is permitted");
+  const expected = ledger.completedPasses === 0 ? "initial" : ledger.completedPasses === 1 ? "delta" : "final";
+  if (requested !== "auto" && requested !== expected) {
+    throw new Error(`Review phase ${requested} is out of order; the next permitted phase is ${expected}`);
+  }
+  return expected;
 }
 
 function rootKey(finding: VerifiedFinding): string {
-  const parts = finding.id.split(":");
-  const stable = parts.length > 2 ? parts.slice(1, -1).join(":") : finding.id;
-  return `root:${hash(`${finding.category}|${normalize(stable)}`).slice(0, 20)}`;
+  return `root:${hash(`${finding.category}|${normalize(finding.rootCauseKey)}`).slice(0, 20)}`;
 }
 
 function mergeFindings(ledger: Ledger, findings: readonly VerifiedFinding[], head: string, phase: Exclude<ReviewPhase, "audit">): VerifiedFinding[] {
@@ -486,6 +482,10 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
   const plan = await planData(input.planPath, input.contract);
   const implementationId = input.implementationId ?? (plan.planPath ? await deriveImplementationId(input.cwd, plan.planPath, dependencies.commands) : undefined);
   const existing = await findLedger(directory, input.sessionId, implementationId);
+  if (input.sessionId && !existing) throw new Error(`Review session not found: ${input.sessionId}`);
+  if (existing && input.implementationId && existing.ledger.implementationId !== input.implementationId) {
+    throw new Error("The supplied implementation ID does not match the review session");
+  }
   const observedBase = await observedBaseSha(input, dependencies, signal);
   const ledger = existing?.ledger ?? newLedger(root, input.target, observedBase, implementationId, plan);
   const path = existing?.path ?? pathFor(directory, ledger.sessionId);
@@ -509,12 +509,6 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
       if (head === current.lastReviewedHead) return resultFromLedger(current, "The current committed head is already review-complete.");
     }
     const phase = selectPhase(current, input.requestedPhase);
-    if (current.completedPasses >= MAX_PASSES) {
-      current.phase = "blocked";
-      current.decision = "blocked";
-      await writeLedger(path, current);
-      return resultFromLedger(current, "No fourth review pass is permitted.");
-    }
     if (phase !== "initial" && current.remediationBatches >= MAX_REMEDIATIONS) {
       current.phase = "blocked";
       current.decision = "blocked";
