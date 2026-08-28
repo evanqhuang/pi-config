@@ -130,6 +130,14 @@ function reviewTargetIdentity(target: ReviewTarget): string {
   }
 }
 
+function operationCwd(ctx: ReviewExecutionContext, target: ReviewTarget): string {
+  return target.kind === "worktree" ? target.path : ctx.cwd;
+}
+
+function contextAt(ctx: ReviewExecutionContext, cwd: string): ReviewExecutionContext {
+  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.sessionManager ? { sessionManager: ctx.sessionManager } : {}) };
+}
+
 function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDecision, status: ReviewResult["status"] = "complete"): ReviewResult {
   return {
     effort,
@@ -166,16 +174,26 @@ async function checkedCommand(
   return result.stdout;
 }
 
-async function requireManagedPrCheckout(
+async function requireManagedTargetCheckout(
   ctx: ReviewExecutionContext,
   target: ReviewTarget,
   commands: NodeCommandRunner,
 ): Promise<Awaited<ReturnType<typeof captureReviewSnapshot>> | undefined> {
+  if (target.kind === "path") {
+    throw new Error("Managed review does not support path-only targets; use a committed branch, worktree, pull request, or current checkout.");
+  }
+  const cwd = operationCwd(ctx, target);
+  const status = await checkedCommand(commands, cwd, "git", ["status", "--porcelain"], ctx.signal);
+  if (status.trim()) throw new Error("Managed review and adjudication require a clean committed target checkout.");
+  const localHead = (await checkedCommand(commands, cwd, "git", ["rev-parse", "HEAD"], ctx.signal)).trim();
+  if (target.kind === "branch") {
+    const branchHead = (await checkedCommand(commands, cwd, "git", ["rev-parse", `${target.ref}^{commit}`], ctx.signal)).trim();
+    if (localHead !== branchHead) {
+      throw new Error(`Managed branch review requires the local checkout at ${target.ref} (${branchHead}); current HEAD is ${localHead}.`);
+    }
+  }
   if (target.kind !== "pull-request") return undefined;
-  const snapshot = await captureReviewSnapshot(target, ctx.cwd, commands, ctx.signal);
-  const status = await checkedCommand(commands, ctx.cwd, "git", ["status", "--porcelain"], ctx.signal);
-  if (status.trim()) throw new Error("Managed pull-request review requires a clean local checkout of the pull-request head.");
-  const localHead = (await checkedCommand(commands, ctx.cwd, "git", ["rev-parse", "HEAD"], ctx.signal)).trim();
+  const snapshot = await captureReviewSnapshot(target, cwd, commands, ctx.signal);
   if (!snapshot.headSha || localHead !== snapshot.headSha) {
     throw new Error(`Managed pull-request review requires the local checkout at PR head ${snapshot.headSha ?? "unknown"}; current HEAD is ${localHead}.`);
   }
@@ -190,17 +208,17 @@ async function requireCurrentAdjudicationTarget(
 ): Promise<void> {
   const sessionId = params.sessionId?.trim();
   if (!sessionId) throw new Error("record requires sessionId");
-  const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId, target }, ctx.signal);
+  const snapshot = await requireManagedTargetCheckout(ctx, target, dependencies.commands);
+  const cwd = operationCwd(ctx, target);
+  const status = await getReviewStatus(cwd, dependencies, { sessionId, target }, ctx.signal);
   if (!status) throw new Error(`Review session not found: ${sessionId}`);
   if (status.targetIdentity !== reviewTargetIdentity(target)) {
     throw new Error("The adjudication target does not match the managed review session; use the same target used for the review.");
   }
   if (status.stale) throw new Error("The target changed after review; run the next managed review phase before recording dispositions.");
-  if (target.kind === "pull-request") {
-    const snapshot = await requireManagedPrCheckout(ctx, target, dependencies.commands);
-    if (!snapshot?.pullRequest || snapshot.pullRequest.baseSha !== status.baseSha || snapshot.headSha !== status.lastReviewedHead) {
-      throw new Error("The pull-request base or head changed after review; dispositions for the stale snapshot were not recorded.");
-    }
+  if (target.kind === "pull-request"
+    && (!snapshot?.pullRequest || snapshot.pullRequest.baseSha !== status.baseSha || snapshot.headSha !== status.lastReviewedHead)) {
+    throw new Error("The pull-request base or head changed after review; dispositions for the stale snapshot were not recorded.");
   }
 }
 
@@ -221,14 +239,16 @@ async function executeReview(
     onProgress: (stage: Parameters<typeof renderProgress>[1], message: string) => renderProgress(ctx, stage, message),
   };
   const target = await resolveReviewTarget(params.target?.trim(), ctx.cwd, commands, ctx.signal);
+  const cwd = operationCwd(ctx, target);
+  const targetContext = contextAt(ctx, cwd);
 
   if (action === "record") {
     if (!params.reviewedSnapshotHash?.trim()) throw new Error("record requires reviewedSnapshotHash");
     if (!params.dispositions || params.dispositions.length === 0) throw new Error("record requires at least one finding disposition");
     validateFindingDispositionInputs(params.dispositions);
-    await requireCurrentAdjudicationTarget(ctx, target, params, dependencies);
+    await requireCurrentAdjudicationTarget(targetContext, target, params, dependencies);
     return recordReviewDispositions({
-      cwd: ctx.cwd,
+      cwd,
       sessionId: params.sessionId!.trim(),
       reviewedSnapshotHash: params.reviewedSnapshotHash.trim(),
       dispositions: params.dispositions,
@@ -236,7 +256,7 @@ async function executeReview(
   }
 
   if (action === "status") {
-    const status = await getReviewStatus(ctx.cwd, dependencies, {
+    const status = await getReviewStatus(cwd, dependencies, {
       ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
       ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
       ...(planPath ? { planPath } : {}),
@@ -245,7 +265,7 @@ async function executeReview(
     return plainResult(formatStatusReport(status), effort, status?.decision);
   }
   if (action === "reset") {
-    const message = await resetReviewSession(ctx.cwd, dependencies, {
+    const message = await resetReviewSession(cwd, dependencies, {
       ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
       ...(params.implementationId?.trim() ? { implementationId: params.implementationId.trim() } : {}),
       ...(planPath ? { planPath } : {}),
@@ -260,9 +280,9 @@ async function executeReview(
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   try {
     if (managed) {
-      await requireManagedPrCheckout(ctx, target, commands);
+      await requireManagedTargetCheckout(targetContext, target, commands);
       return runManagedReview({
-        cwd: ctx.cwd,
+        cwd,
         target,
         requestedPhase: phase,
         effort,
@@ -272,7 +292,7 @@ async function executeReview(
       }, dependencies, cancellation.signal);
     }
     return runCodeReview({
-      cwd: ctx.cwd,
+      cwd,
       target,
       comment: params.comment === true,
       effort: phase === "audit" && params.effort === undefined ? "high" : effort,
