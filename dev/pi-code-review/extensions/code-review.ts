@@ -1,5 +1,6 @@
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, matchesKey } from "@earendil-works/pi-tui";
+import { resolve } from "node:path";
 import { Type } from "typebox";
 import { parseReviewArgs } from "../src/args.js";
 import { cancelActiveReviews, startReviewCancellation } from "../src/cancellation.js";
@@ -119,6 +120,16 @@ function latestMode(ctx: SessionContextLike | undefined): "PLAN" | "ORCHESTRATOR
   return "PLAN";
 }
 
+function reviewTargetIdentity(target: ReviewTarget): string {
+  switch (target.kind) {
+    case "pull-request": return `pr:${target.value}`;
+    case "branch": return `branch:${target.ref}`;
+    case "worktree": return `worktree:${resolve(target.path)}`;
+    case "path": return `path:${target.path}`;
+    case "current-diff": return "current-diff";
+  }
+}
+
 function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDecision, status: ReviewResult["status"] = "complete"): ReviewResult {
   return {
     effort,
@@ -181,6 +192,9 @@ async function requireCurrentAdjudicationTarget(
   if (!sessionId) throw new Error("record requires sessionId");
   const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId, target }, ctx.signal);
   if (!status) throw new Error(`Review session not found: ${sessionId}`);
+  if (status.targetIdentity !== reviewTargetIdentity(target)) {
+    throw new Error("The adjudication target does not match the managed review session; use the same target used for the review.");
+  }
   if (status.stale) throw new Error("The target changed after review; run the next managed review phase before recording dispositions.");
   if (target.kind === "pull-request") {
     const snapshot = await requireManagedPrCheckout(ctx, target, dependencies.commands);
