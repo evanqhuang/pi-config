@@ -376,8 +376,10 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.match(orchestratorStart.systemPrompt, /verify the complete result/i);
   assert.match(orchestratorStart.systemPrompt, /ImplementationWorker leaf-worker profile/);
   assert.match(orchestratorStart.systemPrompt, /cannot create, launch, steer, or wait on subagents/);
-  assert.match(orchestratorStart.systemPrompt, /After the approved plan has been implemented, use LunaCompliance/);
-  assert.match(orchestratorStart.systemPrompt, /use LunaTestVerifier to independently inspect/);
+  assert.match(orchestratorStart.systemPrompt, /Do not launch either verifier by default or merely because implementation finished/);
+  assert.match(orchestratorStart.systemPrompt, /Use LunaCompliance only when the approved plan or user requirements contain concrete compliance, specification, security, migration, or acceptance criteria/);
+  assert.match(orchestratorStart.systemPrompt, /Use LunaTestVerifier only when test evidence is broad, high-risk, coverage-sensitive, difficult to interpret, or otherwise benefits from independent review/);
+  assert.match(orchestratorStart.systemPrompt, /For routine changes with focused commands and clear results, the parent runs and evaluates verification directly/);
   assert.match(orchestratorStart.systemPrompt, /Every verifier delegation names the exact absolute target roots and ref\/snapshot/);
   assert.match(orchestratorStart.systemPrompt, /every substantive citation, cwd, and source metadata is under those roots and on the requested ref/);
   assert.match(orchestratorStart.systemPrompt, /off-root, mirror, stale-copy, or wrong-ref report is invalid evidence and must not trigger edits or a fix loop/);
@@ -399,11 +401,12 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.match(reminderContent(await orchestratorReminder()), /Current lifecycle phase: implementing/);
   pi.events.emit("subagents:completed", { id: "worker-1", type: "ImplementationWorker", description: "implement slice" });
   assert.match(reminderContent(await orchestratorReminder()), /Current lifecycle phase: verification-needed/);
+  assert.match(reminderContent(await orchestratorReminder()), /Do not launch either dedicated verifier by default/);
+  assert.match(reminderContent(await orchestratorReminder()), /The parent may verify routine work directly/);
   pi.events.emit("subagents:started", { id: "compliance-1", type: "LunaCompliance", description: "compliance" });
+  pi.events.emit("subagents:started", { id: "tests-1", type: "LunaTestVerifier", description: "tests" });
   assert.match(reminderContent(await orchestratorReminder()), /Current lifecycle phase: verifying/);
   pi.events.emit("subagents:completed", { id: "compliance-1", type: "LunaCompliance", description: "compliance" });
-  assert.match(reminderContent(await orchestratorReminder()), /Current lifecycle phase: verifying/);
-  pi.events.emit("subagents:started", { id: "tests-1", type: "LunaTestVerifier", description: "tests" });
   assert.match(reminderContent(await orchestratorReminder()), /Current lifecycle phase: verifying/);
   pi.events.emit("subagents:completed", { id: "tests-1", type: "LunaTestVerifier", description: "tests" });
   const signoffReminder = await orchestratorReminder();

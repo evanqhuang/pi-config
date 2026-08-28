@@ -54,10 +54,10 @@ const PHASE_TEXT = Object.freeze({
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFICATION_NEEDED]: [
     "ORCHESTRATOR verification is needed after implementation work. Inspect the actual diff and run fresh diagnostics and tests.",
-    "Use the dedicated LunaCompliance and LunaTestVerifier agents as appropriate; their completion is evidence, not parent sign-off.",
+    "Do not launch either dedicated verifier by default. Use only the verifier justified by concrete plan criteria or unusually broad, high-risk, coverage-sensitive, or difficult test evidence. The parent may verify routine work directly and sign off without launching either verifier.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFYING]: [
-    "ORCHESTRATOR verification is in progress after implementation work. Wait for both required verifier agents to complete.",
+    "ORCHESTRATOR dedicated verification is in progress after implementation work. Wait only for the verifier agents the parent actually selected.",
     "Their completion is evidence, not parent sign-off; inspect the actual diff and independently run fresh diagnostics and tests.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFICATION_FAILED]: [
@@ -65,7 +65,7 @@ const PHASE_TEXT = Object.freeze({
     "Inspect the actual repository state, remediate every actionable gap, and rerun the necessary verification before sign-off. Do not claim success from raw agent output.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.SIGNOFF_READY]: [
-    "ORCHESTRATOR verification agents have completed for the tracked implementation cycle.",
+    "The selected ORCHESTRATOR verifier agents have completed for the tracked implementation cycle.",
     "This is only a soft sign-off cue: inspect the real diff and independently run fresh diagnostics and tests before reporting completion.",
   ].join("\n"),
 });
@@ -247,9 +247,9 @@ function hasImplementationFailure(agents) {
 }
 
 function verifiersReady(agents) {
-  const statuses = new Map(verifierAgents(agents).map((agent) => [agent.type, agent.status]));
-  return statuses.get(ORCHESTRATOR_AGENT_TYPES.LUNA_COMPLIANCE) === ORCHESTRATOR_AGENT_STATUSES.COMPLETED
-    && statuses.get(ORCHESTRATOR_AGENT_TYPES.LUNA_TEST_VERIFIER) === ORCHESTRATOR_AGENT_STATUSES.COMPLETED;
+  const selected = verifierAgents(agents);
+  return selected.length > 0
+    && selected.every((agent) => agent.status === ORCHESTRATOR_AGENT_STATUSES.COMPLETED);
 }
 
 function verifierFailure(agents) {

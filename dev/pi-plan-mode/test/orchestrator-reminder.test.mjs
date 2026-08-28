@@ -41,7 +41,7 @@ test("classifies only the three canonical orchestrator roles", () => {
   assert.equal(classifyOrchestratorAgent({ type: "ImplementationWorkerish" }), null);
 });
 
-test("lifecycle transitions are pure and require both verification agents", () => {
+test("lifecycle waits only for the dedicated verifier agents the parent selected", () => {
   let state = createOrchestratorState();
   const initial = state;
   state = apply(state, "subagents:started", "ImplementationWorker", "worker-1");
@@ -51,10 +51,9 @@ test("lifecycle transitions are pure and require both verification agents", () =
   state = apply(state, "subagents:completed", "ImplementationWorker", "worker-1");
   assert.equal(state.phase, ORCHESTRATOR_PHASES.VERIFICATION_NEEDED);
   state = apply(state, "subagents:started", "LunaCompliance", "compliance-1");
+  state = apply(state, "subagents:started", "LunaTestVerifier", "tests-1");
   assert.equal(state.phase, ORCHESTRATOR_PHASES.VERIFYING);
   state = apply(state, "subagents:completed", "LunaCompliance", "compliance-1");
-  assert.equal(state.phase, ORCHESTRATOR_PHASES.VERIFYING);
-  state = apply(state, "subagents:started", "LunaTestVerifier", "tests-1");
   assert.equal(state.phase, ORCHESTRATOR_PHASES.VERIFYING);
   state = apply(state, "subagents:completed", "LunaTestVerifier", "tests-1");
   assert.equal(state.phase, ORCHESTRATOR_PHASES.SIGNOFF_READY);
@@ -63,6 +62,16 @@ test("lifecycle transitions are pure and require both verification agents", () =
     { id: "compliance-1", type: "LunaCompliance", status: "completed" },
     { id: "tests-1", type: "LunaTestVerifier", status: "completed" },
   ]);
+});
+
+test("one selected verifier is sufficient when the other verifier is not justified", () => {
+  let state = createOrchestratorState();
+  state = apply(state, "subagents:started", "ImplementationWorker", "worker-1");
+  state = apply(state, "subagents:completed", "ImplementationWorker", "worker-1");
+  state = apply(state, "subagents:started", "LunaCompliance", "compliance-1");
+  assert.equal(state.phase, ORCHESTRATOR_PHASES.VERIFYING);
+  state = apply(state, "subagents:completed", "LunaCompliance", "compliance-1");
+  assert.equal(state.phase, ORCHESTRATOR_PHASES.SIGNOFF_READY);
 });
 
 test("parallel workers remain tracked and any failure requires remediation", () => {
