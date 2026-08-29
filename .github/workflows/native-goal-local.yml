@@ -2,7 +2,8 @@ name: Native goal verification
 
 on:
   push:
-    branches: [feat/native-goal-local]
+    branches:
+      - feat/native-goal-local
   pull_request:
     paths:
       - "dev/pi-goal-local/**"
@@ -12,43 +13,33 @@ on:
       - "settings.json"
       - ".github/workflows/native-goal-local.yml"
 
-permissions:
-  contents: write
-
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'push' && github.ref_name || github.event.pull_request.head.sha }}
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            dev/pi-subagents-local/package-lock.json
 
-      - name: Apply required in-memory child lineage fix
-        if: github.event_name == 'push'
+      - name: Apply lineage patch in verification workspace
+        shell: bash
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
-          p = Path('dev/pi-subagents-local/src/agent-runner.ts')
+          p = Path("dev/pi-subagents-local/src/agent-runner.ts")
           text = p.read_text()
-          old = '      : SessionManager.inMemory(effectiveCwd);'
-          new = '''      : SessionManager.inMemory(effectiveCwd, {
-          parentSession:
-            ctx.sessionManager?.getSessionFile?.() ??
-            ctx.sessionManager?.getSessionId?.(),
-        });'''
+          old = "      : SessionManager.inMemory(effectiveCwd);"
+          new = """      : SessionManager.inMemory(effectiveCwd, {
+            parentSession:
+              ctx.sessionManager?.getSessionFile?.() ??
+              ctx.sessionManager?.getSessionId?.(),
+          });"""
           if old in text:
-              text = text.replace(old, new, 1)
-              p.write_text(text)
+              p.write_text(text.replace(old, new, 1))
           elif new not in text:
-              raise SystemExit('agent-runner lineage anchor not found')
+              raise SystemExit("agent-runner lineage anchor not found")
           PY
 
       - name: Check pi-subagents-local
@@ -60,15 +51,3 @@ jobs:
         run: |
           npm install --prefix dev/pi-goal-local --no-package-lock
           npm run check --prefix dev/pi-goal-local
-
-      - name: Commit lineage fix after checks
-        if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
-        run: |
-          if git diff --quiet -- dev/pi-subagents-local/src/agent-runner.ts; then
-            exit 0
-          fi
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add dev/pi-subagents-local/src/agent-runner.ts
-          git commit -m "Preserve lineage for in-memory subagents"
-          git push origin HEAD:feat/native-goal-local
