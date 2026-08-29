@@ -4,15 +4,15 @@ import { loadCustomAgents } from "../src/custom-agents.js";
 const agents = loadCustomAgents(process.cwd());
 
 describe("native goal evaluator cards", () => {
-  it("loads GoalJudge as a one-turn non-mutating local-mode evaluator", () => {
+  it("loads GoalJudge as a one-turn non-mutating local-mode evaluator with runtime routing", () => {
     const judge = agents.get("GoalJudge");
     expect(judge).toBeDefined();
     expect(judge?.builtinToolNames).toEqual([]);
     expect(judge?.extensions).toEqual(["local-mode"]);
     expect(judge?.skills).toBe(false);
     expect(judge?.disallowedTools).toEqual(["request_deeper_reasoning"]);
-    expect(judge?.model).toBe("openai-codex/gpt-5.6-luna");
-    expect(judge?.thinking).toBe("low");
+    expect(judge?.model).toBeUndefined();
+    expect(judge?.thinking).toBeUndefined();
     expect(judge?.maxTurns).toBe(1);
     expect(judge?.persistSession).toBe(false);
     expect(judge?.outputTranscript).toBe(false);
