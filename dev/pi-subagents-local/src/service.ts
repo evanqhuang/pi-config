@@ -81,7 +81,7 @@ function createService(): PiSubagentsServiceV3 {
         if (!worktree) {
           throw new Error(`Agent "${type}" requires a disposable source snapshot, but the worktree could not be created.`);
         }
-        cwd = worktree.path;
+        cwd = worktree.workPath;
         worktreeBase = options.ctx.cwd;
       }
 
