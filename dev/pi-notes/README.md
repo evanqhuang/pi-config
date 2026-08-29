@@ -40,6 +40,8 @@ The extension uses Pi core APIs only:
 
 It does not call `pi.setActiveTools()`. If another mode hides `checkpoint_notes`, reminder pressure pauses until the tool becomes available again.
 
+Lifecycle tests exercise fresh `/new` and `/fork` identities, `/tree` branch restoration, session resume rematerialization, compaction checkpoint pressure, inherited-resume integrity, and out-of-band mutation gating.
+
 ## Optional integrations
 
 The core has no dependency on goal, plan mode, orchestrator, subagents, memory, or compaction extensions.
