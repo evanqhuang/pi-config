@@ -5,6 +5,7 @@ import {
   createRuntime,
   notesPathFor,
   renderNotes,
+  selectReminder,
   stripNotesReminders,
   type CheckpointPayload,
 } from "../index.js";
@@ -46,11 +47,19 @@ describe("runtime and rendering", () => {
 });
 
 describe("activity classification", () => {
-  it("marks edit/write as meaningful mutations", () => {
+  it("marks successful edit/write as meaningful mutations", () => {
     expect(classifyToolResult("edit", { path: "src/a.ts" }, false)).toEqual({
       meaningful: true,
       highSignal: true,
       modifiedPath: "src/a.ts",
+    });
+  });
+
+  it("does not claim a failed write modified the file", () => {
+    expect(classifyToolResult("write", { path: "src/a.ts" }, true)).toEqual({
+      meaningful: true,
+      highSignal: true,
+      modifiedPath: undefined,
     });
   });
 
@@ -86,5 +95,17 @@ describe("transient reminders", () => {
     const normal = { role: "user", content: "hello" };
     const reminder = { role: "custom", customType: NOTES_REMINDER_TYPE, content: "old" };
     expect(stripNotesReminders([normal, reminder])).toEqual([normal]);
+  });
+
+  it("emits re-entry once, then exposes an already-due checkpoint reminder", () => {
+    const runtime = createRuntime("manual");
+    runtime.reentryRequired = true;
+    runtime.dirty = true;
+    runtime.checkpointDue = true;
+    const pi = { getActiveTools: () => ["checkpoint_notes"] };
+
+    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES RE-ENTRY]");
+    expect(runtime.reentryRequired).toBe(false);
+    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
   });
 });
