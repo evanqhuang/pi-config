@@ -39,6 +39,7 @@ jobs:
         run: |
           npm ci --prefix dev/pi-subagents-local
           npm ci --prefix dev/pi-plan-mode
+          npm install --no-save --no-package-lock jiti
 
       - name: Apply native goal integration patches
         shell: bash
@@ -77,12 +78,58 @@ jobs:
 
           controller = Path("dev/pi-goal-local/src/controller.ts")
           text = controller.read_text()
+          import_old = 'import { latestGoalState, nextGeneration, terminalState } from "./state.js";'
+          import_new = 'import { CLEARED_REASON, latestGoalState, nextGeneration, terminalState } from "./state.js";'
+          if import_old in text:
+              text = text.replace(import_old, import_new, 1)
+          elif import_new not in text:
+              raise SystemExit("goal state import anchor not found")
+
           usage_old = "  const usage = runtime.getContextUsage?.();"
           usage_new = "  const usage = runtime.getContextUsage?.() as unknown as { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;"
           if usage_old in text:
-              controller.write_text(text.replace(usage_old, usage_new, 1))
+              text = text.replace(usage_old, usage_new, 1)
           elif usage_new not in text:
               raise SystemExit("goal context usage anchor not found")
+
+          clear_old = '''  clear(ctx: ExtensionContext): GoalStateV1 | undefined {
+    return this.stop(ctx, "Cleared by user. Historical goal entries remain append-only.");
+  }'''
+          clear_new = '''  clear(ctx: ExtensionContext): GoalStateV1 | undefined {
+    this.syncBranch(ctx);
+    if (!this.state) return undefined;
+    this.evaluatorAbort?.abort();
+    const cleared = terminalState(this.state, "stopped", CLEARED_REASON);
+    this.persist(cleared);
+    this.state = undefined;
+    return cleared;
+  }'''
+          if clear_old in text:
+              text = text.replace(clear_old, clear_new, 1)
+          elif clear_new not in text:
+              raise SystemExit("goal clear anchor not found")
+
+          failure_old = '''    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
+      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
+      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);
+    }
+  }'''
+          failure_new = '''    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
+      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
+      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);
+      return;
+    }
+    this.hidden(
+      GOAL_CONTINUE_MESSAGE,
+      `Goal evaluation failed transiently (${failures}/${DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures}). Continue pursuing the active goal; evaluation will retry after settlement. Reason: ${reason}`,
+    );
+  }'''
+          if failure_old in text:
+              text = text.replace(failure_old, failure_new, 1)
+          elif failure_new not in text:
+              raise SystemExit("goal judge failure anchor not found")
+
+          controller.write_text(text)
           PY
 
       - name: Check pi-subagents-local
