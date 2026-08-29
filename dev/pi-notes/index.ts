@@ -561,8 +561,8 @@ export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime
     runtime.reentryRequired = false;
     return "[TASK NOTES RE-ENTRY]\nReread the current Notes checkpoint and inspect live worktree/tool state before continuing. Notes is continuity context, not proof.";
   }
-  if (runtime.dirty && runtime.checkpointDue) {
-    return "[TASK NOTES CHECKPOINT DUE]\nExecution state changed materially since the last durable checkpoint. Before doing substantially more work, call checkpoint_notes once with only durable state, then continue.";
+  if (runtime.checkpointDue) {
+    return "[TASK NOTES CHECKPOINT DUE]\nExecution state changed materially since the last durable checkpoint or a checkpoint was explicitly requested. Before doing substantially more work, call checkpoint_notes once with only durable state, then continue.";
   }
   return undefined;
 }
