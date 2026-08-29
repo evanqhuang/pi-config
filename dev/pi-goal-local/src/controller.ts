@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { buildJudgePrompt, parseGoalVerdict } from "./judge.js";
-import { latestGoalState, nextGeneration, terminalState } from "./state.js";
+import { CLEARED_REASON, latestGoalState, nextGeneration, terminalState } from "./state.js";
 import { hasActiveSubagents, runEvaluator } from "./subagents.js";
 import { buildGoalEvidence, fingerprintEvidence } from "./transcript.js";
 import {
@@ -28,7 +28,7 @@ function contextPercent(ctx: ExtensionContext): number | undefined {
   const runtime = ctx as ExtensionContext & {
     getContextUsage?: () => { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;
   };
-  const usage = runtime.getContextUsage?.();
+  const usage = runtime.getContextUsage?.() as unknown as { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;
   if (!usage) return undefined;
   if (typeof usage.percent === "number") return usage.percent > 1 ? usage.percent / 100 : usage.percent;
   if (typeof usage.contextPercent === "number") return usage.contextPercent > 1 ? usage.contextPercent / 100 : usage.contextPercent;
@@ -183,7 +183,13 @@ export class GoalController {
   }
 
   clear(ctx: ExtensionContext): GoalStateV1 | undefined {
-    return this.stop(ctx, "Cleared by user. Historical goal entries remain append-only.");
+    this.syncBranch(ctx);
+    if (!this.state) return undefined;
+    this.evaluatorAbort?.abort();
+    const cleared = terminalState(this.state, "stopped", CLEARED_REASON);
+    this.persist(cleared);
+    this.state = undefined;
+    return cleared;
   }
 
   scheduleSubagentWake(): void {
@@ -229,7 +235,12 @@ export class GoalController {
     if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
       const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
       if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);
+      return;
     }
+    this.hidden(
+      GOAL_CONTINUE_MESSAGE,
+      `Goal evaluation failed transiently (${failures}/${DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures}). Continue pursuing the active goal; evaluation will retry after settlement. Reason: ${reason}`,
+    );
   }
 
   private async evaluateOnce(ctx: ExtensionContext): Promise<void> {
