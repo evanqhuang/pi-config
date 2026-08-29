@@ -5,6 +5,7 @@
     "npm:@pandi-coding-agent/goal",
     "npm:pi-prewalk",
     "dev/pi-plan-mode",
+    "dev/pi-notes",
     "npm:pi-rtk-rewrite",
     {
       "source": "npm:pi-playwright",

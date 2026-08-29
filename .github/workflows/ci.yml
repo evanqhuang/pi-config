@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PI_CODING_AGENT_DIR: ${{ github.workspace }}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: pi-code-review
+            directory: dev/pi-code-review
+            install: npm ci
+            check: npm run check
+          - package: pi-notes
+            directory: dev/pi-notes
+            install: npm ci
+            check: npm run check
+          - package: pi-subagents-local
+            directory: dev/pi-subagents-local
+            install: npm ci
+            check: npm run check
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.directory }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.directory }}
+        run: ${{ matrix.install }}
+
+      - name: Prepare pi-subagents-local integration environment
+        if: matrix.package == 'pi-subagents-local'
+        run: npm ci --prefix "$GITHUB_WORKSPACE/dev/pi-plan-mode"
+
+      - name: Typecheck and test
+        working-directory: ${{ matrix.directory }}
+        run: ${{ matrix.check }}
+
+  plan-mode-portable:
+    name: pi-plan-mode-portable
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-plan-mode/package-lock.json
+
+      - name: Install dependencies
+        working-directory: dev/pi-plan-mode
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: dev/pi-plan-mode
+        run: npm run typecheck
+
+      - name: Portable policy and reminder tests
+        working-directory: dev/pi-plan-mode
+        run: >-
+          node --test
+          test/policy.test.mjs
+          test/plan-reminder.test.mjs
+          test/orchestrator-reminder.test.mjs
+
+  # The full PLAN suite still contains pre-existing workstation/native-sandbox
+  # assumptions. Do not emulate one developer's filesystem on hosted runners;
+  # keep CI to the portable suite until those tests are environment-agnostic.
+
+  required:
+    name: required
+    if: always()
+    needs: [packages, plan-mode-portable]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs passed
+        env:
+          PACKAGES_RESULT: ${{ needs.packages.result }}
+          PLAN_MODE_PORTABLE_RESULT: ${{ needs.plan-mode-portable.result }}
+        run: |
+          test "$PACKAGES_RESULT" = "success"
+          test "$PLAN_MODE_PORTABLE_RESULT" = "success"
