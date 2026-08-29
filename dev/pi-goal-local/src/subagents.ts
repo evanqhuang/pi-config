@@ -1,10 +1,29 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getPiSubagentsServiceV3, type EphemeralAgentResult, type PiSubagentsServiceV3 } from "../../pi-subagents-local/src/service.js";
 
-let service: PiSubagentsServiceV3 | undefined;
+const PI_SUBAGENTS_SERVICE_V3 = Symbol.for("pi-subagents:service:v3");
 
-export function subagents(): PiSubagentsServiceV3 {
-  service ??= getPiSubagentsServiceV3();
+interface EphemeralAgentResult {
+  output: string;
+  failure?: string;
+  aborted: boolean;
+  steered: boolean;
+}
+
+interface PiSubagentsServiceV3 {
+  runEphemeralAgent(options: {
+    pi: ExtensionAPI;
+    ctx: ExtensionContext;
+    type: string;
+    prompt: string;
+    description?: string;
+    signal?: AbortSignal;
+  }): Promise<EphemeralAgentResult>;
+  hasActiveAgents(): boolean;
+}
+
+function subagents(): PiSubagentsServiceV3 {
+  const service = (globalThis as Record<PropertyKey, unknown>)[PI_SUBAGENTS_SERVICE_V3] as PiSubagentsServiceV3 | undefined;
+  if (!service) throw new Error("pi-subagents-local service v3 is unavailable in this session.");
   return service;
 }
 
