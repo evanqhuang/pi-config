@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: pi-code-review
+            directory: dev/pi-code-review
+            install: npm ci
+            check: npm run check
+          - package: pi-notes
+            directory: dev/pi-notes
+            install: npm install
+            check: npm run check
+          - package: pi-plan-mode
+            directory: dev/pi-plan-mode
+            install: npm ci
+            check: npm run typecheck && npm test
+          - package: pi-subagents-local
+            directory: dev/pi-subagents-local
+            install: npm ci
+            check: npm run check
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.directory }}
+        run: ${{ matrix.install }}
+
+      - name: Typecheck and test
+        working-directory: ${{ matrix.directory }}
+        run: ${{ matrix.check }}
+
+  required:
+    name: required
+    if: always()
+    needs: [packages]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs passed
+        env:
+          PACKAGES_RESULT: ${{ needs.packages.result }}
+        run: test "$PACKAGES_RESULT" = "success"
