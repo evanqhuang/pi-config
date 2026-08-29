@@ -8,22 +8,39 @@ on:
     paths:
       - "dev/pi-goal-local/**"
       - "dev/pi-subagents-local/**"
+      - "dev/pi-plan-mode/**"
+      - "extensions/local-mode/**"
       - "agents/GoalJudge.md"
       - "agents/GoalVerifier.md"
       - "settings.json"
       - ".github/workflows/native-goal-local.yml"
+
+permissions:
+  contents: write
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Apply lineage patch in verification workspace
+      - name: Mirror Pi agent directory layout
+        run: |
+          mkdir -p "$HOME/.pi"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/.pi/agent"
+
+      - name: Install integration dependencies
+        run: |
+          npm ci --prefix dev/pi-subagents-local
+          npm ci --prefix dev/pi-plan-mode
+
+      - name: Apply required in-memory child lineage fix
         shell: bash
         run: |
           python3 - <<'PY'
@@ -43,11 +60,24 @@ jobs:
           PY
 
       - name: Check pi-subagents-local
-        run: |
-          npm ci --prefix dev/pi-subagents-local
-          npm run check --prefix dev/pi-subagents-local
+        run: npm run check --prefix dev/pi-subagents-local
 
-      - name: Check pi-goal-local
+      - name: Check native goal package
         run: |
           npm install --prefix dev/pi-goal-local --no-package-lock
           npm run check --prefix dev/pi-goal-local
+
+      - name: Check local-mode session policy
+        run: node --test extensions/local-mode/session-policy.test.cjs
+
+      - name: Commit lineage fix after verification
+        if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
+        run: |
+          if git diff --quiet -- dev/pi-subagents-local/src/agent-runner.ts; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add dev/pi-subagents-local/src/agent-runner.ts
+          git commit -m "Preserve lineage for in-memory subagents"
+          git push origin HEAD:feat/native-goal-local
