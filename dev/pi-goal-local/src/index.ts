@@ -12,7 +12,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_switch", () => {
-    ctx = undefined;
+    controller.prepareForNavigation();
+  });
+
+  pi.on("session_before_fork", () => {
+    controller.prepareForNavigation();
+  });
+
+  pi.on("session_before_tree", () => {
+    controller.prepareForNavigation();
+  });
+
+  pi.on("session_tree", (_event, treeCtx) => {
+    ctx = treeCtx;
+    controller.restoreSelectedBranch(treeCtx);
   });
 
   pi.on("session_shutdown", () => {
@@ -38,7 +51,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
       switch (command.kind) {
         case "status":
-          controller.restore(activeCtx);
+          controller.refresh(activeCtx);
           commandCtx.ui.notify(formatGoalStatus(controller.current), "info");
           return;
         case "start": {
