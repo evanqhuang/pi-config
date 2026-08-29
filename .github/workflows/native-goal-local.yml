@@ -1,0 +1,61 @@
+name: Native goal verification
+
+on:
+  push:
+    branches:
+      - feat/native-goal-local
+  pull_request:
+    paths:
+      - "dev/pi-goal-local/**"
+      - "dev/pi-subagents-local/**"
+      - "dev/pi-plan-mode/**"
+      - "extensions/local-mode/**"
+      - "agents/GoalJudge.md"
+      - "agents/GoalVerifier.md"
+      - "settings.json"
+      - ".github/workflows/native-goal-local.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Mirror Pi agent directory layout
+        run: |
+          mkdir -p "$HOME/.pi"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/.pi/agent"
+
+      - name: Install integration dependencies
+        run: |
+          npm ci --prefix dev/pi-subagents-local
+          npm ci --prefix dev/pi-plan-mode
+          npm install --no-save --no-package-lock jiti
+
+      - name: Check pi-subagents-local
+        run: npm run check --prefix dev/pi-subagents-local
+
+      - name: Check native goal package
+        run: |
+          npm install --prefix dev/pi-goal-local --no-package-lock
+          npm run check --prefix dev/pi-goal-local
+
+      - name: Check portable plan-mode contracts
+        run: |
+          npm run typecheck --prefix dev/pi-plan-mode
+          node --test \
+            dev/pi-plan-mode/test/orchestrator-reminder.test.mjs \
+            dev/pi-plan-mode/test/plan-reminder.test.mjs \
+            dev/pi-plan-mode/test/policy.test.mjs
+
+      - name: Check local-mode session policy
+        run: node --test extensions/local-mode/session-policy.test.cjs

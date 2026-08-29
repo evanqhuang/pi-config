@@ -910,7 +910,11 @@ export async function runAgent(
           // still persist rather than take the whole spawn down.
           parentSession: ctx.sessionManager?.getSessionFile?.(),
         })
-      : SessionManager.inMemory(effectiveCwd);
+      : SessionManager.inMemory(effectiveCwd, {
+          parentSession:
+            ctx.sessionManager?.getSessionFile?.() ??
+            ctx.sessionManager?.getSessionId?.(),
+        });
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.

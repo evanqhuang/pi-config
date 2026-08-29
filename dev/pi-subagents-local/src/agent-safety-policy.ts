@@ -27,10 +27,17 @@ const LUNA_TEST_VERIFIER_POLICY: AgentSafetyPolicy = Object.freeze({
   snapshotSource: true,
 });
 
+const GOAL_VERIFIER_POLICY: AgentSafetyPolicy = Object.freeze({
+  isolation: "worktree",
+  worktreeDisposition: "discard",
+  snapshotSource: true,
+});
+
 /** The only policy entries. Keep this table private so callers cannot mutate it. */
 const AGENT_SAFETY_POLICIES: Readonly<Record<string, AgentSafetyPolicy>> = Object.freeze({
   LunaCompliance: LUNA_COMPLIANCE_POLICY,
   LunaTestVerifier: LUNA_TEST_VERIFIER_POLICY,
+  GoalVerifier: GOAL_VERIFIER_POLICY,
 });
 
 /**
