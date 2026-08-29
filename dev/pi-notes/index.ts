@@ -244,7 +244,10 @@ async function ensureSafeDestination(runtime: NotesRuntime): Promise<void> {
   if (rootStat.isSymbolicLink()) throw new Error("Notes root must not be a symlink");
   const resolvedRoot = await realpath(root);
   const directory = dirname(runtime.notesPath);
-  const rel = relative(resolvedRoot, resolve(directory));
+  // Compare lexical paths before creation so symlinked ancestors such as macOS
+  // /tmp -> /private/tmp do not look like an escape. The realpath check below
+  // validates the created directory against the canonical root.
+  const rel = relative(resolve(root), resolve(directory));
   if (rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
     throw new Error("Notes destination escapes the configured agent notes directory");
   }

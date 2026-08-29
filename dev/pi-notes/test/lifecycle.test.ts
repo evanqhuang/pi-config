@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -94,6 +94,23 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
 }
 
 describe("session lifecycle integration", () => {
+  it.skipIf(process.platform === "win32")("accepts an agent directory reached through a symlinked ancestor", async () => {
+    const container = await mkdtemp(join(tmpdir(), "pi-notes-symlink-"));
+    createdRoots.push(container);
+    const realRoot = join(container, "real");
+    const aliasRoot = join(container, "alias");
+    await mkdir(realRoot);
+    await symlink(realRoot, aliasRoot, "dir");
+
+    const h = await makeHarness([], aliasRoot);
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+
+    await expect(h.checkpointTool.execute("cp-symlink", payload)).resolves.toMatchObject({
+      details: { generation: 1 },
+    });
+  });
+
   it("restores the selected branch and isolates /fork and /new identities", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
