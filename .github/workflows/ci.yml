@@ -34,10 +34,6 @@ jobs:
             directory: dev/pi-notes
             install: npm install
             check: npm run check
-          - package: pi-plan-mode
-            directory: dev/pi-plan-mode
-            install: npm ci
-            check: npm run typecheck && npm test
           - package: pi-subagents-local
             directory: dev/pi-subagents-local
             install: npm ci
@@ -56,12 +52,34 @@ jobs:
         working-directory: ${{ matrix.directory }}
         run: ${{ matrix.install }}
 
-      - name: Prepare pi-plan-mode integration environment
-        if: matrix.package == 'pi-plan-mode'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap ripgrep socat
+      - name: Prepare pi-subagents-local integration environment
+        if: matrix.package == 'pi-subagents-local'
+        run: npm ci --prefix "$GITHUB_WORKSPACE/dev/pi-plan-mode"
 
+      - name: Typecheck and test
+        working-directory: ${{ matrix.directory }}
+        run: ${{ matrix.check }}
+
+  plan-mode:
+    name: pi-plan-mode
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: dev/pi-plan-mode
+        run: npm ci
+
+      - name: Prepare native integration environment
+        run: |
+          brew install ripgrep socat || true
           npm install --prefix "$GITHUB_WORKSPACE/npm" --no-save context-mode
 
           sudo mkdir -p \
@@ -72,21 +90,20 @@ jobs:
           sudo ln -s "$GITHUB_WORKSPACE/npm/node_modules/context-mode" /Users/evanhuang/.pi/agent/npm/node_modules/context-mode
           sudo npm install --prefix /opt/homebrew/lib @earendil-works/pi-coding-agent@0.84.3
 
-      - name: Prepare pi-subagents-local integration environment
-        if: matrix.package == 'pi-subagents-local'
-        run: npm ci --prefix "$GITHUB_WORKSPACE/dev/pi-plan-mode"
-
       - name: Typecheck and test
-        working-directory: ${{ matrix.directory }}
-        run: ${{ matrix.check }}
+        working-directory: dev/pi-plan-mode
+        run: npm run typecheck && npm test
 
   required:
     name: required
     if: always()
-    needs: [packages]
+    needs: [packages, plan-mode]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs passed
         env:
           PACKAGES_RESULT: ${{ needs.packages.result }}
-        run: test "$PACKAGES_RESULT" = "success"
+          PLAN_MODE_RESULT: ${{ needs.plan-mode.result }}
+        run: |
+          test "$PACKAGES_RESULT" = "success"
+          test "$PLAN_MODE_RESULT" = "success"
