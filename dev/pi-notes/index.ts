@@ -214,9 +214,6 @@ function latestRecord<T>(entries: readonly SessionEntry[], read: (entry: Session
   return undefined;
 }
 
-// A checkpoint is itself the clean-state record for its generation. If the
-// newest matching lifecycle entry is a checkpoint, an older dirty marker must
-// not make the restored branch dirty again.
 function latestStateForId(entries: readonly SessionEntry[], notesId: string): StateRecord | undefined {
   for (let index = entries.length - 1; index >= 0; index--) {
     const checkpoint = compatibleCheckpoint(entries[index]);
@@ -280,6 +277,11 @@ async function readCurrentHash(path: string): Promise<string | undefined> {
   }
 }
 
+export async function hasUnexpectedMaterializedChange(runtime: NotesRuntime): Promise<boolean> {
+  if (!runtime.lastCheckpointHash) return false;
+  return await readCurrentHash(runtime.notesPath) !== runtime.lastCheckpointHash;
+}
+
 async function atomicWrite(path: string, content: string): Promise<void> {
   const tmp = join(dirname(path), `.NOTES.${process.pid}.${randomUUID()}.tmp`);
   try {
@@ -307,11 +309,8 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
   runtime.checkpointInFlight = true;
   try {
     await ensureSafeDestination(runtime);
-    if (runtime.lastCheckpointHash) {
-      const currentHash = await readCurrentHash(runtime.notesPath);
-      if (currentHash !== runtime.lastCheckpointHash) {
-        throw new Error("Session-local NOTES.md changed outside checkpoint_notes; run /notes restore before checkpointing");
-      }
+    if (await hasUnexpectedMaterializedChange(runtime)) {
+      throw new Error("Session-local NOTES.md changed outside checkpoint_notes; run /notes restore before checkpointing");
     }
     const rendered = renderNotes(payload, runtime);
     const bytes = Buffer.byteLength(rendered, "utf8");
@@ -681,6 +680,8 @@ export default function notesExtension(pi: ExtensionAPI): void {
         if (Buffer.byteLength(rendered, "utf8") > DEFAULT_CONFIG.notesMaxBytes) throw new Error("Inherited Notes exceed configured bound");
         await ensureSafeDestination(runtime);
         await atomicWrite(runtime.notesPath, rendered);
+        runtime.lastCheckpointHash = hashText(rendered);
+        runtime.lastCheckpointAt = undefined;
         appendState(pi, runtime);
         ctx.ui.notify(`Adopted inherited checkpoint content into fresh Notes identity ${runtime.notesId}; checkpoint it before relying on it.`, "info");
         return;
@@ -731,7 +732,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     if (event.toolName === "checkpoint_notes") return;
     recordActivity(pi, runtime, event.toolName, event.input, event.isError);
   });
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (isChildSession() && event.toolName === "checkpoint_notes") {
       return { block: true, reason: "Child subagent sessions cannot write the parent session Notes file." };
     }
@@ -742,8 +743,13 @@ export default function notesExtension(pi: ExtensionAPI): void {
       }
     }
     if (DEFAULT_CONFIG.integrations.goal && event.toolName === "goal_progress") {
-      if ((event.input as Record<string, unknown>).status === "done" && runtime.active && runtime.dirty) {
-        return { block: true, reason: "Goal completion is blocked until dirty durable Notes are checkpointed with checkpoint_notes." };
+      if ((event.input as Record<string, unknown>).status === "done" && runtime.active) {
+        if (runtime.dirty) {
+          return { block: true, reason: "Goal completion is blocked until dirty durable Notes are checkpointed with checkpoint_notes." };
+        }
+        if (await hasUnexpectedMaterializedChange(runtime)) {
+          return { block: true, reason: "Goal completion is blocked because session-local NOTES.md changed outside checkpoint_notes; run /notes restore before completing the goal." };
+        }
       }
     }
     return undefined;
