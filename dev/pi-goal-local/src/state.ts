@@ -1,6 +1,8 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { GOAL_STATE_TYPE, type GoalStateV1, type GoalStatus } from "./types.js";
 
+export const CLEARED_REASON = "__pi_goal_cleared__";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -56,7 +58,9 @@ export function latestGoalState(entries: readonly SessionEntry[]): GoalStateV1 |
     const entry = entries[i];
     if (entry.type !== "custom" || entry.customType !== GOAL_STATE_TYPE) continue;
     const parsed = parseGoalState(entry.data);
-    if (parsed) return parsed;
+    if (!parsed) continue;
+    if (parsed.status === "stopped" && parsed.terminalReason === CLEARED_REASON) return undefined;
+    return parsed;
   }
   return undefined;
 }
