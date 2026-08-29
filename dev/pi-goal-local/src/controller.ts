@@ -52,6 +52,7 @@ function entriesSinceGoal(entries: readonly SessionEntry[], goal: GoalStateV1): 
 export class GoalController {
   private ctx: ExtensionContext | undefined;
   private state: GoalStateV1 | undefined;
+  private sessionEpoch = 0;
   private evaluationInFlight = false;
   private evaluationQueued = false;
   private wakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -104,33 +105,71 @@ export class GoalController {
     return "Use the main session's currently selected PLAN / ORCHESTRATOR / YOLO mode and available tools. Do not assume unavailable capabilities. Goal evaluation itself cannot mutate through GoalJudge; GoalVerifier is read-only acceptance verification.";
   }
 
+  private invalidatePendingEvaluation(): void {
+    this.sessionEpoch += 1;
+    this.evaluatorAbort?.abort();
+    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    this.wakeTimer = undefined;
+    this.evaluationQueued = false;
+  }
+
+  private refreshEvaluationState(ctx: ExtensionContext, epoch: number, current: GoalStateV1): boolean {
+    if (epoch !== this.sessionEpoch || this.ctx !== ctx) return false;
+    this.state = this.branchState(ctx);
+    return this.state?.id === current.id
+      && this.state.generation === current.generation
+      && this.state.status === "active";
+  }
+
+  private scheduleResume(ctx: ExtensionContext, goal: GoalStateV1, epoch: number): void {
+    setTimeout(() => {
+      if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
+      this.state = this.branchState(ctx);
+      if (this.state?.id !== goal.id || this.state.generation !== goal.generation || this.state.status !== "active") return;
+      if (!parentReady(ctx) || hasActiveSubagents()) return;
+      this.hidden(GOAL_CONTINUE_MESSAGE, `Resume autonomous pursuit of the active goal:\n\n${goal.objective}`);
+    }, 0);
+  }
+
   restore(ctx: ExtensionContext): void {
+    this.sessionEpoch += 1;
     this.syncBranch(ctx);
     const goal = this.state;
     if (!goal || goal.status !== "active") return;
     const key = `${ctx.sessionManager.getSessionId()}+${goal.id}+${goal.generation}`;
     if (restoredInProcess.has(key)) return;
     restoredInProcess.add(key);
-    setTimeout(() => {
-      if (this.state?.id !== goal.id || this.state.generation !== goal.generation || this.state.status !== "active") return;
-      if (!this.ctx || !parentReady(this.ctx) || hasActiveSubagents()) return;
-      this.hidden(GOAL_CONTINUE_MESSAGE, `Resume autonomous pursuit of the active goal:\n\n${goal.objective}`);
-    }, 0);
+    this.scheduleResume(ctx, goal, this.sessionEpoch);
+  }
+
+  restoreSelectedBranch(ctx: ExtensionContext): void {
+    this.sessionEpoch += 1;
+    this.syncBranch(ctx);
+    const goal = this.state;
+    if (!goal || goal.status !== "active") return;
+    this.scheduleResume(ctx, goal, this.sessionEpoch);
+  }
+
+  refresh(ctx: ExtensionContext): GoalStateV1 | undefined {
+    this.syncBranch(ctx);
+    return this.state;
+  }
+
+  prepareForNavigation(): void {
+    this.invalidatePendingEvaluation();
   }
 
   shutdown(): void {
-    this.evaluatorAbort?.abort();
+    this.invalidatePendingEvaluation();
     this.evaluatorAbort = undefined;
-    if (this.wakeTimer) clearTimeout(this.wakeTimer);
-    this.wakeTimer = undefined;
     this.ctx = undefined;
     this.state = undefined;
-    this.evaluationQueued = false;
   }
 
   start(ctx: ExtensionContext, objective: string, criteria: string[]): GoalStateV1 {
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
+      this.evaluatorAbort?.abort();
       this.persist(terminalState(this.state, "stopped", "Replaced by a newer /goal generation."));
     }
     const previous = this.state;
@@ -194,11 +233,13 @@ export class GoalController {
 
   scheduleSubagentWake(): void {
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    const ctx = this.ctx;
+    const epoch = this.sessionEpoch;
+    if (!ctx) return;
     this.wakeTimer = setTimeout(() => {
       this.wakeTimer = undefined;
-      const ctx = this.ctx;
-      if (!ctx) return;
-      this.syncBranch(ctx);
+      if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
+      this.state = this.branchState(ctx);
       if (this.state?.status !== "active" || hasActiveSubagents() || !parentReady(ctx)) return;
       this.hidden(GOAL_SUBAGENT_UPDATE_MESSAGE, "Background subagent work has settled. Reassess the active goal using the new results.");
     }, WAKE_DEBOUNCE_MS);
@@ -227,10 +268,15 @@ export class GoalController {
     }
   }
 
-  private async evaluatorFailure(current: GoalStateV1, reason: string): Promise<void> {
-    if (!this.state || this.state.id !== current.id || this.state.generation !== current.generation) return;
-    const failures = current.consecutiveJudgeFailures + 1;
-    const next: GoalStateV1 = { ...current, consecutiveJudgeFailures: failures, lastReason: reason, updatedAt: Date.now() };
+  private async evaluatorFailure(ctx: ExtensionContext, epoch: number, current: GoalStateV1, reason: string): Promise<void> {
+    if (!this.refreshEvaluationState(ctx, epoch, current) || !this.state) return;
+    const failures = this.state.consecutiveJudgeFailures + 1;
+    const next: GoalStateV1 = {
+      ...this.state,
+      consecutiveJudgeFailures: failures,
+      lastReason: reason,
+      updatedAt: Date.now(),
+    };
     this.persist(next);
     if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
       const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
@@ -246,6 +292,7 @@ export class GoalController {
   private async evaluateOnce(ctx: ExtensionContext): Promise<void> {
     this.syncBranch(ctx);
     const current = this.state;
+    const epoch = this.sessionEpoch;
     if (!current || current.status !== "active") return;
     if (!parentReady(ctx) || hasActiveSubagents()) return;
 
@@ -265,7 +312,6 @@ export class GoalController {
     const entries = ctx.sessionManager.buildContextEntries();
     const evidenceText = buildGoalEvidence(entriesSinceGoal(entries, current));
     const evidenceFingerprint = fingerprintEvidence(evidenceText);
-    const generation = current.generation;
     this.evaluatorAbort = new AbortController();
 
     let judgeOutput: string;
@@ -281,17 +327,16 @@ export class GoalController {
       if (judge.failure || judge.aborted) throw new Error(judge.failure ?? "GoalJudge aborted");
       judgeOutput = judge.output;
     } catch (error) {
-      await this.evaluatorFailure(current, error instanceof Error ? error.message : String(error));
+      await this.evaluatorFailure(ctx, epoch, current, error instanceof Error ? error.message : String(error));
       return;
     } finally {
       this.evaluatorAbort = undefined;
     }
 
-    this.syncBranch(ctx);
-    if (!this.state || this.state.id !== current.id || this.state.generation !== generation || this.state.status !== "active") return;
+    if (!this.refreshEvaluationState(ctx, epoch, current)) return;
     const verdict = parseGoalVerdict(judgeOutput);
     if (!verdict) {
-      await this.evaluatorFailure(current, "GoalJudge returned malformed output.");
+      await this.evaluatorFailure(ctx, epoch, current, "GoalJudge returned malformed output.");
       return;
     }
 
@@ -320,11 +365,10 @@ export class GoalController {
         if (verifier.failure || verifier.aborted) throw new Error(verifier.failure ?? "GoalVerifier aborted");
         const parsed = parseVerifierVerdict(verifier.output);
         if (!parsed) throw new Error("GoalVerifier returned malformed output.");
+        if (!this.refreshEvaluationState(ctx, epoch, current)) return;
         if (parsed.ok) {
-          this.syncBranch(ctx);
-          if (!this.state || this.state.id !== current.id || this.state.generation !== generation || this.state.status !== "active") return;
           const completed: GoalStateV1 = {
-            ...this.state,
+            ...this.state!,
             status: "completed",
             updatedAt: Date.now(),
             lastReason: parsed.reason,
@@ -343,8 +387,7 @@ export class GoalController {
         this.evaluatorAbort = undefined;
       }
 
-      this.syncBranch(ctx);
-      if (!this.state || this.state.id !== current.id || this.state.generation !== generation || this.state.status !== "active") return;
+      if (!this.refreshEvaluationState(ctx, epoch, current) || !this.state) return;
       const failures = this.state.verificationFailures + 1;
       const next: GoalStateV1 = {
         ...this.state,
@@ -369,8 +412,8 @@ export class GoalController {
       ? current.noProgressCycles + 1
       : 0;
     const next: GoalStateV1 = {
-      ...current,
-      iteration: current.iteration + 1,
+      ...this.state!,
+      iteration: this.state!.iteration + 1,
       consecutiveJudgeFailures: 0,
       noProgressCycles: noProgress,
       lastReason: verdict.reason,
