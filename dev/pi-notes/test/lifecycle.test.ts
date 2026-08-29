@@ -37,9 +37,9 @@ function latestCustom(entries: any[], customType: string): any | undefined {
   return undefined;
 }
 
-async function makeHarness(initialBranch: any[] = []) {
-  const root = await mkdtemp(join(tmpdir(), "pi-notes-lifecycle-"));
-  createdRoots.push(root);
+async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
+  const root = existingRoot ?? await mkdtemp(join(tmpdir(), "pi-notes-lifecycle-"));
+  if (!existingRoot) createdRoots.push(root);
   process.env.PI_CODING_AGENT_DIR = root;
 
   let branch = [...initialBranch];
@@ -143,7 +143,7 @@ describe("session lifecycle integration", () => {
     const branch = source.branch.slice();
 
     await unlink(notesPath);
-    const resumed = await makeHarness(branch);
+    const resumed = await makeHarness(branch, source.root);
     await resumed.handlers.get("session_start")!({ reason: "resume" }, resumed.ctx);
 
     expect(await resumed.status()).toContain("generation: 1");
