@@ -93,9 +93,9 @@ jobs:
           test/plan-reminder.test.mjs
           test/orchestrator-reminder.test.mjs
 
-  # The full PLAN suite still contains workstation/native-sandbox assumptions.
-  # Do not emulate one developer's filesystem on hosted runners: keep CI to the
-  # portable suite until those pre-existing tests are made environment-agnostic.
+  # The full PLAN suite still contains pre-existing workstation/native-sandbox
+  # assumptions. Do not emulate one developer's filesystem on hosted runners;
+  # keep CI to the portable suite until those tests are environment-agnostic.
 
   required:
     name: required
