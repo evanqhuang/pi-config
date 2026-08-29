@@ -120,6 +120,11 @@ describe("evaluator parsing", () => {
       reason: "verified",
       evidence: ["test passed"],
     });
+    expect(parseVerifierVerdict('{"ok":false,"reason":"acceptance check failed","evidence":["npm test: 1 failed","src/x.ts mismatch"]}')).toEqual({
+      ok: false,
+      reason: "acceptance check failed\nEvidence: npm test: 1 failed | src/x.ts mismatch",
+      evidence: ["npm test: 1 failed", "src/x.ts mismatch"],
+    });
   });
 
   it("fingerprints evidence deterministically", () => {
