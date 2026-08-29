@@ -108,4 +108,13 @@ describe("transient reminders", () => {
     expect(runtime.reentryRequired).toBe(false);
     expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
   });
+
+  it("honors an explicit checkpoint request even when Notes are clean", () => {
+    const runtime = createRuntime("manual");
+    runtime.dirty = false;
+    runtime.checkpointDue = true;
+    const pi = { getActiveTools: () => ["checkpoint_notes"] };
+
+    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
+  });
 });
