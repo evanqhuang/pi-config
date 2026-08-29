@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PI_CODING_AGENT_DIR: ${{ github.workspace }}
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -52,6 +55,26 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ matrix.directory }}
         run: ${{ matrix.install }}
+
+      - name: Prepare pi-plan-mode integration environment
+        if: matrix.package == 'pi-plan-mode'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap ripgrep socat
+
+          npm install --prefix "$GITHUB_WORKSPACE/npm" --no-save context-mode
+
+          sudo mkdir -p \
+            /Users/evanhuang/.pi/agent/dev \
+            /Users/evanhuang/.pi/agent/npm/node_modules \
+            /opt/homebrew/lib
+          sudo ln -s "$GITHUB_WORKSPACE/dev/pi-plan-mode" /Users/evanhuang/.pi/agent/dev/pi-plan-mode
+          sudo ln -s "$GITHUB_WORKSPACE/npm/node_modules/context-mode" /Users/evanhuang/.pi/agent/npm/node_modules/context-mode
+          sudo npm install --prefix /opt/homebrew/lib @earendil-works/pi-coding-agent@0.84.3
+
+      - name: Prepare pi-subagents-local integration environment
+        if: matrix.package == 'pi-subagents-local'
+        run: npm ci --prefix "$GITHUB_WORKSPACE/dev/pi-plan-mode"
 
       - name: Typecheck and test
         working-directory: ${{ matrix.directory }}
