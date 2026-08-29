@@ -19,14 +19,14 @@ Notes are never written into the project tree. Each top-level session owns:
 - `/notes off` — disable tracking/reminders without deleting the file.
 - `/notes auto` — use conservative automatic activation.
 - `/notes checkpoint` — request a model-authored checkpoint immediately when the agent is idle.
-- `/notes resume` — explicitly seed a fresh fork/session identity from a compatible inherited checkpoint.
+- `/notes resume` — explicitly seed a fresh fork/session identity from a compatible inherited checkpoint, baseline the materialized copy for integrity checks, and require a new checkpoint before relying on it.
 - `/notes restore` — rematerialize the latest committed checkpoint for the active branch while preserving its clean/dirty state.
 
 ## Tool
 
 `checkpoint_notes` is sequential, accepts bounded structured semantic state, and has no path/session/hash/generation arguments. The extension adds deterministic harness facts and atomically rewrites the fixed session-local `NOTES.md`.
 
-While Notes is active, built-in `edit`/`write` calls targeting the canonical Notes file are blocked. Unexpected external changes are detected at checkpoint/restore boundaries.
+While Notes is active, built-in `edit`/`write` calls targeting the canonical Notes file are blocked. Unexpected external changes are detected before checkpointing and, when goal integration is present, before allowing goal completion; `/notes restore` rematerializes the trusted committed snapshot.
 
 ## Lifecycle
 
@@ -46,8 +46,8 @@ The core has no dependency on goal, plan mode, orchestrator, subagents, memory, 
 
 When present:
 
-- `goal_progress({ status: "done" })` is blocked while active Notes are dirty.
-- `Symbol.for("pi-subagents:child-context:v1")` prevents child sessions from writing parent Notes.
-- `pi-plan-mode` may explicitly allowlist `checkpoint_notes`; child sessions remain blocked by `pi-notes` itself.
+- `goal_progress({ status: "done" })` is blocked while active Notes are dirty or the materialized checkpoint no longer matches the last committed hash.
+- `Symbol.for("pi-subagents:child-context:v1")` prevents the extension from registering in child subagent sessions.
+- `pi-plan-mode` may explicitly allowlist `checkpoint_notes`; child sessions do not load `pi-notes`.
 
 A Notes checkpoint records continuity state. It is not verification evidence and does not replace a plan, goal, todo system, or completion verifier.
