@@ -16,7 +16,7 @@ on:
       - ".github/workflows/native-goal-local.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -41,107 +41,6 @@ jobs:
           npm ci --prefix dev/pi-plan-mode
           npm install --no-save --no-package-lock jiti
 
-      - name: Apply native goal integration patches
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          runner = Path("dev/pi-subagents-local/src/agent-runner.ts")
-          text = runner.read_text()
-          old = "      : SessionManager.inMemory(effectiveCwd);"
-          new = "\n".join([
-              "      : SessionManager.inMemory(effectiveCwd, {",
-              "          parentSession:",
-              "            ctx.sessionManager?.getSessionFile?.() ??",
-              "            ctx.sessionManager?.getSessionId?.(),",
-              "        });",
-          ])
-          if old in text:
-              runner.write_text(text.replace(old, new, 1))
-          elif new not in text:
-              raise SystemExit("agent-runner lineage anchor not found")
-
-          index = Path("dev/pi-subagents-local/src/index.ts")
-          text = index.read_text()
-          import_anchor = 'import { SubagentScheduler } from "./schedule.js";'
-          service_import = 'import { getPiSubagentsServiceV3 } from "./service.js";'
-          if service_import not in text:
-              if import_anchor not in text:
-                  raise SystemExit("subagents service import anchor not found")
-              text = text.replace(import_anchor, import_anchor + "\n" + service_import, 1)
-          factory_anchor = "  if (inChildSessionContext()) return;"
-          service_start = factory_anchor + "\n\n  // Expose the small versioned process-local evaluator seam for sibling extensions.\n  getPiSubagentsServiceV3();"
-          if service_start not in text:
-              if factory_anchor not in text:
-                  raise SystemExit("subagents factory anchor not found")
-              text = text.replace(factory_anchor, service_start, 1)
-          index.write_text(text)
-
-          controller = Path("dev/pi-goal-local/src/controller.ts")
-          text = controller.read_text()
-          import_old = 'import { latestGoalState, nextGeneration, terminalState } from "./state.js";'
-          import_new = 'import { CLEARED_REASON, latestGoalState, nextGeneration, terminalState } from "./state.js";'
-          if import_old in text:
-              text = text.replace(import_old, import_new, 1)
-          elif import_new not in text:
-              raise SystemExit("goal state import anchor not found")
-
-          usage_old = "  const usage = runtime.getContextUsage?.();"
-          usage_new = "  const usage = runtime.getContextUsage?.() as unknown as { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;"
-          if usage_old in text:
-              text = text.replace(usage_old, usage_new, 1)
-          elif usage_new not in text:
-              raise SystemExit("goal context usage anchor not found")
-
-          clear_old = "\n".join([
-              "  clear(ctx: ExtensionContext): GoalStateV1 | undefined {",
-              '    return this.stop(ctx, "Cleared by user. Historical goal entries remain append-only.");',
-              "  }",
-          ])
-          clear_new = "\n".join([
-              "  clear(ctx: ExtensionContext): GoalStateV1 | undefined {",
-              "    this.syncBranch(ctx);",
-              "    if (!this.state) return undefined;",
-              "    this.evaluatorAbort?.abort();",
-              '    const cleared = terminalState(this.state, "stopped", CLEARED_REASON);',
-              "    this.persist(cleared);",
-              "    this.state = undefined;",
-              "    return cleared;",
-              "  }",
-          ])
-          if clear_old in text:
-              text = text.replace(clear_old, clear_new, 1)
-          elif clear_new not in text:
-              raise SystemExit("goal clear anchor not found")
-
-          failure_old = "\n".join([
-              "    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {",
-              '      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);',
-              '      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);',
-              "    }",
-              "  }",
-          ])
-          failure_new = "\n".join([
-              "    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {",
-              '      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);',
-              '      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);',
-              "      return;",
-              "    }",
-              "    this.hidden(",
-              "      GOAL_CONTINUE_MESSAGE,",
-              '      `Goal evaluation failed transiently (${failures}/${DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures}). Continue pursuing the active goal; evaluation will retry after settlement. Reason: ${reason}`,',
-              "    );",
-              "  }",
-          ])
-          if failure_old in text:
-              text = text.replace(failure_old, failure_new, 1)
-          elif failure_new not in text:
-              raise SystemExit("goal judge failure anchor not found")
-
-          controller.write_text(text)
-          PY
-
       - name: Check pi-subagents-local
         run: npm run check --prefix dev/pi-subagents-local
 
@@ -160,15 +59,3 @@ jobs:
 
       - name: Check local-mode session policy
         run: node --test extensions/local-mode/session-policy.test.cjs
-
-      - name: Commit verified integration patches
-        if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
-        run: |
-          if git diff --quiet -- dev/pi-subagents-local/src/agent-runner.ts dev/pi-subagents-local/src/index.ts dev/pi-goal-local/src/controller.ts; then
-            exit 0
-          fi
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add dev/pi-subagents-local/src/agent-runner.ts dev/pi-subagents-local/src/index.ts dev/pi-goal-local/src/controller.ts
-          git commit -m "Wire native goal evaluator integration"
-          git push origin HEAD:feat/native-goal-local
