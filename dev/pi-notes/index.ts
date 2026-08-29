@@ -214,11 +214,17 @@ function latestRecord<T>(entries: readonly SessionEntry[], read: (entry: Session
   return undefined;
 }
 
+// A checkpoint is itself the clean-state record for its generation. If the
+// newest matching lifecycle entry is a checkpoint, an older dirty marker must
+// not make the restored branch dirty again.
 function latestStateForId(entries: readonly SessionEntry[], notesId: string): StateRecord | undefined {
-  return latestRecord(entries, (entry) => {
-    const state = compatibleState(entry);
-    return state?.notesId === notesId ? state : undefined;
-  });
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const checkpoint = compatibleCheckpoint(entries[index]);
+    if (checkpoint?.notesId === notesId) return undefined;
+    const state = compatibleState(entries[index]);
+    if (state?.notesId === notesId) return state;
+  }
+  return undefined;
 }
 
 function latestCheckpointForId(entries: readonly SessionEntry[], notesId: string): CheckpointRecord | undefined {
