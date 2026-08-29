@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { runAgent } from "./agent-runner.js";
+import { resolveDefaultModel, runAgent } from "./agent-runner.js";
 import { getAgentSafetyPolicy, getUnavailableAgentSafetyPolicyError } from "./agent-safety-policy.js";
 import { registerAgents } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import type { SubagentType } from "./types.js";
+import type { SubagentType, ThinkingLevel } from "./types.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled } from "./worktree.js";
 
 export const PI_SUBAGENTS_SERVICE_V3 = Symbol.for("pi-subagents:service:v3");
@@ -17,6 +17,8 @@ export interface EphemeralAgentOptions {
   prompt: string;
   description?: string;
   signal?: AbortSignal;
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface EphemeralAgentResult {
@@ -86,12 +88,20 @@ function createService(): PiSubagentsServiceV3 {
       }
 
       try {
+        const model = options.model
+          ? resolveDefaultModel(options.ctx.model, options.ctx.modelRegistry, options.model)
+          : undefined;
+        if (options.model && (!model || `${model.provider}/${model.id}` !== options.model)) {
+          throw new Error(`Configured evaluator model "${options.model}" is unavailable.`);
+        }
         const result = await runAgent(options.ctx, type, options.prompt, {
           pi: options.pi,
           agentId: id,
           signal: options.signal,
           cwd,
           worktreeBase,
+          model,
+          thinkingLevel: options.thinkingLevel,
           disallowedTools: policy?.disallowedTools,
         });
         session = result.session;
