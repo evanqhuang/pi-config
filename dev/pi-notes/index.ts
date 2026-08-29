@@ -25,7 +25,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   },
   checkpointing: {
     dirtyTurns: 6,
-    meaningfulToolCalls: 20,
+    continuityRelevantToolResults: 20,
   },
   integrations: {
     goal: true,
@@ -62,7 +62,7 @@ export interface NotesRuntime {
   dirty: boolean;
   checkpointDue: boolean;
   turnsSinceCheckpoint: number;
-  meaningfulToolCallsSinceCheckpoint: number;
+  continuityRelevantToolResultsSinceCheckpoint: number;
   activationTurns: number;
   activationToolCalls: number;
   readOnlyTurns: number;
@@ -137,7 +137,7 @@ export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMo
     dirty: false,
     checkpointDue: false,
     turnsSinceCheckpoint: 0,
-    meaningfulToolCallsSinceCheckpoint: 0,
+    continuityRelevantToolResultsSinceCheckpoint: 0,
     activationTurns: 0,
     activationToolCalls: 0,
     readOnlyTurns: 0,
@@ -342,7 +342,7 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
     runtime.dirty = false;
     runtime.checkpointDue = false;
     runtime.turnsSinceCheckpoint = 0;
-    runtime.meaningfulToolCallsSinceCheckpoint = 0;
+    runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
     runtime.reentryRequired = false;
     runtime.harnessFacts.recentFailedCommandCount = 0;
     return { hash, generation };
@@ -361,7 +361,7 @@ function resetIdentity(runtime: NotesRuntime): void {
   runtime.checkpointDue = false;
   runtime.reentryRequired = false;
   runtime.turnsSinceCheckpoint = 0;
-  runtime.meaningfulToolCallsSinceCheckpoint = 0;
+  runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
   runtime.activationTurns = 0;
   runtime.activationToolCalls = 0;
   runtime.readOnlyTurns = 0;
@@ -427,7 +427,7 @@ function restoreRuntimeState(runtime: NotesRuntime, state: StateRecord | undefin
   }
   runtime.checkpointDue = runtime.dirty;
   runtime.turnsSinceCheckpoint = 0;
-  runtime.meaningfulToolCallsSinceCheckpoint = 0;
+  runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
   runtime.reentryRequired = runtime.active;
 }
 
@@ -490,6 +490,10 @@ function markDirty(pi: ExtensionAPI, runtime: NotesRuntime): void {
 
 const VERIFY_PATTERN = /(?:^|\s)(?:npm|pnpm|yarn|bun)?\s*(?:test|build|lint|typecheck|check)|\b(?:pytest|cargo test|go test|tsc|eslint|vitest|jest|ruff|mypy)\b/i;
 const MUTATE_PATTERN = /(?:^|\s)(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove)|\b(?:git\s+(?:add|commit|checkout|switch|merge|rebase|reset|restore|clean)|sed\s+-i|mv\s|cp\s|rm\s|mkdir\s|touch\s|chmod\s|chown\s)\b/i;
+const INSPECT_PATTERN = /\b(?:grep|rg|find|ls|cat|head|tail|git\s+(?:status|log|diff|show|branch|rev-parse)|gh\s+(?:pr|issue|repo|run|api)|jq)\b/i;
+const READ_TOOL_PATTERN = /^(?:read|grep|find|ls|symbol_search|project_report|module_report|read_symbol|read_enclosing|lsp_diagnostics|lens_diagnostics|ast_grep_search|ast_grep_outline|lsp_navigation|ctx_execute_file)$/i;
+const RESEARCH_TOOL_PATTERN = /^(?:web_search|source_check|fetch_content|get_search_content|resolve-library-id|query-docs|ctx_execute|ctx_batch_execute|ctx_search|ctx_fetch_and_index)$/i;
+const SUBAGENT_RESULT_TOOL_PATTERN = /^(?:Agent|get_subagent_result)$/i;
 
 function commandFromInput(input: Record<string, unknown>): string | undefined {
   const command = input.command;
@@ -501,23 +505,27 @@ function pathFromInput(input: Record<string, unknown>): string | undefined {
   return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
 }
 
-export function classifyToolResult(toolName: string, input: Record<string, unknown>, isError: boolean): { meaningful: boolean; highSignal: boolean; verification?: string; modifiedPath?: string } {
+export function classifyToolResult(toolName: string, input: Record<string, unknown>, isError: boolean): { continuityRelevant: boolean; highSignal: boolean; verification?: string; modifiedPath?: string } {
   if (toolName === "edit" || toolName === "write") {
-    return { meaningful: true, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
+    return { continuityRelevant: !isError, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
   }
   if (toolName === "bash" || toolName === "powershell") {
     const command = commandFromInput(input);
-    if (!command) return { meaningful: false, highSignal: false };
-    if (VERIFY_PATTERN.test(command)) return { meaningful: true, highSignal: true, verification: command };
-    if (MUTATE_PATTERN.test(command)) return { meaningful: true, highSignal: true };
-    if (isError && !/\b(?:grep|rg|find|ls|cat|head|tail)\b/.test(command)) return { meaningful: true, highSignal: true };
-    return { meaningful: false, highSignal: false };
+    if (!command) return { continuityRelevant: false, highSignal: false };
+    if (VERIFY_PATTERN.test(command)) return { continuityRelevant: true, highSignal: true, verification: command };
+    if (MUTATE_PATTERN.test(command)) return { continuityRelevant: !isError, highSignal: true };
+    if (INSPECT_PATTERN.test(command)) return { continuityRelevant: !isError, highSignal: false };
+    if (isError) return { continuityRelevant: true, highSignal: true };
+    return { continuityRelevant: false, highSignal: false };
   }
   if (/^(?:apply_patch|patch|create_file|update_file|delete_file|migration|format|codegen)$/i.test(toolName)) {
-    return { meaningful: true, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
+    return { continuityRelevant: !isError, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
   }
-  if (/^(?:test|build|lint|typecheck|verify|check)/i.test(toolName)) return { meaningful: true, highSignal: true };
-  return { meaningful: false, highSignal: false };
+  if (/^(?:test|build|lint|typecheck|verify|check)/i.test(toolName)) return { continuityRelevant: true, highSignal: true };
+  if (READ_TOOL_PATTERN.test(toolName) || RESEARCH_TOOL_PATTERN.test(toolName) || SUBAGENT_RESULT_TOOL_PATTERN.test(toolName)) {
+    return { continuityRelevant: !isError, highSignal: false };
+  }
+  return { continuityRelevant: false, highSignal: false };
 }
 
 function recordActivity(pi: ExtensionAPI, runtime: NotesRuntime, toolName: string, input: Record<string, unknown>, isError: boolean): void {
@@ -533,10 +541,13 @@ function recordActivity(pi: ExtensionAPI, runtime: NotesRuntime, toolName: strin
     runtime.harnessFacts.lastVerificationCommand = classified.verification;
     runtime.harnessFacts.lastVerificationOutcome = isError ? "error" : "success";
   }
-  if (classified.meaningful && isError) runtime.harnessFacts.recentFailedCommandCount += 1;
-  if (runtime.active && classified.meaningful) {
-    runtime.meaningfulToolCallsSinceCheckpoint += 1;
+  if (classified.continuityRelevant && isError) runtime.harnessFacts.recentFailedCommandCount += 1;
+  if (runtime.active && classified.continuityRelevant) {
+    runtime.continuityRelevantToolResultsSinceCheckpoint += 1;
     markDirty(pi, runtime);
+    if (runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
+      runtime.checkpointDue = true;
+    }
   }
   activateIfNeeded(pi, runtime);
 }
@@ -725,7 +736,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     if (runtime.active && runtime.dirty) {
       runtime.turnsSinceCheckpoint += 1;
       if (runtime.turnsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.dirtyTurns
-        || runtime.meaningfulToolCallsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.meaningfulToolCalls) {
+        || runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
         runtime.checkpointDue = true;
       }
     }

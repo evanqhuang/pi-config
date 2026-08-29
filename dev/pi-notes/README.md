@@ -30,9 +30,11 @@ While Notes is active, built-in `edit`/`write` calls targeting the canonical Not
 
 ## Lifecycle
 
+Automatic activation is intentionally conservative: 8 turns or 32 tool calls after high-signal activity, or 10 consecutive read-only turns. Activation signal and checkpoint freshness are independent. Once Notes are active, the first successful continuity-relevant result—such as source inspection, research, subagent output, verification, or mutation—marks a clean checkpoint dirty. Checkpoint pressure begins after 6 additional dirty turns or 20 continuity-relevant tool results; compaction and completion still enforce freshness immediately.
+
 The extension uses Pi core APIs only:
 
-- `tool_result` for meaningful activity and verification tracking.
+- `tool_result` for independent high-signal activation, continuity-relevant freshness, and verification tracking.
 - `before_agent_start` for the static Notes policy.
 - `context` for transient de-duplicated checkpoint/re-entry reminders.
 - `pi.appendEntry()` for branch-local dirty/checkpoint state.
@@ -40,7 +42,7 @@ The extension uses Pi core APIs only:
 
 It does not call `pi.setActiveTools()`. If another mode hides `checkpoint_notes`, reminder pressure pauses until the tool becomes available again.
 
-Lifecycle tests cover fresh identities, branch restoration, resume rematerialization, compaction pressure, inherited-resume integrity, and external-mutation gating.
+Lifecycle tests cover fresh identities, branch restoration, resume rematerialization, read/research freshness, delayed checkpoint pressure, compaction pressure, inherited-resume integrity, and external-mutation gating.
 
 ## Optional integrations
 

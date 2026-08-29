@@ -168,6 +168,56 @@ describe("session lifecycle integration", () => {
     expect(await readFile(notesPath, "utf8")).toBe(expected);
   });
 
+  it("marks a clean checkpoint dirty on the first relevant read without making it due", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    h.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/a.ts" }, isError: false });
+
+    expect(await h.status()).toContain("dirty: true");
+    expect(await h.status()).toContain("checkpoint due: false");
+  });
+
+  it("applies checkpoint pressure after continuity-relevant results or dirty turns", async () => {
+    const byResults = await makeHarness();
+    await byResults.handlers.get("session_start")!({ reason: "new" }, byResults.ctx);
+    await byResults.command.handler("on", byResults.ctx);
+    await byResults.checkpointTool.execute("cp-1", payload);
+    for (let index = 0; index < 19; index += 1) {
+      byResults.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/${index}.ts` }, isError: false });
+    }
+    expect(await byResults.status()).toContain("checkpoint due: false");
+    byResults.handlers.get("tool_result")!({ toolName: "web_search", input: { query: "notes freshness" }, isError: false });
+    expect(await byResults.status()).toContain("checkpoint due: true");
+
+    const byTurns = await makeHarness();
+    await byTurns.handlers.get("session_start")!({ reason: "new" }, byTurns.ctx);
+    await byTurns.command.handler("on", byTurns.ctx);
+    await byTurns.checkpointTool.execute("cp-1", payload);
+    byTurns.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/a.ts" }, isError: false });
+    for (let index = 0; index < 5; index += 1) byTurns.handlers.get("turn_end")!({});
+    expect(await byTurns.status()).toContain("checkpoint due: false");
+    byTurns.handlers.get("turn_end")!({});
+    expect(await byTurns.status()).toContain("checkpoint due: true");
+  });
+
+  it("blocks completion as soon as continuity-relevant work makes Notes stale", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+    h.handlers.get("tool_result")!({ toolName: "get_subagent_result", input: { agent_id: "research" }, isError: false });
+
+    const blocked = await h.handlers.get("tool_call")!({
+      toolName: "goal_progress",
+      input: { status: "done" },
+    }, h.ctx);
+    expect(blocked).toMatchObject({ block: true });
+    expect(blocked.reason).toMatch(/dirty durable Notes/i);
+  });
+
   it("preserves dirty checkpoint pressure across compaction boundaries", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);

@@ -30,6 +30,10 @@ describe("runtime and rendering", () => {
       readOnlyLongTaskTurns: 10,
       requireHighSignalActivity: true,
     });
+    expect(DEFAULT_CONFIG.checkpointing).toEqual({
+      dirtyTurns: 6,
+      continuityRelevantToolResults: 20,
+    });
   });
 
   it("starts auto mode armed but inactive with a session-local Notes path", () => {
@@ -57,17 +61,17 @@ describe("runtime and rendering", () => {
 });
 
 describe("activity classification", () => {
-  it("marks successful edit/write as meaningful mutations", () => {
+  it("marks successful edits as both high-signal and continuity-relevant", () => {
     expect(classifyToolResult("edit", { path: "src/a.ts" }, false)).toEqual({
-      meaningful: true,
+      continuityRelevant: true,
       highSignal: true,
       modifiedPath: "src/a.ts",
     });
   });
 
-  it("does not claim a failed write modified the file", () => {
+  it("does not claim a failed write changed continuity or modified a file", () => {
     expect(classifyToolResult("write", { path: "src/a.ts" }, true)).toEqual({
-      meaningful: true,
+      continuityRelevant: false,
       highSignal: true,
       modifiedPath: undefined,
     });
@@ -75,26 +79,28 @@ describe("activity classification", () => {
 
   it("records verification commands without inventing exit codes", () => {
     expect(classifyToolResult("bash", { command: "pnpm test" }, false)).toMatchObject({
-      meaningful: true,
+      continuityRelevant: true,
       highSignal: true,
       verification: "pnpm test",
     });
   });
 
-  it("does not dirty Notes for ordinary read-only exploration", () => {
+  it("separates continuity-relevant exploration from high-signal activation", () => {
+    for (const toolName of ["read", "grep", "find", "web_search", "ctx_execute", "Agent", "get_subagent_result"]) {
+      expect(classifyToolResult(toolName, { path: "src/a.ts" }, false)).toEqual({
+        continuityRelevant: true,
+        highSignal: false,
+      });
+    }
     expect(classifyToolResult("bash", { command: "rg TODO src" }, false)).toEqual({
-      meaningful: false,
-      highSignal: false,
-    });
-    expect(classifyToolResult("read", { path: "src/a.ts" }, false)).toEqual({
-      meaningful: false,
+      continuityRelevant: true,
       highSignal: false,
     });
   });
 
-  it("does not treat a failed lookup as a milestone", () => {
+  it("does not treat a failed lookup as continuity-relevant", () => {
     expect(classifyToolResult("bash", { command: "rg missing src" }, true)).toEqual({
-      meaningful: false,
+      continuityRelevant: false,
       highSignal: false,
     });
   });
