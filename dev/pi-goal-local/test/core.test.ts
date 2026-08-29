@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseGoalCommand } from "../src/commands.js";
+import { agentRunWasAborted } from "../src/index.js";
 import { parseGoalVerdict } from "../src/judge.js";
 import { CLEARED_REASON, latestGoalState, parseGoalState } from "../src/state.js";
 import { fingerprintEvidence } from "../src/transcript.js";
@@ -58,6 +59,13 @@ describe("goal state", () => {
       },
     ] as any;
     expect(latestGoalState(entries)).toBeUndefined();
+  });
+});
+
+describe("agent settlement", () => {
+  it("detects an aborted assistant run so the controller can pause instead of continuing", () => {
+    expect(agentRunWasAborted([{ role: "assistant", stopReason: "aborted" }])).toBe(true);
+    expect(agentRunWasAborted([{ role: "assistant", stopReason: "stop" }])).toBe(false);
   });
 });
 
