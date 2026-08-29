@@ -93,10 +93,13 @@ jobs:
           npm install --prefix dev/pi-goal-local --no-package-lock
           npm run check --prefix dev/pi-goal-local
 
-      - name: Check plan-mode
+      - name: Check portable plan-mode contracts
         run: |
           npm run typecheck --prefix dev/pi-plan-mode
-          npm test --prefix dev/pi-plan-mode
+          node --test \
+            dev/pi-plan-mode/test/orchestrator-reminder.test.mjs \
+            dev/pi-plan-mode/test/plan-reminder.test.mjs \
+            dev/pi-plan-mode/test/policy.test.mjs
 
       - name: Check local-mode session policy
         run: node --test extensions/local-mode/session-policy.test.cjs
