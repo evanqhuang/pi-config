@@ -40,13 +40,14 @@ jobs:
           npm ci --prefix dev/pi-subagents-local
           npm ci --prefix dev/pi-plan-mode
 
-      - name: Apply required in-memory child lineage fix
+      - name: Apply native goal integration patches
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("dev/pi-subagents-local/src/agent-runner.ts")
-          text = p.read_text()
+
+          runner = Path("dev/pi-subagents-local/src/agent-runner.ts")
+          text = runner.read_text()
           old = "      : SessionManager.inMemory(effectiveCwd);"
           new = """      : SessionManager.inMemory(effectiveCwd, {
             parentSession:
@@ -54,9 +55,34 @@ jobs:
               ctx.sessionManager?.getSessionId?.(),
           });"""
           if old in text:
-              p.write_text(text.replace(old, new, 1))
+              runner.write_text(text.replace(old, new, 1))
           elif new not in text:
               raise SystemExit("agent-runner lineage anchor not found")
+
+          index = Path("dev/pi-subagents-local/src/index.ts")
+          text = index.read_text()
+          import_anchor = 'import { SubagentScheduler } from "./schedule.js";'
+          service_import = 'import { getPiSubagentsServiceV3 } from "./service.js";'
+          if service_import not in text:
+              if import_anchor not in text:
+                  raise SystemExit("subagents service import anchor not found")
+              text = text.replace(import_anchor, import_anchor + "\n" + service_import, 1)
+          factory_anchor = "  if (inChildSessionContext()) return;"
+          service_start = factory_anchor + "\n\n  // Expose the small versioned process-local evaluator seam for sibling extensions.\n  getPiSubagentsServiceV3();"
+          if service_start not in text:
+              if factory_anchor not in text:
+                  raise SystemExit("subagents factory anchor not found")
+              text = text.replace(factory_anchor, service_start, 1)
+          index.write_text(text)
+
+          controller = Path("dev/pi-goal-local/src/controller.ts")
+          text = controller.read_text()
+          usage_old = "  const usage = runtime.getContextUsage?.();"
+          usage_new = "  const usage = runtime.getContextUsage?.() as unknown as { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;"
+          if usage_old in text:
+              controller.write_text(text.replace(usage_old, usage_new, 1))
+          elif usage_new not in text:
+              raise SystemExit("goal context usage anchor not found")
           PY
 
       - name: Check pi-subagents-local
@@ -67,17 +93,22 @@ jobs:
           npm install --prefix dev/pi-goal-local --no-package-lock
           npm run check --prefix dev/pi-goal-local
 
+      - name: Check plan-mode
+        run: |
+          npm run typecheck --prefix dev/pi-plan-mode
+          npm test --prefix dev/pi-plan-mode
+
       - name: Check local-mode session policy
         run: node --test extensions/local-mode/session-policy.test.cjs
 
-      - name: Commit lineage fix after verification
+      - name: Commit verified integration patches
         if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
         run: |
-          if git diff --quiet -- dev/pi-subagents-local/src/agent-runner.ts; then
+          if git diff --quiet -- dev/pi-subagents-local/src/agent-runner.ts dev/pi-subagents-local/src/index.ts dev/pi-goal-local/src/controller.ts; then
             exit 0
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add dev/pi-subagents-local/src/agent-runner.ts
-          git commit -m "Preserve lineage for in-memory subagents"
+          git add dev/pi-subagents-local/src/agent-runner.ts dev/pi-subagents-local/src/index.ts dev/pi-goal-local/src/controller.ts
+          git commit -m "Wire native goal evaluator integration"
           git push origin HEAD:feat/native-goal-local
