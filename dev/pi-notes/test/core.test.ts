@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_CONFIG,
   NOTES_REMINDER_TYPE,
   classifyToolResult,
   createRuntime,
@@ -22,6 +23,15 @@ const payload: CheckpointPayload = {
 };
 
 describe("runtime and rendering", () => {
+  it("uses conservative automatic activation thresholds", () => {
+    expect(DEFAULT_CONFIG.autoActivation).toEqual({
+      turns: 8,
+      toolCalls: 32,
+      readOnlyLongTaskTurns: 10,
+      requireHighSignalActivity: true,
+    });
+  });
+
   it("starts auto mode armed but inactive with a session-local Notes path", () => {
     const runtime = createRuntime();
     expect(runtime.activationMode).toBe("auto");

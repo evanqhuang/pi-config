@@ -18,9 +18,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   activationMode: "auto" as const,
   notesMaxBytes: 8192,
   autoActivation: {
-    turns: 3,
-    toolCalls: 12,
-    readOnlyLongTaskTurns: 5,
+    turns: 8,
+    toolCalls: 32,
+    readOnlyLongTaskTurns: 10,
     requireHighSignalActivity: true,
   },
   checkpointing: {
