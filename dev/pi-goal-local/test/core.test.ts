@@ -5,7 +5,7 @@ import { parseGoalVerdict } from "../src/judge.js";
 import { CLEARED_REASON, latestGoalState, parseGoalState } from "../src/state.js";
 import { fingerprintEvidence } from "../src/transcript.js";
 import { parseVerifierVerdict } from "../src/verifier.js";
-import { GOAL_STATE_TYPE, type GoalStateV1 } from "../src/types.js";
+import { GOAL_CONTINUE_MESSAGE, GOAL_STATE_TYPE, type GoalStateV1 } from "../src/types.js";
 
 function goal(overrides: Partial<GoalStateV1> = {}): GoalStateV1 {
   return {
@@ -23,6 +23,48 @@ function goal(overrides: Partial<GoalStateV1> = {}): GoalStateV1 {
     noProgressCycles: 0,
     ...overrides,
   };
+}
+
+function progressEvidence(timestamp: number, toolCallId: string, output = "PASS"): string {
+  return [
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "custom",
+        customType: GOAL_CONTINUE_MESSAGE,
+        content: "Continue working on the goal.",
+        display: false,
+        timestamp,
+      },
+    }),
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: `private-${timestamp}` },
+          { type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "npm test" } },
+        ],
+        api: "responses",
+        provider: "test-provider",
+        model: "test-model",
+        usage: { output: timestamp },
+        stopReason: "toolUse",
+        timestamp,
+      },
+    }),
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName: "bash",
+        content: [{ type: "text", text: output }],
+        isError: false,
+        timestamp,
+      },
+    }),
+  ].join("\n");
 }
 
 describe("goal command parser", () => {
@@ -83,5 +125,17 @@ describe("evaluator parsing", () => {
   it("fingerprints evidence deterministically", () => {
     expect(fingerprintEvidence("a")).toBe(fingerprintEvidence("a"));
     expect(fingerprintEvidence("a")).not.toBe(fingerprintEvidence("b"));
+  });
+
+  it("fingerprints only substantive work from the latest goal iteration", () => {
+    const first = progressEvidence(100, "call-1");
+    const sameWorkWithNewRuntimeMetadata = progressEvidence(200, "call-2");
+    const changedResult = progressEvidence(300, "call-3", "FAIL: regression");
+
+    expect(fingerprintEvidence(first)).toBe(fingerprintEvidence(sameWorkWithNewRuntimeMetadata));
+    expect(fingerprintEvidence(`${first}\n${sameWorkWithNewRuntimeMetadata}`)).toBe(
+      fingerprintEvidence(sameWorkWithNewRuntimeMetadata),
+    );
+    expect(fingerprintEvidence(sameWorkWithNewRuntimeMetadata)).not.toBe(fingerprintEvidence(changedResult));
   });
 });
