@@ -6,8 +6,6 @@ tools: none
 extensions: local-mode
 skills: false
 disallowed_tools: request_deeper_reasoning
-model: openai-codex/gpt-5.6-luna
-thinking: low
 max_turns: 1
 persist_session: false
 output_transcript: false
