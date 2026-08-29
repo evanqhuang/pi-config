@@ -2,7 +2,7 @@
   "lastChangelogVersion": "0.84.3",
   "theme": "dark",
   "packages": [
-    "npm:@pandi-coding-agent/goal",
+    "dev/pi-goal-local",
     "npm:pi-prewalk",
     "dev/pi-plan-mode",
     "npm:pi-rtk-rewrite",
