@@ -7,12 +7,20 @@ export function parseVerifierVerdict(raw: string): GoalVerifierVerdict | undefin
   try {
     const value = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
     if (!value || typeof value.ok !== "boolean" || typeof value.reason !== "string" || !value.reason.trim()) return undefined;
+    const evidence = Array.isArray(value.evidence)
+      ? value.evidence.filter((v): v is string => typeof v === "string").map(v => v.trim()).filter(Boolean).slice(0, 32)
+      : undefined;
+    const baseReason = value.reason.trim();
+    // The controller sends verifierReason directly back to the parent on FAIL.
+    // Preserve the structured evidence separately, but also fold it into the
+    // failure reason so concrete acceptance failures are actionable on retry.
+    const reason = value.ok || !evidence?.length
+      ? baseReason
+      : `${baseReason}\nEvidence: ${evidence.join(" | ")}`;
     return {
       ok: value.ok,
-      reason: value.reason.trim().slice(0, 4000),
-      evidence: Array.isArray(value.evidence)
-        ? value.evidence.filter((v): v is string => typeof v === "string").slice(0, 32)
-        : undefined,
+      reason: reason.slice(0, 4000),
+      evidence,
     };
   } catch {
     return undefined;
