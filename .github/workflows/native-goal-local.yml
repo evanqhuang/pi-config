@@ -50,11 +50,13 @@ jobs:
           runner = Path("dev/pi-subagents-local/src/agent-runner.ts")
           text = runner.read_text()
           old = "      : SessionManager.inMemory(effectiveCwd);"
-          new = """      : SessionManager.inMemory(effectiveCwd, {
-            parentSession:
-              ctx.sessionManager?.getSessionFile?.() ??
-              ctx.sessionManager?.getSessionId?.(),
-          });"""
+          new = "\n".join([
+              "      : SessionManager.inMemory(effectiveCwd, {",
+              "          parentSession:",
+              "            ctx.sessionManager?.getSessionFile?.() ??",
+              "            ctx.sessionManager?.getSessionId?.(),",
+              "        });",
+          ])
           if old in text:
               runner.write_text(text.replace(old, new, 1))
           elif new not in text:
@@ -92,38 +94,46 @@ jobs:
           elif usage_new not in text:
               raise SystemExit("goal context usage anchor not found")
 
-          clear_old = '''  clear(ctx: ExtensionContext): GoalStateV1 | undefined {
-    return this.stop(ctx, "Cleared by user. Historical goal entries remain append-only.");
-  }'''
-          clear_new = '''  clear(ctx: ExtensionContext): GoalStateV1 | undefined {
-    this.syncBranch(ctx);
-    if (!this.state) return undefined;
-    this.evaluatorAbort?.abort();
-    const cleared = terminalState(this.state, "stopped", CLEARED_REASON);
-    this.persist(cleared);
-    this.state = undefined;
-    return cleared;
-  }'''
+          clear_old = "\n".join([
+              "  clear(ctx: ExtensionContext): GoalStateV1 | undefined {",
+              '    return this.stop(ctx, "Cleared by user. Historical goal entries remain append-only.");',
+              "  }",
+          ])
+          clear_new = "\n".join([
+              "  clear(ctx: ExtensionContext): GoalStateV1 | undefined {",
+              "    this.syncBranch(ctx);",
+              "    if (!this.state) return undefined;",
+              "    this.evaluatorAbort?.abort();",
+              '    const cleared = terminalState(this.state, "stopped", CLEARED_REASON);',
+              "    this.persist(cleared);",
+              "    this.state = undefined;",
+              "    return cleared;",
+              "  }",
+          ])
           if clear_old in text:
               text = text.replace(clear_old, clear_new, 1)
           elif clear_new not in text:
               raise SystemExit("goal clear anchor not found")
 
-          failure_old = '''    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
-      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
-      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);
-    }
-  }'''
-          failure_new = '''    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {
-      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);
-      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);
-      return;
-    }
-    this.hidden(
-      GOAL_CONTINUE_MESSAGE,
-      `Goal evaluation failed transiently (${failures}/${DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures}). Continue pursuing the active goal; evaluation will retry after settlement. Reason: ${reason}`,
-    );
-  }'''
+          failure_old = "\n".join([
+              "    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {",
+              '      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);',
+              '      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);',
+              "    }",
+              "  }",
+          ])
+          failure_new = "\n".join([
+              "    if (failures >= DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures) {",
+              '      const blocked = this.transition("blocked", `GoalJudge failed ${failures} consecutive times: ${reason}`);',
+              '      if (blocked) this.notify(blocked, `Goal blocked: ${blocked.terminalReason}`);',
+              "      return;",
+              "    }",
+              "    this.hidden(",
+              "      GOAL_CONTINUE_MESSAGE,",
+              '      `Goal evaluation failed transiently (${failures}/${DEFAULT_GOAL_BUDGET.maxConsecutiveJudgeFailures}). Continue pursuing the active goal; evaluation will retry after settlement. Reason: ${reason}`,',
+              "    );",
+              "  }",
+          ])
           if failure_old in text:
               text = text.replace(failure_old, failure_new, 1)
           elif failure_new not in text:
