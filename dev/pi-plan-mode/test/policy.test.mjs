@@ -22,18 +22,20 @@ test("PLAN is an explicit read-only allowlist and unknown tools fail closed", ()
   assert.ok(PLAN_TOOLS.includes("bash"));
   assert.ok(PLAN_TOOLS.includes("ctx_execute"));
   assert.ok(PLAN_TOOLS.includes("ctx_batch_execute"));
+  assert.ok(PLAN_TOOLS.includes("checkpoint_notes"));
   assert.ok(PLAN_TOOLS.includes("manage_plan_draft"));
   assert.ok(PLAN_TOOLS.includes("Agent"));
   assert.deepEqual(planToolNames(), PLAN_TOOLS);
   for (const tool of ["edit", "write", "apply_patch", "delegate", "subagent", "ctx_purge", "ctx_upgrade", "unknown_tool"]) {
     assert.equal(isAllowedTool("PLAN", tool), false, tool);
   }
+  assert.equal(isAllowedTool("PLAN", "checkpoint_notes"), true);
   assert.equal(isAllowedTool("ORCHESTRATOR", "apply_patch"), true);
   assert.equal(isAllowedTool("YOLO", "apply_patch"), true);
 });
 
 test("filtering is re-applied to dynamically registered tools", () => {
-  assert.deepEqual(filterTools("PLAN", ["read", "write", "late_tool", "bash"]), ["read", "bash"]);
+  assert.deepEqual(filterTools("PLAN", ["read", "write", "checkpoint_notes", "late_tool", "bash"]), ["read", "checkpoint_notes", "bash"]);
   assert.deepEqual(filterTools("ORCHESTRATOR", ["read", "write", "late_tool"]), ["read", "write", "late_tool"]);
   assert.deepEqual(filterTools("YOLO", ["read", "write", "late_tool"]), ["read", "write", "late_tool"]);
 });
