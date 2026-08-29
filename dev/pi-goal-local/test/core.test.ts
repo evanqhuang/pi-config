@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseGoalCommand } from "../src/commands.js";
 import { parseGoalVerdict } from "../src/judge.js";
-import { latestGoalState, parseGoalState } from "../src/state.js";
+import { CLEARED_REASON, latestGoalState, parseGoalState } from "../src/state.js";
 import { fingerprintEvidence } from "../src/transcript.js";
 import { parseVerifierVerdict } from "../src/verifier.js";
 import { GOAL_STATE_TYPE, type GoalStateV1 } from "../src/types.js";
@@ -46,6 +46,18 @@ describe("goal state", () => {
     ] as any;
     expect(latestGoalState(entries)?.generation).toBe(2);
     expect(latestGoalState(entries)?.status).toBe("active");
+  });
+
+  it("treats the newest native clear marker as no effective branch goal", () => {
+    const entries = [
+      { type: "custom", customType: GOAL_STATE_TYPE, data: goal() },
+      {
+        type: "custom",
+        customType: GOAL_STATE_TYPE,
+        data: goal({ status: "stopped", terminalReason: CLEARED_REASON, lastReason: CLEARED_REASON }),
+      },
+    ] as any;
+    expect(latestGoalState(entries)).toBeUndefined();
   });
 });
 
