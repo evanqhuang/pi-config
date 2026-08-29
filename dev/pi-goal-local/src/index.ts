@@ -23,7 +23,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
   pi.registerCommand("goal", {
     description: "Set or manage an autonomous branch-aware completion goal",
     handler: async (args, commandCtx) => {
-      const activeCtx = ctx ?? commandCtx;
+      if (!ctx) {
+        commandCtx.ui.notify("No active session is available for /goal.", "error");
+        return;
+      }
+      const activeCtx = ctx;
       let command;
       try {
         command = parseGoalCommand(args);
