@@ -9,6 +9,7 @@
 # Pi runtime, private state, and machine-local installations.
 /sessions/
 /plans/
+/notes/
 /prompt-history.jsonl
 /auth.json
 /trust.json
