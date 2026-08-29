@@ -32,7 +32,7 @@ jobs:
             check: npm run check
           - package: pi-notes
             directory: dev/pi-notes
-            install: npm install
+            install: npm ci
             check: npm run check
           - package: pi-subagents-local
             directory: dev/pi-subagents-local
@@ -47,6 +47,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.directory }}/package-lock.json
 
       - name: Install dependencies
         working-directory: ${{ matrix.directory }}
@@ -72,6 +74,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: dev/pi-plan-mode/package-lock.json
 
       - name: Install dependencies
         working-directory: dev/pi-plan-mode
@@ -89,44 +93,9 @@ jobs:
           test/plan-reminder.test.mjs
           test/orchestrator-reminder.test.mjs
 
-  # The full PLAN suite currently contains workstation/native-sandbox integration
-  # assumptions. Keep running it for signal, but do not make those pre-existing
-  # machine-specific failures block otherwise portable pull requests.
-  plan-mode-native:
-    name: pi-plan-mode-native
-    runs-on: macos-latest
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install dependencies
-        working-directory: dev/pi-plan-mode
-        run: npm ci
-
-      - name: Prepare native integration environment
-        run: |
-          brew install ripgrep socat || true
-          npm install --prefix "$GITHUB_WORKSPACE/npm" --no-save context-mode
-
-          sudo mkdir -p \
-            /Users/evanhuang/.pi/agent/dev \
-            /Users/evanhuang/.pi/agent/npm/node_modules \
-            /Users/evanhuang/scratch/mcmaster-agent \
-            /opt/homebrew/lib
-          sudo ln -s "$GITHUB_WORKSPACE/dev/pi-plan-mode" /Users/evanhuang/.pi/agent/dev/pi-plan-mode
-          sudo ln -s "$GITHUB_WORKSPACE/npm/node_modules/context-mode" /Users/evanhuang/.pi/agent/npm/node_modules/context-mode
-          sudo npm install --prefix /opt/homebrew/lib @earendil-works/pi-coding-agent@0.84.3
-
-      - name: Full native integration suite
-        working-directory: dev/pi-plan-mode
-        run: npm run typecheck && npm test
+  # The full PLAN suite still contains workstation/native-sandbox assumptions.
+  # Do not emulate one developer's filesystem on hosted runners: keep CI to the
+  # portable suite until those pre-existing tests are made environment-agnostic.
 
   required:
     name: required
