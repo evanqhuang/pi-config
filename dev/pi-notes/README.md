@@ -18,9 +18,9 @@ Notes are never written into the project tree. Each top-level session owns:
 - `/notes on` — activate immediately.
 - `/notes off` — disable tracking/reminders without deleting the file.
 - `/notes auto` — use conservative automatic activation.
-- `/notes checkpoint` — request a model-authored checkpoint on the next turn.
+- `/notes checkpoint` — request a model-authored checkpoint immediately when the agent is idle.
 - `/notes resume` — explicitly seed a fresh fork/session identity from a compatible inherited checkpoint.
-- `/notes restore` — rematerialize the latest committed checkpoint for the active branch.
+- `/notes restore` — rematerialize the latest committed checkpoint for the active branch while preserving its clean/dirty state.
 
 ## Tool
 
