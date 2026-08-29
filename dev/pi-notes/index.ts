@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export const NOTES_STATE_TYPE = "pi-notes-state";
@@ -62,6 +67,8 @@ export interface NotesRuntime {
   activationToolCalls: number;
   readOnlyTurns: number;
   sawHighSignalActivity: boolean;
+  toolCallsThisTurn: number;
+  highSignalThisTurn: boolean;
   checkpointGeneration: number;
   lastCheckpointHash?: string;
   lastCheckpointAt?: number;
@@ -135,6 +142,8 @@ export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMo
     activationToolCalls: 0,
     readOnlyTurns: 0,
     sawHighSignalActivity: false,
+    toolCallsThisTurn: 0,
+    highSignalThisTurn: false,
     checkpointGeneration: 0,
     reentryRequired: false,
     harnessFacts: freshHarnessFacts(),
@@ -197,12 +206,26 @@ function compatibleCheckpoint(entry: SessionEntry): CheckpointRecord | undefined
   return data;
 }
 
-function latestRecord<T>(entries: SessionEntry[], read: (entry: SessionEntry) => T | undefined): T | undefined {
+function latestRecord<T>(entries: readonly SessionEntry[], read: (entry: SessionEntry) => T | undefined): T | undefined {
   for (let index = entries.length - 1; index >= 0; index--) {
     const value = read(entries[index]);
     if (value) return value;
   }
   return undefined;
+}
+
+function latestStateForId(entries: readonly SessionEntry[], notesId: string): StateRecord | undefined {
+  return latestRecord(entries, (entry) => {
+    const state = compatibleState(entry);
+    return state?.notesId === notesId ? state : undefined;
+  });
+}
+
+function latestCheckpointForId(entries: readonly SessionEntry[], notesId: string): CheckpointRecord | undefined {
+  return latestRecord(entries, (entry) => {
+    const checkpoint = compatibleCheckpoint(entry);
+    return checkpoint?.notesId === notesId ? checkpoint : undefined;
+  });
 }
 
 function isChildSession(): boolean {
@@ -214,25 +237,25 @@ function isChildSession(): boolean {
 async function ensureSafeDestination(runtime: NotesRuntime): Promise<void> {
   const root = notesRoot();
   await mkdir(root, { recursive: true });
+  const rootStat = await lstat(root);
+  if (rootStat.isSymbolicLink()) throw new Error("Notes root must not be a symlink");
   const resolvedRoot = await realpath(root);
   const directory = dirname(runtime.notesPath);
   const rel = relative(resolvedRoot, resolve(directory));
-  if (rel.startsWith("..") || rel.includes(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+  if (rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
     throw new Error("Notes destination escapes the configured agent notes directory");
-  }
-  try {
-    const rootStat = await lstat(resolvedRoot);
-    if (rootStat.isSymbolicLink()) throw new Error("Notes root must not be a symlink");
-  } catch (error) {
-    throw new Error(`Unable to validate Notes root: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
     const dirStat = await lstat(directory);
     if (dirStat.isSymbolicLink()) throw new Error("Notes session directory must not be a symlink");
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     await mkdir(directory, { recursive: false });
+  }
+  const realDirectory = await realpath(directory);
+  const afterRel = relative(resolvedRoot, realDirectory);
+  if (afterRel === ".." || afterRel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    throw new Error("Validated Notes directory resolved outside the agent notes root");
   }
   try {
     const fileStat = await lstat(runtime.notesPath);
@@ -240,9 +263,6 @@ async function ensureSafeDestination(runtime: NotesRuntime): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const realDirectory = await realpath(directory);
-  const afterRel = relative(resolvedRoot, realDirectory);
-  if (afterRel.startsWith("..")) throw new Error("Validated Notes directory resolved outside the agent notes root");
 }
 
 async function readCurrentHash(path: string): Promise<string | undefined> {
@@ -338,6 +358,8 @@ function resetIdentity(runtime: NotesRuntime): void {
   runtime.activationToolCalls = 0;
   runtime.readOnlyTurns = 0;
   runtime.sawHighSignalActivity = false;
+  runtime.toolCallsThisTurn = 0;
+  runtime.highSignalThisTurn = false;
   runtime.harnessFacts = freshHarnessFacts();
 }
 
@@ -360,12 +382,45 @@ async function materializeCheckpoint(runtime: NotesRuntime, checkpoint: Checkpoi
   runtime.harnessFacts.recentFailedCommandCount = checkpoint.harnessFacts.recentFailedCommandCount;
   const rendered = renderNotes(checkpoint.payload, runtime);
   runtime.checkpointGeneration = checkpoint.generation;
-  await ensureSafeDestination(runtime);
   if (hashText(rendered) !== checkpoint.hash) throw new Error("Persisted Notes checkpoint hash does not match its bounded payload");
-  const currentHash = await readCurrentHash(runtime.notesPath);
-  if (currentHash !== checkpoint.hash) await atomicWrite(runtime.notesPath, rendered);
+  await ensureSafeDestination(runtime);
+  if (await readCurrentHash(runtime.notesPath) !== checkpoint.hash) await atomicWrite(runtime.notesPath, rendered);
   runtime.lastCheckpointHash = checkpoint.hash;
   runtime.lastCheckpointAt = checkpoint.checkpointedAt;
+}
+
+async function clearMaterializedNotes(runtime: NotesRuntime): Promise<void> {
+  await unlink(runtime.notesPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  runtime.checkpointGeneration = 0;
+  runtime.lastCheckpointHash = undefined;
+  runtime.lastCheckpointAt = undefined;
+  runtime.harnessFacts = freshHarnessFacts();
+}
+
+function restoreRuntimeState(runtime: NotesRuntime, state: StateRecord | undefined, checkpoint: CheckpointRecord | undefined): void {
+  if (state) {
+    runtime.activationMode = state.activationMode;
+    runtime.active = state.active;
+    runtime.dirty = state.dirty;
+    runtime.checkpointGeneration = state.generation;
+  } else if (checkpoint) {
+    runtime.activationMode = checkpoint.activationMode;
+    runtime.active = checkpoint.active;
+    runtime.dirty = false;
+    runtime.checkpointGeneration = checkpoint.generation;
+  } else {
+    runtime.dirty = false;
+    runtime.checkpointDue = false;
+    runtime.checkpointGeneration = 0;
+    runtime.lastCheckpointHash = undefined;
+    runtime.lastCheckpointAt = undefined;
+  }
+  runtime.checkpointDue = runtime.dirty;
+  runtime.turnsSinceCheckpoint = 0;
+  runtime.meaningfulToolCallsSinceCheckpoint = 0;
+  runtime.reentryRequired = runtime.active;
 }
 
 async function restoreFromBranch(pi: ExtensionAPI, runtime: NotesRuntime, ctx: ExtensionContext, reason: string): Promise<void> {
@@ -376,6 +431,17 @@ async function restoreFromBranch(pi: ExtensionAPI, runtime: NotesRuntime, ctx: E
     appendState(pi, runtime);
     return;
   }
+
+  if (reason === "tree") {
+    const state = latestStateForId(entries, runtime.notesId);
+    const checkpoint = latestCheckpointForId(entries, runtime.notesId);
+    restoreRuntimeState(runtime, state, checkpoint);
+    if (checkpoint) await materializeCheckpoint(runtime, checkpoint);
+    else await clearMaterializedNotes(runtime);
+    runtime.reentryRequired = runtime.active;
+    return;
+  }
+
   const state = latestRecord(entries, compatibleState);
   const checkpoint = latestRecord(entries, compatibleCheckpoint);
   const identity = state?.notesId ?? checkpoint?.notesId;
@@ -387,20 +453,11 @@ async function restoreFromBranch(pi: ExtensionAPI, runtime: NotesRuntime, ctx: E
   }
   runtime.notesId = identity;
   runtime.notesPath = notesPathFor(identity);
-  if (state) {
-    runtime.activationMode = state.activationMode;
-    runtime.active = state.active;
-    runtime.dirty = state.dirty;
-    runtime.checkpointGeneration = state.generation;
-  } else if (checkpoint) {
-    runtime.activationMode = checkpoint.activationMode;
-    runtime.active = checkpoint.active;
-    runtime.dirty = false;
-    runtime.checkpointGeneration = checkpoint.generation;
-  }
-  if (checkpoint && checkpoint.notesId === identity) await materializeCheckpoint(runtime, checkpoint);
-  if (runtime.dirty) runtime.checkpointDue = true;
-  runtime.reentryRequired = runtime.active;
+  const ownState = latestStateForId(entries, identity);
+  const ownCheckpoint = latestCheckpointForId(entries, identity);
+  restoreRuntimeState(runtime, ownState, ownCheckpoint);
+  if (ownCheckpoint) await materializeCheckpoint(runtime, ownCheckpoint);
+  else await clearMaterializedNotes(runtime);
 }
 
 function activateIfNeeded(pi: ExtensionAPI, runtime: NotesRuntime): void {
@@ -437,9 +494,7 @@ function pathFromInput(input: Record<string, unknown>): string | undefined {
 }
 
 export function classifyToolResult(toolName: string, input: Record<string, unknown>, isError: boolean): { meaningful: boolean; highSignal: boolean; verification?: string; modifiedPath?: string } {
-  if (toolName === "edit" || toolName === "write") {
-    return { meaningful: true, highSignal: true, modifiedPath: pathFromInput(input) };
-  }
+  if (toolName === "edit" || toolName === "write") return { meaningful: true, highSignal: true, modifiedPath: pathFromInput(input) };
   if (toolName === "bash" || toolName === "powershell") {
     const command = commandFromInput(input);
     if (!command) return { meaningful: false, highSignal: false };
@@ -457,8 +512,12 @@ export function classifyToolResult(toolName: string, input: Record<string, unkno
 
 function recordActivity(pi: ExtensionAPI, runtime: NotesRuntime, toolName: string, input: Record<string, unknown>, isError: boolean): void {
   runtime.activationToolCalls += 1;
+  runtime.toolCallsThisTurn += 1;
   const classified = classifyToolResult(toolName, input, isError);
-  if (classified.highSignal) runtime.sawHighSignalActivity = true;
+  if (classified.highSignal) {
+    runtime.sawHighSignalActivity = true;
+    runtime.highSignalThisTurn = true;
+  }
   if (classified.modifiedPath) runtime.harnessFacts.modifiedFiles.add(classified.modifiedPath);
   if (classified.verification) {
     runtime.harnessFacts.lastVerificationCommand = classified.verification;
@@ -481,22 +540,15 @@ function notesPolicy(): string {
 }
 
 function reminderMessage(text: string) {
-  return {
-    role: "custom" as const,
-    customType: NOTES_REMINDER_TYPE,
-    content: text,
-    display: false,
-    timestamp: Date.now(),
-  };
+  return { role: "custom" as const, customType: NOTES_REMINDER_TYPE, content: text, display: false, timestamp: Date.now() };
 }
 
-function stripReminders(messages: any[]): any[] {
+export function stripNotesReminders(messages: readonly any[]): any[] {
   return messages.filter((message) => message?.customType !== NOTES_REMINDER_TYPE);
 }
 
 function selectReminder(pi: ExtensionAPI, runtime: NotesRuntime): string | undefined {
-  if (!runtime.active) return undefined;
-  if (!pi.getActiveTools().includes("checkpoint_notes")) return undefined;
+  if (!runtime.active || !pi.getActiveTools().includes("checkpoint_notes")) return undefined;
   if (runtime.reentryRequired) {
     return "[TASK NOTES RE-ENTRY]\nReread the current Notes checkpoint and inspect live worktree/tool state before continuing. Notes is continuity context, not proof.";
   }
@@ -521,13 +573,19 @@ function displayStatus(ctx: ExtensionContext, runtime: NotesRuntime, pi: Extensi
 }
 
 async function restoreCommittedSnapshot(runtime: NotesRuntime, ctx: ExtensionContext): Promise<boolean> {
-  const checkpoint = latestRecord(ctx.sessionManager.getBranch(), compatibleCheckpoint);
-  if (!checkpoint || checkpoint.notesId !== runtime.notesId) return false;
+  const checkpoint = latestCheckpointForId(ctx.sessionManager.getBranch(), runtime.notesId);
+  if (!checkpoint) return false;
   await materializeCheckpoint(runtime, checkpoint);
   runtime.dirty = true;
   runtime.checkpointDue = true;
   runtime.reentryRequired = true;
   return true;
+}
+
+function canonicalToolPath(ctx: ExtensionContext, input: Record<string, unknown>): string | undefined {
+  const target = pathFromInput(input);
+  if (!target) return undefined;
+  return resolve(isAbsolute(target) ? target : join(ctx.cwd, target));
 }
 
 export default function notesExtension(pi: ExtensionAPI): void {
@@ -542,8 +600,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     parameters: CHECKPOINT_SCHEMA,
     executionMode: "sequential",
     async execute(_toolCallId, params) {
-      const payload = params as CheckpointPayload;
-      const committed = await commitCheckpoint(pi, runtime, payload);
+      const committed = await commitCheckpoint(pi, runtime, params as CheckpointPayload);
       return {
         content: [{ type: "text" as const, text: `Notes checkpoint committed: ${runtime.notesPath} (generation ${committed.generation}, sha256 ${committed.hash.slice(0, 12)})` }],
         details: { notesPath: runtime.notesPath, generation: committed.generation, hash: committed.hash },
@@ -571,7 +628,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
       }
       if (command === "auto") {
         runtime.activationMode = "auto";
-        if (!runtime.active) activateIfNeeded(pi, runtime);
+        activateIfNeeded(pi, runtime);
         appendState(pi, runtime);
         return displayStatus(ctx, runtime, pi);
       }
@@ -585,7 +642,11 @@ export default function notesExtension(pi: ExtensionAPI): void {
           return;
         }
         runtime.checkpointDue = true;
-        pi.sendMessage({ customType: NOTES_REMINDER_TYPE, content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current durable execution state, then continue.", display: false }, { triggerTurn: true, deliverAs: "nextTurn" });
+        pi.sendMessage({
+          customType: NOTES_REMINDER_TYPE,
+          content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current durable execution state, then continue.",
+          display: false,
+        }, { triggerTurn: true, deliverAs: "nextTurn" });
         return;
       }
       if (command === "restore") {
@@ -594,23 +655,23 @@ export default function notesExtension(pi: ExtensionAPI): void {
         return;
       }
       if (command === "resume") {
-        const checkpoint = latestRecord(ctx.sessionManager.getBranch(), compatibleCheckpoint);
-        if (!checkpoint) {
-          ctx.ui.notify("No compatible inherited Notes checkpoint is visible on the active branch.", "warning");
+        const inherited = latestRecord(ctx.sessionManager.getBranch(), compatibleCheckpoint);
+        if (!inherited || inherited.notesId === runtime.notesId) {
+          ctx.ui.notify(inherited ? "The current session already owns this checkpoint." : "No compatible inherited Notes checkpoint is visible on the active branch.", inherited ? "info" : "warning");
           return;
         }
-        if (checkpoint.notesId !== runtime.notesId) {
-          const oldPayload = checkpoint.payload;
-          await ensureSafeDestination(runtime);
-          runtime.active = true;
-          runtime.dirty = true;
-          runtime.checkpointDue = true;
-          runtime.reentryRequired = true;
-          runtime.harnessFacts.modifiedFiles = new Set(checkpoint.harnessFacts.modifiedFiles);
-          const rendered = renderNotes(oldPayload, runtime);
-          if (Buffer.byteLength(rendered, "utf8") <= DEFAULT_CONFIG.notesMaxBytes) await atomicWrite(runtime.notesPath, rendered);
-          appendState(pi, runtime);
-        }
+        runtime.active = true;
+        runtime.dirty = true;
+        runtime.checkpointDue = true;
+        runtime.reentryRequired = true;
+        runtime.harnessFacts.modifiedFiles = new Set(inherited.harnessFacts.modifiedFiles);
+        runtime.harnessFacts.lastVerificationCommand = inherited.harnessFacts.lastVerificationCommand;
+        runtime.harnessFacts.lastVerificationOutcome = inherited.harnessFacts.lastVerificationOutcome;
+        const rendered = renderNotes(inherited.payload, runtime);
+        if (Buffer.byteLength(rendered, "utf8") > DEFAULT_CONFIG.notesMaxBytes) throw new Error("Inherited Notes exceed configured bound");
+        await ensureSafeDestination(runtime);
+        await atomicWrite(runtime.notesPath, rendered);
+        appendState(pi, runtime);
         ctx.ui.notify(`Adopted inherited checkpoint content into fresh Notes identity ${runtime.notesId}; checkpoint it before relying on it.`, "info");
         return;
       }
@@ -621,37 +682,32 @@ export default function notesExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     await restoreFromBranch(pi, runtime, ctx, event.reason);
   });
-
   pi.on("session_tree", async (_event, ctx) => {
     await restoreFromBranch(pi, runtime, ctx, "tree");
-    runtime.reentryRequired = runtime.active;
   });
-
   pi.on("session_compact", () => {
     if (!runtime.active) return;
     runtime.reentryRequired = true;
     if (runtime.dirty) runtime.checkpointDue = true;
   });
-
   pi.on("session_compact_failed", () => {
-    // Preserve current dirty/due/re-entry state. Failed compaction is not recovery.
+    // Preserve state. A failed/aborted compaction is not a recovery boundary.
   });
-
   pi.on("before_agent_start", (event) => {
     if (!runtime.active) return undefined;
     return { systemPrompt: `${event.systemPrompt}\n\n${notesPolicy()}` };
   });
-
   pi.on("context", (event) => {
-    const messages = stripReminders(event.messages as any[]);
+    const messages = stripNotesReminders(event.messages);
     const reminder = selectReminder(pi, runtime);
     return { messages: reminder ? [...messages, reminderMessage(reminder) as any] : messages };
   });
-
   pi.on("turn_end", () => {
     runtime.activationTurns += 1;
-    if (runtime.activationToolCalls === 0 || !runtime.sawHighSignalActivity) runtime.readOnlyTurns += 1;
-    else runtime.readOnlyTurns = 0;
+    if (runtime.toolCallsThisTurn > 0 && !runtime.highSignalThisTurn) runtime.readOnlyTurns += 1;
+    else if (runtime.highSignalThisTurn) runtime.readOnlyTurns = 0;
+    runtime.toolCallsThisTurn = 0;
+    runtime.highSignalThisTurn = false;
     if (runtime.active && runtime.dirty) {
       runtime.turnsSinceCheckpoint += 1;
       if (runtime.turnsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.dirtyTurns
@@ -661,25 +717,22 @@ export default function notesExtension(pi: ExtensionAPI): void {
     }
     activateIfNeeded(pi, runtime);
   });
-
   pi.on("tool_result", (event) => {
     if (event.toolName === "checkpoint_notes") return;
     recordActivity(pi, runtime, event.toolName, event.input, event.isError);
   });
-
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
     if (isChildSession() && event.toolName === "checkpoint_notes") {
       return { block: true, reason: "Child subagent sessions cannot write the parent session Notes file." };
     }
     if (runtime.active && (event.toolName === "edit" || event.toolName === "write")) {
-      const target = pathFromInput(event.input);
-      if (target && resolve(target) === resolve(runtime.notesPath)) {
+      const target = canonicalToolPath(ctx, event.input);
+      if (target === resolve(runtime.notesPath)) {
         return { block: true, reason: "Direct writes to the canonical session NOTES.md are blocked; use checkpoint_notes." };
       }
     }
     if (DEFAULT_CONFIG.integrations.goal && event.toolName === "goal_progress") {
-      const input = event.input as Record<string, unknown>;
-      if (input.status === "done" && runtime.active && runtime.dirty) {
+      if ((event.input as Record<string, unknown>).status === "done" && runtime.active && runtime.dirty) {
         return { block: true, reason: "Goal completion is blocked until dirty durable Notes are checkpointed with checkpoint_notes." };
       }
     }
