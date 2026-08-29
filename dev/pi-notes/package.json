@@ -5,7 +5,7 @@
   "description": "Session-local durable execution checkpoints for Pi",
   "type": "module",
   "keywords": ["pi-package", "pi-extension", "notes"],
-  "pi": { "extensions": ["./index.ts"] },
+  "pi": { "extensions": ["./entry.ts"] },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
