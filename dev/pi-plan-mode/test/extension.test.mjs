@@ -163,8 +163,8 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   await pi.handlers.get("session_start")({}, ctx);
   assert.equal(readdirSync(process.env.PI_PLAN_DIR).includes("stale-plan"), false);
 
-  assert.deepEqual(pi.active, ["read", "manage_plan_draft", "submit_plan_for_approval", "bash"], "fresh parent sessions default safely to PLAN");
-  assert.match((await pi.handlers.get("before_agent_start")({ systemPrompt: "base" })).systemPrompt, /PLAN MODE IS ACTIVE/);
+  assert.deepEqual(pi.active, [...pi.tools.keys()], "fresh parent sessions default to YOLO");
+  assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
   assert.ok(pi.commands.has("mode"));
   assert.ok(pi.commands.has("plan"));
   assert.ok(pi.commands.has("orchestrator"));
@@ -465,6 +465,7 @@ test("managed plans record bounded recommendations and approval puts the recomme
   await registerPlanMode(pi);
   const ctx = mockContext([], undefined);
   await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
 
   const draftTool = pi.tools.get("manage_plan_draft");
   const approvalTool = pi.tools.get("submit_plan_for_approval");
@@ -502,6 +503,7 @@ test("actionable revisions return a parent-owned ask_user_question proposal and 
   await registerPlanMode(pi);
   const ctx = mockContext([], undefined);
   await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
   const draftTool = pi.tools.get("manage_plan_draft");
   const approvalTool = pi.tools.get("submit_plan_for_approval");
   const created = await draftTool.execute("revision-apply", { action: "create", plan: "# Current\n\n1. Keep the current behavior." }, undefined, undefined, ctx);
@@ -562,6 +564,7 @@ test("revision Keep resubmits the current plan and further feedback does not wri
   await registerPlanMode(pi);
   const ctx = mockContext([], undefined);
   await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
   const draftTool = pi.tools.get("manage_plan_draft");
   const approvalTool = pi.tools.get("submit_plan_for_approval");
   const created = await draftTool.execute("revision-keep", { action: "create", plan: "# Current\n\n1. Keep this." }, undefined, undefined, ctx);
@@ -603,6 +606,7 @@ test("ambiguous revision feedback requires ask_user_question before a proposal",
   await registerPlanMode(pi);
   const ctx = mockContext([], undefined);
   await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
   const draftTool = pi.tools.get("manage_plan_draft");
   const approvalTool = pi.tools.get("submit_plan_for_approval");
   const created = await draftTool.execute("revision-clarify", { action: "create", plan: "# Current" }, undefined, undefined, ctx);
@@ -628,6 +632,7 @@ test("pending revision feedback persists and restores through startup, tree, and
   await registerPlanMode(pi);
   const ctx = mockContext(pi.entries, undefined);
   await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
   const draftTool = pi.tools.get("manage_plan_draft");
   const approvalTool = pi.tools.get("submit_plan_for_approval");
   const created = await draftTool.execute("revision-persist", { action: "create", plan: "# Current\n\n1. Keep this." }, undefined, undefined, ctx);
@@ -854,7 +859,7 @@ test("session tree restores branch-local mode and managed plan context", async (
   await pi.handlers.get("session_shutdown")({}, ctx);
 });
 
-test("malformed child probe safely defaults to the parent PLAN contract", async (t) => {
+test("malformed child probe safely defaults to the YOLO contract", async (t) => {
   isolatedEnvironment(t);
   const key = Symbol.for("pi-subagents:child-context:v1");
   const registry = globalThis;
@@ -865,11 +870,8 @@ test("malformed child probe safely defaults to the parent PLAN contract", async 
     await registerPlanMode(pi);
     const ctx = mockContext([], undefined);
     await pi.handlers.get("session_start")({}, ctx);
-    assert.equal(pi.active.includes("manage_plan_draft"), true);
-    assert.equal(pi.active.includes("submit_plan_for_approval"), true);
-    const baseline = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
-    assert.match(baseline.systemPrompt, /The parent remains responsible/);
-    assert.doesNotMatch(baseline.systemPrompt, /child planning agent/);
+    assert.deepEqual(pi.active, [...pi.tools.keys()]);
+    assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
     await pi.handlers.get("session_shutdown")({}, ctx);
   } finally {
     if (previous === undefined) delete registry[key];
@@ -889,6 +891,7 @@ test("approved pending recovery is branch-local, explicit, and idempotent", asyn
   await registerPlanMode(firstPi);
   const firstCtx = mockContext([], sessionFile);
   await firstPi.handlers.get("session_start")({}, firstCtx);
+  await firstPi.commands.get("plan").handler(undefined, firstCtx);
   const draft = await firstPi.tools.get("manage_plan_draft").execute("draft", {
     action: "create",
     plan: "# Recovery\n\nParent recommendation: ORCHESTRATOR\n\n1. Implement safely.",
@@ -938,6 +941,7 @@ test("Stay in PLAN preserves pending approval across reloads and headless restor
   await registerPlanMode(firstPi);
   const firstCtx = mockContext([], sessionFile);
   await firstPi.handlers.get("session_start")({}, firstCtx);
+  await firstPi.commands.get("plan").handler(undefined, firstCtx);
   const draft = await firstPi.tools.get("manage_plan_draft").execute("draft", { action: "create", plan: "# Stay\n\n1. Wait." }, undefined, undefined, firstCtx);
   firstCtx.selections.push("Implement with YOLO");
   await firstPi.tools.get("submit_plan_for_approval").execute("approve", { planPath: draft.details.planPath }, undefined, undefined, firstCtx);

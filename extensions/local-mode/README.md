@@ -21,6 +21,7 @@ When enabled, the extension:
 - switches to the `local-green` theme, including green editor borders;
 - shows a green `LOCAL` status and working indicator;
 - shows the measured local output generation rate in the statusline after a response (`tok/s`) and keeps the latest rate visible across tool turns;
+- requires the main local agent to create and update parent-session todos for multi-step work; Explore remains read-only and cannot update those todos;
 - adds local 27B/9B subagent-routing instructions to each turn;
 - remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp`;
 - limits `/local model` and Option-Tab model cycling to `qwen38-main/qwen3.8-27b` and `qwopus-subagent/qwopus3.5-9b-coder-mtp`.

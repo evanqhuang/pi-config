@@ -17,67 +17,98 @@ function createPiImporter() {
 	});
 }
 
-test("plain Tab cycles thinking for empty and whitespace-only editor text", async () => {
+function createRegisteredEditor(registerTabThinking) {
+	const handlers = new Map();
+	const thinkingLevels = [];
+	const delegated = [];
+	let text = "";
+	let factoryCalls = 0;
+	const baseEditor = {
+		getText: () => text,
+		handleInput: (data) => delegated.push(data),
+		isVimEditor: true,
+	};
+	const baseFactory = (...args) => {
+		factoryCalls++;
+		assert.equal(args.length, 3, "the current editor factory receives Pi's editor arguments");
+		return baseEditor;
+	};
+	let editorFactory = baseFactory;
+	const ui = {
+		getEditorComponent: () => editorFactory,
+		setEditorComponent: (factory) => {
+			editorFactory = factory;
+		},
+		notify: () => {},
+	};
+	const pi = {
+		on: (event, handler) => handlers.set(event, handler),
+		getThinkingLevel: () => "low",
+		setThinkingLevel: (level) => thinkingLevels.push(level),
+	};
+	const context = { mode: "tui", model: { reasoning: true }, ui };
+
+	registerTabThinking(pi);
+	handlers.get("resources_discover")({}, context);
+	handlers.get("session_start")({}, context);
+	const editor = editorFactory({}, {}, {});
+
+	return {
+		editor,
+		baseEditor,
+		delegated,
+		factoryCalls: () => factoryCalls,
+		setText: (value) => {
+			text = value;
+		},
+		thinkingLevels,
+		shutdown: () => handlers.get("session_shutdown")({}, context),
+	};
+}
+
+test("the registered factory preserves custom editors and cycles thinking on empty Tab", async () => {
 	const jiti = createPiImporter();
-	const [{ default: registerTabThinking, normalizeTerminalInput }, { CustomEditor }, { matchesKey, parseKey }] = await Promise.all([
+	const [{ default: registerTabThinking, normalizeTerminalInput }, { matchesKey, parseKey }] = await Promise.all([
 		jiti.import("/Users/evanhuang/.pi/agent/extensions/tab-thinking.ts"),
-		jiti.import("@earendil-works/pi-coding-agent"),
 		jiti.import("@earendil-works/pi-tui"),
 	]);
+	const setup = createRegisteredEditor(registerTabThinking);
 
-	registerTabThinking({ on() {} });
-
-	const state = CustomEditor.prototype.__hostelhawkTabThinkingState;
-	assert.ok(state, "Tab-thinking hook should be installed");
-
-	let cycles = 0;
-	const delegated = [];
-	state.cycle = () => cycles++;
-	state.originalHandleInput = function (data) {
-		delegated.push({ data, text: this.getText() });
-	};
+	assert.equal(setup.editor, setup.baseEditor, "the active custom editor is wrapped rather than replaced");
+	assert.equal(setup.editor.isVimEditor, true, "custom editor behavior remains available");
+	assert.equal(setup.factoryCalls(), 1);
 
 	for (const text of ["", " ", "   ", "\n", " \n\t "]) {
-		CustomEditor.prototype.handleInput.call({ getText: () => text }, "\t");
+		setup.setText(text);
+		setup.editor.handleInput("\t");
 	}
 
-	CustomEditor.prototype.handleInput.call({ getText: () => "prompt" }, "\t");
-	CustomEditor.prototype.handleInput.call({ getText: () => " " }, "x");
+	setup.setText("prompt");
+	setup.editor.handleInput("\t");
+	setup.setText(" ");
+	setup.editor.handleInput("x");
 
 	const legacyAltTab = "\x1b\t";
 	const normalizedAltTab = normalizeTerminalInput(legacyAltTab);
 	assert.equal(parseKey(legacyAltTab), "ctrl+alt+i", "documents the upstream legacy parsing bug");
 	assert.equal(parseKey(normalizedAltTab), "alt+tab");
 	assert.equal(matchesKey(normalizedAltTab, "alt+tab"), true);
-	CustomEditor.prototype.handleInput.call({ getText: () => "" }, legacyAltTab);
+	setup.setText("");
+	setup.editor.handleInput(legacyAltTab);
 
-	assert.equal(cycles, 5, "Option+Tab must not trigger plain-Tab thinking cycling");
-	assert.deepEqual(delegated, [
-		{ data: "\t", text: "prompt" },
-		{ data: "x", text: " " },
-		{ data: normalizedAltTab, text: "" },
-	]);
+	assert.deepEqual(setup.thinkingLevels, ["medium", "medium", "medium", "medium", "medium"]);
+	assert.deepEqual(setup.delegated, ["\t", "x", normalizedAltTab]);
 });
 
-test("empty Tab is consumed while the thinking callback is unavailable", async () => {
+test("empty Tab remains consumed after session shutdown", async () => {
 	const jiti = createPiImporter();
-	const [{ default: registerTabThinking }, { CustomEditor }] = await Promise.all([
-		jiti.import("/Users/evanhuang/.pi/agent/extensions/tab-thinking.ts"),
-		jiti.import("@earendil-works/pi-coding-agent"),
-	]);
+	const { default: registerTabThinking } = await jiti.import("/Users/evanhuang/.pi/agent/extensions/tab-thinking.ts");
+	const setup = createRegisteredEditor(registerTabThinking);
 
-	registerTabThinking({ on() {} });
+	setup.shutdown();
+	setup.setText("");
+	setup.editor.handleInput("\t");
 
-	const state = CustomEditor.prototype.__hostelhawkTabThinkingState;
-	assert.ok(state, "Tab-thinking hook should be installed");
-
-	state.cycle = undefined;
-	let delegated = false;
-	state.originalHandleInput = function () {
-		delegated = true;
-	};
-
-	CustomEditor.prototype.handleInput.call({ getText: () => "" }, "\t");
-
-	assert.equal(delegated, false, "empty Tab must not reach the original editor handler");
+	assert.deepEqual(setup.thinkingLevels, []);
+	assert.deepEqual(setup.delegated, []);
 });

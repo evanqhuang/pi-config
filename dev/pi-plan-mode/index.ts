@@ -684,7 +684,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   // future context bridge starts through the native sandbox wrapper.
   const contextPatch = await installContextBridgeSandboxPatch();
   const state: State = {
-    mode: "PLAN",
+    mode: "YOLO",
     pendingApprovalArmed: false,
     transitionPromises: new Map(),
     transitionStarted: new Set(),
@@ -1260,7 +1260,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       // A recoverable approval is an explicit safety interlock: it never
       // restores the previously persisted execution mode before the user
       // chooses whether to resume it.
-      await apply(recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
+      await apply(recoveredApproval ? "PLAN" : isChild ? "PLAN" : lastMode(ctx), ctx);
       if (!recoveredApproval || !genuineResume || !ctx.hasUI) return;
       // Explicit runtime reasons distinguish reload/fork from a later real
       // startup/resume. Adapters without the reason use the process/session

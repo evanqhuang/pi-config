@@ -169,6 +169,14 @@ test("keeps the before-agent event available for local system-prompt injection",
 	);
 });
 
+test("instructs the local main agent to track multi-step work in the parent todo", () => {
+	const extensionSource = readFileSync(join(__dirname, "index.ts"), "utf8");
+	assert.match(
+		extensionSource,
+		/## Task Tracking[\s\S]*?use the built-in todo tool before beginning work[\s\S]*?Explore subagents are read-only/,
+	);
+});
+
 test("uses a one-time model-led deeper-reasoning request instead of keywords", () => {
 	const extensionSource = readFileSync(join(__dirname, "index.ts"), "utf8");
 	assert.match(

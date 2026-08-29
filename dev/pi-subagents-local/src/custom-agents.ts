@@ -1,9 +1,12 @@
 /**
- * custom-agents.ts — Load user-defined agents from project (.pi/agents/, plus the shared .agents/agents/ workspace) and global ($PI_CODING_AGENT_DIR/agents/, default ~/.pi/agent/agents/) locations.
+ * custom-agents.ts — Load user-defined agents from project (.pi/agents/, plus
+ * project-local .agents/agents/) and Pi's global agent directory
+ * ($PI_CODING_AGENT_DIR/agents/, default ~/.pi/agent/agents/).
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
@@ -28,12 +31,14 @@ const RESERVED_IN_TYPE = ":";
  * Scan for custom agent .md files from multiple locations.
  * Discovery hierarchy (higher priority wins):
  *   1. Project:   <cwd>/.pi/agents/*.md (authoritative — also where /agents writes)
- *   2. Workspace: <cwd>/.agents/agents/*.md (shared cross-tool .agents workspace, read-only)
+ *   2. Workspace: <cwd>/.agents/agents/*.md (project-local, read-only)
  *   3. Global:    $PI_CODING_AGENT_DIR/agents/*.md (default: ~/.pi/agent/agents/*.md)
  *
- * Project-level agents override global ones with the same name. On a name clash
- * between the two project locations, .pi/agents wins — .pi stays the project
- * authority; .agents/agents is an additional read location.
+ * The global cross-tool ~/.agents/agents directory is deliberately excluded,
+ * even when Pi is launched from $HOME. Project-level agents override global
+ * Pi agents with the same name. On a name clash between the two project
+ * locations, .pi/agents wins — .pi stays the project authority;
+ * .agents/agents is an additional read location.
  * Any name is allowed — names matching defaults (e.g. "Explore") override them.
  *
  * An agent's type comes from its frontmatter `name:`, falling back to the
@@ -45,12 +50,17 @@ const RESERVED_IN_TYPE = ":";
 export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
   const globalDir = join(getAgentDir(), "agents");
   const workspaceProjectDir = join(cwd, ".agents", "agents");
+  const globalSharedDir = join(homedir(), ".agents", "agents");
   const projectDir = join(cwd, ".pi", "agents");
 
   const agents = new Map<string, AgentConfig>();
-  loadFromDir(globalDir, agents, "global", strict);            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  loadFromDir(globalDir, agents, "global", strict); // lowest priority
+  // Keep project-local .agents/agents support, but never treat the user's
+  // cross-tool home directory as a Pi workspace when cwd is $HOME.
+  if (resolve(workspaceProjectDir) !== resolve(globalSharedDir)) {
+    loadFromDir(workspaceProjectDir, agents, "project", strict);
+  }
+  loadFromDir(projectDir, agents, "project", strict); // highest priority (overwrites)
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();

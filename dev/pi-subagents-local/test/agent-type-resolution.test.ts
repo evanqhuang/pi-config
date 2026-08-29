@@ -116,6 +116,36 @@ describe("real custom-card loading and resolution", () => {
     expect(resolved).toEqual({ ok: true, type: "ImplementationWorker" });
   });
 
+  it("ignores the global shared agents directory but keeps project-local workspace agents", async () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = tempRoot;
+    try {
+      const globalSharedDir = join(tempRoot, ".agents", "agents");
+      await mkdir(globalSharedDir, { recursive: true });
+      await writeFile(
+        join(globalSharedDir, "GlobalShared.md"),
+        "---\nname: global-shared\ndescription: shared global card\n---\n\nGlobal shared prompt\n",
+      );
+
+      expect(loadCustomAgents(tempRoot).has("global-shared")).toBe(false);
+
+      const cwd = projectDir();
+      const projectSharedDir = join(cwd, ".agents", "agents");
+      await mkdir(projectSharedDir, { recursive: true });
+      await writeFile(
+        join(projectSharedDir, "ProjectShared.md"),
+        "---\nname: project-shared\ndescription: project card\n---\n\nProject prompt\n",
+      );
+
+      expect(loadCustomAgents(cwd).get("project-shared")?.sourcePath).toBe(
+        join(projectSharedDir, "ProjectShared.md"),
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   it("fails closed when the ImplementationWorker card is missing", async () => {
     const cards = loadCustomAgents(projectDir());
     const resolved = resolveSpawnTypeIn(buildAgentRegistry(cards), "ImplementationWorker");

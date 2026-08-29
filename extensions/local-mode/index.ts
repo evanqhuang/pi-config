@@ -5,7 +5,6 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
 	CustomEditor,
-	type EditorFactory,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type Theme,
@@ -72,7 +71,7 @@ interface LocalModeState {
 	cycling: boolean;
 	generationStartedAt?: number;
 	tokensPerSecond?: number;
-	previousEditorFactory?: EditorFactory;
+	localCycleEditorInstalled: boolean;
 	previousModel?: Model<Api>;
 	previousThinkingLevel?: ThinkingLevel;
 	previousTheme?: Theme;
@@ -93,6 +92,10 @@ function buildLocalInstructions(activeModel: Model<Api> | undefined): string {
 
 	return `[LOCAL MODE ACTIVE]
 The current main model is ${current}. Do not change it unless the user asks.
+
+## Task Tracking
+- For every multi-step task, use the built-in todo tool before beginning work and keep its statuses current as work progresses.
+- Keep task tracking in the parent session. Explore subagents are read-only and cannot update the parent's todo list.
 
 ## Local Model Subagent Routing
 - Use only the local model providers listed below for delegated work while local mode is active.
@@ -123,7 +126,6 @@ function resetState(state: LocalModeState): void {
 	state.cycling = false;
 	state.generationStartedAt = undefined;
 	state.tokensPerSecond = undefined;
-	state.previousEditorFactory = undefined;
 	state.previousModel = undefined;
 	state.previousThinkingLevel = undefined;
 	state.previousTheme = undefined;
@@ -401,19 +403,20 @@ async function cycleLocalModel(
 }
 
 function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: ExtensionContext): void {
-	state.previousEditorFactory = ctx.ui.getEditorComponent();
-	const previousFactory = state.previousEditorFactory;
+	if (state.localCycleEditorInstalled) return;
+
+	const previousFactory = ctx.ui.getEditorComponent();
 	ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 		const editor = previousFactory
 			? previousFactory(tui, theme, keybindings)
 			: new CustomEditor(tui, theme, keybindings);
 		const handleInput = editor.handleInput.bind(editor);
 		editor.handleInput = (data: string) => {
-			if (keybindings.matches(data, "app.model.cycleForward")) {
+			if (state.enabled && keybindings.matches(data, "app.model.cycleForward")) {
 				void cycleLocalModel(pi, state, ctx, "forward");
 				return;
 			}
-			if (keybindings.matches(data, "app.model.cycleBackward")) {
+			if (state.enabled && keybindings.matches(data, "app.model.cycleBackward")) {
 				void cycleLocalModel(pi, state, ctx, "backward");
 				return;
 			}
@@ -421,6 +424,13 @@ function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: E
 		};
 		return editor;
 	});
+	state.localCycleEditorInstalled = true;
+}
+
+function applyLocalTheme(state: LocalModeState, ctx: ExtensionContext): void {
+	if (!state.enabled) return;
+	const greenTheme = ctx.ui.getTheme(GREEN_THEME_NAME);
+	if (greenTheme) ctx.ui.setTheme(greenTheme);
 }
 
 async function showLocalModelSelector(
@@ -463,12 +473,7 @@ async function activateLocalMode(
 	state.localOnly = true;
 	getProcessLocalProviderPolicy().enabled = true;
 	installLocalCycleEditor(pi, state, ctx);
-	const greenTheme = ctx.ui.getTheme(GREEN_THEME_NAME);
-	if (greenTheme) {
-		ctx.ui.setTheme(greenTheme);
-	} else {
-		ctx.ui.notify("Local mode theme unavailable", "warning");
-	}
+	applyLocalTheme(state, ctx);
 	updateUi(state, ctx);
 	ctx.ui.notify("Local mode enabled. Use /local model to switch local models.", "info");
 	return true;
@@ -487,7 +492,6 @@ async function disableLocalMode(pi: ExtensionAPI, state: LocalModeState, ctx: Ex
 	state.enabled = false;
 	state.localOnly = false;
 	getProcessLocalProviderPolicy().enabled = false;
-	ctx.ui.setEditorComponent(state.previousEditorFactory);
 	if (state.previousModel && !(await pi.setModel(state.previousModel))) {
 		ctx.ui.notify(`Could not restore model: ${modelKey(state.previousModel)}`, "warning");
 	}
@@ -565,9 +569,13 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		pendingAutomaticThinkingLevel: undefined,
 		deepReasoningRequested: false,
 		compactionRequested: false,
+		localCycleEditorInstalled: false,
 	};
 
-	pi.on("resources_discover", () => ({ themePaths: [GREEN_THEME_PATH] }));
+	pi.on("resources_discover", (_event, ctx) => {
+		setTimeout(() => applyLocalTheme(state, ctx), 0);
+		return { themePaths: [GREEN_THEME_PATH] };
+	});
 
 	pi.registerTool({
 		name: "request_deeper_reasoning",
@@ -764,12 +772,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 
 		getProcessLocalProviderPolicy().enabled = false;
 		const persistedState = getPersistedLocalModeState(ctx);
-		const currentModel = ctx.model;
-		const legacyLocalSession =
-			persistedState === undefined &&
-			currentModel !== undefined &&
-			LOCAL_MODELS.some((model) => modelKey(model) === modelKey(currentModel));
-		if (persistedState?.enabled === true || legacyLocalSession) {
+		if (persistedState?.enabled === true) {
 			await activateLocalMode(pi, state, ctx);
 			if (
 				persistedState?.automaticThinking === false &&

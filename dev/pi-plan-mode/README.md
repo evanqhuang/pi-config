@@ -14,7 +14,7 @@ A focused Pi extension with exactly three workflow modes:
 - `/mode yolo`, `/yolo` — activate YOLO
 - `/modes` — alias for `/mode`
 
-The selected mode is persisted in the current Pi session. Fresh, malformed, and no-session contexts default safely to PLAN.
+The selected mode is persisted in the current Pi session. Fresh, malformed, and no-session contexts default to YOLO.
 
 ## File-backed planning workflow
 
@@ -28,7 +28,7 @@ PLAN keeps long plans out of repetitive chat output:
 
 Plans may opt into a recommendation with a bounded directive such as `Parent recommendation: ORCHESTRATOR` (or `PREWALK`/`YOLO`) and may state `Compaction advice: compact-first` or `direct`; callers may also provide the bounded `recommendedMode`, `recommendCompaction`, and `recommendationReason` fields to create/replace. Unmarked or conflicting signals use the safe display recommendation of YOLO; recommendations do not grant approval or transition modes.
 
-A typical substantial task therefore flows from three parallel explorers, through correction of any wrong-ref finding, to a Plan-agent stress test, one rendered plan artifact, and path-only approval. Recommendation labels are advisory: the user remains the sole approval authority, and fresh or malformed sessions still default safely to PLAN.
+A typical substantial task therefore flows from three parallel explorers, through correction of any wrong-ref finding, to a Plan-agent stress test, one rendered plan artifact, and path-only approval. Recommendation labels are advisory: the user remains the sole approval authority, and fresh or malformed sessions default to YOLO.
 
 ## Lifecycle and security model
 

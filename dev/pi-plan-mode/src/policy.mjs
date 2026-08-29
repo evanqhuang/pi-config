@@ -4,13 +4,13 @@ const SAFE_DELEGATION_TYPES = Object.freeze(new Map([
 ]));
 
 // This is deliberately explicit. New tools are unavailable in PLAN until their
-// behavior has been reviewed and added here. checkpoint_notes is safe here
-// because pi-notes owns a fixed agent-private path and accepts no caller path.
+// behavior has been reviewed and added here.
 export const PLAN_TOOLS = Object.freeze([
   "read", "grep", "find", "ls", "bash",
-  "ask_user_question", "questionnaire", "checkpoint_notes", "manage_plan_draft", "submit_plan_for_approval",
+  "ask_user_question", "questionnaire", "manage_plan_draft", "submit_plan_for_approval",
   "ctx_execute", "ctx_execute_file", "ctx_batch_execute",
   "ctx_search", "ctx_fetch_and_index", "ctx_index", "ctx_stats", "ctx_doctor",
+  "checkpoint_notes",
   "web_search", "fetch_content", "get_search_content", "web_fetch",
   "Agent", "get_subagent_result", "steer_subagent",
 ]);
@@ -126,6 +126,9 @@ const FORBIDDEN_ARGUMENTS = new Set([
 
 function isSafeCommandShape(command) {
   if (typeof command !== "string" || command.trim() === "") return false;
+  // A single argv-only command is intentional. The native sandbox remains the
+  // final defense, but rejecting shell composition prevents hidden second
+  // commands from being treated as automatically approved batch work.
   if (/[;&|<>`\n\r]|\$\(|\$\{/.test(command)) return false;
 
   const tokens = shellTokens(command);
@@ -134,6 +137,7 @@ function isSafeCommandShape(command) {
   while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index++;
   if (tokens[index] === "env" || tokens[index] === "command" || tokens[index] === "builtin") return false;
   const executableToken = tokens[index] ?? "";
+  // Do not trust a safe basename reached through an attacker-controlled path.
   if (executableToken.includes("/") || executableToken.includes("\\")) return false;
   const executable = executableToken;
   if (!SAFE_COMMANDS.has(executable)) return false;
@@ -173,5 +177,6 @@ export function restoreMode(entries) {
   const mode = (Array.isArray(entries) ? entries : [])
     .map((entry) => String(entry?.mode ?? "").toUpperCase())
     .findLast((value) => value === "PLAN" || value === "ORCHESTRATOR" || value === "YOLO");
-  return mode ?? "PLAN";
+  // YOLO is the default for fresh, malformed, and no-session contexts.
+  return mode ?? "YOLO";
 }

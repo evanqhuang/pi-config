@@ -89,10 +89,10 @@ test("batch execution is automatically allowed only for read-only command shapes
   assert.equal(isReadOnlyBatch({ commands: [{ label: "status", command: "git status" }, { label: "write", command: "touch x" }] }), false);
 });
 
-test("mode persistence defaults safely and restores only known modes", () => {
-  assert.equal(restoreMode([]), "PLAN");
+test("mode persistence defaults to YOLO and restores only known modes", () => {
+  assert.equal(restoreMode([]), "YOLO");
   assert.equal(restoreMode([{ mode: "YOLO" }, { mode: "ORCHESTRATOR" }]), "ORCHESTRATOR");
   assert.equal(restoreMode([{ mode: "YOLO" }, { mode: "PLAN" }]), "PLAN");
   assert.equal(restoreMode([{ mode: "plan" }]), "PLAN");
-  assert.equal(restoreMode([{ mode: "CODE" }]), "PLAN");
+  assert.equal(restoreMode([{ mode: "CODE" }]), "YOLO");
 });
