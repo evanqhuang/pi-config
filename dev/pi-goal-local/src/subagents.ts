@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { loadGoalJudgeSettings, type GoalJudgeThinking } from "./settings.js";
 
 const PI_SUBAGENTS_SERVICE_V3 = Symbol.for("pi-subagents:service:v3");
 
@@ -17,6 +18,8 @@ interface PiSubagentsServiceV3 {
     prompt: string;
     description?: string;
     signal?: AbortSignal;
+    model?: string;
+    thinkingLevel?: GoalJudgeThinking;
   }): Promise<EphemeralAgentResult>;
   hasActiveAgents(): boolean;
 }
@@ -38,6 +41,7 @@ export function runEvaluator(
   prompt: string,
   signal?: AbortSignal,
 ): Promise<EphemeralAgentResult> {
+  const judge = type === "GoalJudge" ? loadGoalJudgeSettings(ctx.cwd) : undefined;
   return subagents().runEphemeralAgent({
     pi,
     ctx,
@@ -45,5 +49,7 @@ export function runEvaluator(
     prompt,
     description: type === "GoalJudge" ? "Evaluate active goal" : "Verify active goal",
     signal,
+    model: judge?.model,
+    thinkingLevel: judge?.thinking,
   });
 }
