@@ -2,9 +2,18 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { parseGoalCommand, formatGoalStatus } from "./commands.js";
 import { GoalController } from "./controller.js";
 
+export function agentRunWasAborted(messages: readonly unknown[]): boolean {
+  return messages.some(message => {
+    if (!message || typeof message !== "object") return false;
+    const candidate = message as { role?: unknown; stopReason?: unknown };
+    return candidate.role === "assistant" && candidate.stopReason === "aborted";
+  });
+}
+
 export default function goalExtension(pi: ExtensionAPI): void {
   const controller = new GoalController(pi);
   let ctx: ExtensionContext | undefined;
+  let currentRunAborted = false;
 
   pi.on("session_start", (_event, nextCtx) => {
     ctx = nextCtx;
@@ -31,6 +40,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     controller.shutdown();
     ctx = undefined;
+    currentRunAborted = false;
   });
 
   pi.registerCommand("goal", {
@@ -83,8 +93,25 @@ export default function goalExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on("agent_start", () => {
+    currentRunAborted = false;
+  });
+
+  pi.on("agent_end", (event) => {
+    currentRunAborted ||= agentRunWasAborted(event.messages);
+  });
+
   pi.on("agent_settled", (_event, settledCtx) => {
     ctx = settledCtx;
+    const aborted = currentRunAborted;
+    currentRunAborted = false;
+    if (aborted) {
+      const paused = controller.pause(settledCtx);
+      if (paused && settledCtx.hasUI) {
+        settledCtx.ui.notify("Goal paused because the agent run was aborted.", "warning");
+      }
+      return;
+    }
     controller.requestEvaluation(settledCtx);
   });
 
