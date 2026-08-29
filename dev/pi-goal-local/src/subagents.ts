@@ -24,14 +24,21 @@ interface PiSubagentsServiceV3 {
   hasActiveAgents(): boolean;
 }
 
+function maybeSubagents(): PiSubagentsServiceV3 | undefined {
+  return (globalThis as Record<PropertyKey, unknown>)[PI_SUBAGENTS_SERVICE_V3] as PiSubagentsServiceV3 | undefined;
+}
+
 function subagents(): PiSubagentsServiceV3 {
-  const service = (globalThis as Record<PropertyKey, unknown>)[PI_SUBAGENTS_SERVICE_V3] as PiSubagentsServiceV3 | undefined;
+  const service = maybeSubagents();
   if (!service) throw new Error("pi-subagents-local service v3 is unavailable in this session.");
   return service;
 }
 
 export function hasActiveSubagents(): boolean {
-  return subagents().hasActiveAgents();
+  // Do not throw from the controller's pre-evaluation readiness check. If the
+  // service is missing, let runEvaluator() produce the explicit failure so the
+  // goal controller can apply its normal retry/block budget and fail closed.
+  return maybeSubagents()?.hasActiveAgents() ?? false;
 }
 
 export function runEvaluator(
