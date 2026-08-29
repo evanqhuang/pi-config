@@ -500,7 +500,9 @@ function pathFromInput(input: Record<string, unknown>): string | undefined {
 }
 
 export function classifyToolResult(toolName: string, input: Record<string, unknown>, isError: boolean): { meaningful: boolean; highSignal: boolean; verification?: string; modifiedPath?: string } {
-  if (toolName === "edit" || toolName === "write") return { meaningful: true, highSignal: true, modifiedPath: pathFromInput(input) };
+  if (toolName === "edit" || toolName === "write") {
+    return { meaningful: true, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
+  }
   if (toolName === "bash" || toolName === "powershell") {
     const command = commandFromInput(input);
     if (!command) return { meaningful: false, highSignal: false };
@@ -510,7 +512,7 @@ export function classifyToolResult(toolName: string, input: Record<string, unkno
     return { meaningful: false, highSignal: false };
   }
   if (/^(?:apply_patch|patch|create_file|update_file|delete_file|migration|format|codegen)$/i.test(toolName)) {
-    return { meaningful: true, highSignal: true, modifiedPath: pathFromInput(input) };
+    return { meaningful: true, highSignal: true, modifiedPath: isError ? undefined : pathFromInput(input) };
   }
   if (/^(?:test|build|lint|typecheck|verify|check)/i.test(toolName)) return { meaningful: true, highSignal: true };
   return { meaningful: false, highSignal: false };
@@ -553,9 +555,10 @@ export function stripNotesReminders(messages: readonly any[]): any[] {
   return messages.filter((message) => message?.customType !== NOTES_REMINDER_TYPE);
 }
 
-function selectReminder(pi: ExtensionAPI, runtime: NotesRuntime): string | undefined {
+export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime: NotesRuntime): string | undefined {
   if (!runtime.active || !pi.getActiveTools().includes("checkpoint_notes")) return undefined;
   if (runtime.reentryRequired) {
+    runtime.reentryRequired = false;
     return "[TASK NOTES RE-ENTRY]\nReread the current Notes checkpoint and inspect live worktree/tool state before continuing. Notes is continuity context, not proof.";
   }
   if (runtime.dirty && runtime.checkpointDue) {
@@ -579,12 +582,13 @@ function displayStatus(ctx: ExtensionContext, runtime: NotesRuntime, pi: Extensi
 }
 
 async function restoreCommittedSnapshot(runtime: NotesRuntime, ctx: ExtensionContext): Promise<boolean> {
-  const checkpoint = latestCheckpointForId(ctx.sessionManager.getBranch(), runtime.notesId);
+  const entries = ctx.sessionManager.getBranch();
+  const checkpoint = latestCheckpointForId(entries, runtime.notesId);
   if (!checkpoint) return false;
+  const state = latestStateForId(entries, runtime.notesId);
+  restoreRuntimeState(runtime, state, checkpoint);
   await materializeCheckpoint(runtime, checkpoint);
-  runtime.dirty = true;
-  runtime.checkpointDue = true;
-  runtime.reentryRequired = true;
+  runtime.reentryRequired = runtime.active;
   return true;
 }
 
@@ -652,7 +656,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
           customType: NOTES_REMINDER_TYPE,
           content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current durable execution state, then continue.",
           display: false,
-        }, { triggerTurn: true, deliverAs: "nextTurn" });
+        }, { triggerTurn: true, deliverAs: "followUp" });
         return;
       }
       if (command === "restore") {
