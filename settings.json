@@ -35,7 +35,22 @@
     "dev/pi-code-review",
     "npm:pi-skill-manager",
     "npm:pi-btw",
-    "npm:@upstash/context7-pi"
+    "npm:@upstash/context7-pi",
+    {
+      "source": "npm:remote-pi",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    },
+    {
+      "source": "npm:@tian.zuo/pi-compact-output",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    },
+    "npm:@haemmid/pi-processes"
   ],
   "defaultProvider": "qwen38-subagent",
   "defaultModel": "qwen3.8-27b",

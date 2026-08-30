@@ -8,6 +8,8 @@ Local mode is off by default. The normal model scope contains only the configure
 - `/local on` — alias for `/local`.
 - `/local off` — disable it and restore the previous model and theme.
 - `/local auto` — alias for `/local`; restores automatic medium reasoning after a manual thinking-level selection.
+- `/local subagent-27b off` — disable the 27B child-agent lane; the main 27B and read-only 9B Explore lane remain available.
+- `/local subagent-27b on` — re-enable the 27B child-agent lane.
 - Resuming or reloading a session restores the local-mode state saved in that session.
 - `/local model` — enable local mode if needed, then open a picker containing only the local 27B and 9B models.
 
@@ -22,8 +24,8 @@ When enabled, the extension:
 - shows a green `LOCAL` status and working indicator;
 - shows the measured local output generation rate in the statusline after a response (`tok/s`) and keeps the latest rate visible across tool turns;
 - requires the main local agent to create and update parent-session todos for multi-step work; Explore remains read-only and cannot update those todos;
-- adds local 27B/9B subagent-routing instructions to each turn;
-- remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp`;
+- adds concise local working-style, parent-session todo, and non-blocking delegation instructions to each turn;
+- remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp` and blocks other child launches while the 27B child-agent lane is disabled;
 - limits `/local model` and Option-Tab model cycling to `qwen38-main/qwen3.8-27b` and `qwopus-subagent/qwopus3.5-9b-coder-mtp`.
 
 When local mode is disabled, the configured model scope keeps local models out of the default `/model` view and Option-Tab cycle. The picker can still expose Pi's explicit “all models” view, and local providers remain registered so background extensions can use them.

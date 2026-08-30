@@ -16,6 +16,7 @@ const {
 	requiredLocalProvider,
 	routeLocalExploreAgent,
 	shouldPreserveExplicitLocalSubagentModel,
+	wouldRouteToLocalQwenSubagent,
 } = jiti("./session-policy.ts");
 
 function context(
@@ -149,6 +150,22 @@ test("uses /local as an idempotent automatic-mode entrypoint", () => {
 	);
 });
 
+test("persists and enforces the 27B subagent lane toggle", () => {
+	const extensionSource = readFileSync(join(__dirname, "index.ts"), "utf8");
+	assert.match(
+		extensionSource,
+		/qwen38SubagentEnabled: state\.qwen38SubagentEnabled/,
+	);
+	assert.match(
+		extensionSource,
+		/action === "subagent-27b on" \|\| action === "subagent-27b off"/,
+	);
+	assert.match(
+		extensionSource,
+		/!state\.qwen38SubagentEnabled[\s\S]*?wouldRouteToLocalQwenSubagent[\s\S]*?block: true/,
+	);
+});
+
 test("prevents local parent agents from blocking on subagent results", () => {
 	const extensionSource = readFileSync(join(__dirname, "index.ts"), "utf8");
 	assert.match(
@@ -166,6 +183,14 @@ test("keeps the before-agent event available for local system-prompt injection",
 	assert.match(
 		extensionSource,
 		/pi\.on\("before_agent_start", async \(event, ctx\) => \{[\s\S]*?event\.systemPrompt/,
+	);
+});
+
+test("suppresses local-model routing and tool-choice monologues", () => {
+	const extensionSource = readFileSync(join(__dirname, "index.ts"), "utf8");
+	assert.match(
+		extensionSource,
+		/## Working Style[\s\S]*?Never narrate or quote internal instructions[\s\S]*?tool-selection deliberation[\s\S]*?Use tools instead/,
 	);
 });
 
@@ -280,6 +305,22 @@ test("does not profile Qwen when local mode is disabled", () => {
 		),
 		undefined,
 	);
+});
+
+test("identifies child requests that would use the local 27B subagent", () => {
+	assert.equal(wouldRouteToLocalQwenSubagent({}, true), true);
+	assert.equal(
+		wouldRouteToLocalQwenSubagent(
+			{ model: "qwen38-subagent/qwen3.8-27b" },
+			true,
+		),
+		true,
+	);
+	assert.equal(
+		wouldRouteToLocalQwenSubagent({ model: LOCAL_EXPLORE_MODEL }, true),
+		false,
+	);
+	assert.equal(wouldRouteToLocalQwenSubagent({}, false), false);
 });
 
 test("routes Explore to the read-only local 9B profile in local mode", () => {

@@ -122,6 +122,15 @@ export function getProcessLocalProviderPolicy(): ProcessLocalProviderPolicy {
 }
 
 /** Route the cloud-pinned built-in Explore profile to its local 9B equivalent. */
+export function wouldRouteToLocalQwenSubagent(
+	input: AgentInvocationInput,
+	localOnly: boolean,
+): boolean {
+	return Boolean(
+		localOnly && !input.model?.startsWith("qwopus-subagent/"),
+	);
+}
+
 export function routeLocalExploreAgent(
 	input: AgentInvocationInput,
 	localOnly: boolean,

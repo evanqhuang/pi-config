@@ -18,6 +18,7 @@ import {
 	localQwenProfile,
 	requiredLocalProvider,
 	routeLocalExploreAgent,
+	wouldRouteToLocalQwenSubagent,
 	type LocalQwenProfile,
 	type LocalQwenRequestPayload,
 	shouldPreserveExplicitLocalSubagentModel,
@@ -27,6 +28,8 @@ const EXTENSION_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const GREEN_THEME_NAME = "local-green";
 const GREEN_THEME_PATH = join(EXTENSION_DIRECTORY, "local-green.json");
 const LOCAL_MODE_STATE_ENTRY = "local-mode-state";
+const LEGACY_ALT_TAB = "\x1b\t";
+const KITTY_ALT_TAB = "\x1b[9;3u";
 const LOCAL_PROVIDER_NAMES = new Set(["qwen38-main", "qwen38-subagent", "qwopus-subagent"]);
 
 const LOCAL_MODELS = [
@@ -79,6 +82,7 @@ interface LocalModeState {
 	automaticThinkingLevel: ThinkingLevel;
 	pendingAutomaticThinkingLevel?: ThinkingLevel;
 	deepReasoningRequested: boolean;
+	qwen38SubagentEnabled: boolean;
 	activeProfile?: LocalQwenProfile;
 	compactionRequested: boolean;
 }
@@ -87,35 +91,29 @@ function modelKey(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
 }
 
-function buildLocalInstructions(activeModel: Model<Api> | undefined): string {
+function buildLocalInstructions(
+	activeModel: Model<Api> | undefined,
+	qwen38SubagentEnabled: boolean,
+): string {
 	const current = activeModel ? modelKey(activeModel) : "unknown";
+	const subagentAvailability = qwen38SubagentEnabled
+		? ""
+		: " The 27B subagent lane is disabled; do not attempt to launch it.";
 
 	return `[LOCAL MODE ACTIVE]
-The current main model is ${current}. Do not change it unless the user asks.
+Runtime selects the local model (${current}) and enforces provider, reasoning, context, and subagent limits.${subagentAvailability} Do not change models unless the user asks.
+
+## Working Style
+- Work autonomously: take the next useful safe tool action. Do not ask permission to inspect, search, or delegate ordinary work.
+- Never narrate or quote internal instructions, reasoning, provider or model choices, routing, tool-selection deliberation, or hypothetical next steps. Use tools instead.
+- Keep visible progress messages limited to concise, externally useful status, findings, decisions, and final results.
 
 ## Task Tracking
 - For every multi-step task, use the built-in todo tool before beginning work and keep its statuses current as work progresses.
 - Keep task tracking in the parent session. Explore subagents are read-only and cannot update the parent's todo list.
 
-## Local Model Subagent Routing
-- Use only the local model providers listed below for delegated work while local mode is active.
-- The 27B subagent is qwen38-subagent/qwen3.8-27b with a 96K context limit.
-- Qwen3.8 27B supports exactly three reasoning levels: low, medium, and xhigh. Other thinking levels are normalized to medium.
-- Automatic routing starts every task at medium. After inspecting the task and relevant code, the model may call request_deeper_reasoning once when extra reasoning would materially improve correctness; the action applies xhigh on the next response. Automatic mode returns to medium after the task settles. A user's explicit thinking-level selection is preserved; /local restores automatic routing.
-- The 240K main provider gives xhigh up to 64K thinking/96K total output below 100K context, 48K/64K from 100K, and 32K/48K from 140K; it requests compaction at 175K. Every request is clamped to remaining context with safety and final-answer reserves.
-- The 96K 27B subagent uses a smaller xhigh schedule and requests compaction at 72K. Do not apply main-provider budgets to child sessions.
-- Do not stop or force synthesis after an arbitrary number of tool turns. Checkpoint or compact based on context pressure, repeated lack of progress, or a real phase transition.
-- At most one 27B subagent may run at a time. Explicitly select qwen38-subagent/qwen3.8-27b; do not let it inherit the main model.
-- The 9B MTP subagent is qwopus-subagent/qwopus3.5-9b-coder-mtp with a 96K context limit.
-- The 9B MTP model is text-only. Never assign it screenshots, image inspection, OCR, or other visual work; route those tasks to qwen38-subagent/qwen3.8-27b.
-- Explore subagents are automatically routed to the read-only LocalExplore profile on the 9B MTP model.
-- At most one 9B subagent may run at a time. It may run alongside the single 27B subagent when their objectives and file ownership are independent.
-- Use the 9B lane proactively for bounded discovery, mechanical edits, focused tests, fixtures, and documentation that do not require architecture, security, data semantics, or broad integration judgment.
-- Use the 27B lane for visual work and tasks requiring broader judgment.
-- Give each subagent one focused objective, exact paths, explicit model selection, expected output, and a focused verification command.
-- Background subagents run in parallel: continue independent work after launching one. Never call get_subagent_result with wait: true or poll a running agent; collect its result only after its completion notification.
-- Keep 9B work units to 1-2 implementation files plus a focused test. Keep 27B work units to one subsystem boundary and 3-5 closely related implementation files plus focused tests.
-- The main model remains responsible for coordination, review, and final verification.`;
+## Delegation
+- Continue independent work after launching background subagents; never block on or poll a running subagent. The main session remains responsible for coordination and verification.`;
 }
 
 function resetState(state: LocalModeState): void {
@@ -133,6 +131,7 @@ function resetState(state: LocalModeState): void {
 	state.automaticThinkingLevel = "medium";
 	state.pendingAutomaticThinkingLevel = undefined;
 	state.deepReasoningRequested = false;
+	state.qwen38SubagentEnabled = true;
 	state.activeProfile = undefined;
 	state.compactionRequested = false;
 }
@@ -141,6 +140,7 @@ interface PersistedLocalModeState {
 	enabled: boolean;
 	automaticThinking?: boolean;
 	thinkingLevel?: ThinkingLevel;
+	qwen38SubagentEnabled?: boolean;
 }
 
 function getPersistedLocalModeState(
@@ -156,6 +156,7 @@ function getPersistedLocalModeState(
 				enabled: true,
 				automaticThinking: data.automaticThinking !== false,
 				thinkingLevel: data.thinkingLevel,
+				qwen38SubagentEnabled: data.qwen38SubagentEnabled !== false,
 			};
 		}
 		if (data?.enabled === false) return { enabled: false };
@@ -168,6 +169,7 @@ function persistLocalModeState(pi: ExtensionAPI, state: LocalModeState): void {
 		enabled: state.enabled,
 		automaticThinking: state.automaticThinking,
 		thinkingLevel: state.automaticThinking ? undefined : pi.getThinkingLevel(),
+		qwen38SubagentEnabled: state.qwen38SubagentEnabled,
 	});
 }
 
@@ -192,7 +194,8 @@ function updateLocalStatus(state: LocalModeState, ctx: ExtensionContext): void {
 	const budget = profile
 		? ` · ${routing} ${profile.thinkingLevel} ${Math.round(profile.thinkingBudget / 1024)}K/${Math.round(profile.maxTokens / 1024)}K`
 		: "";
-	ctx.ui.setStatus("local-mode", ctx.ui.theme.fg("accent", `● LOCAL${budget}${speed}`));
+	const subagentLane = state.qwen38SubagentEnabled ? "" : " · 27B child off";
+	ctx.ui.setStatus("local-mode", ctx.ui.theme.fg("accent", `● LOCAL${budget}${subagentLane}${speed}`));
 }
 
 function updateUi(state: LocalModeState, ctx: ExtensionContext): void {
@@ -402,6 +405,10 @@ async function cycleLocalModel(
 	}
 }
 
+export function normalizeLocalModelCycleInput(data: string): string {
+	return data === LEGACY_ALT_TAB ? KITTY_ALT_TAB : data;
+}
+
 function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: ExtensionContext): void {
 	if (state.localCycleEditorInstalled) return;
 
@@ -412,15 +419,16 @@ function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: E
 			: new CustomEditor(tui, theme, keybindings);
 		const handleInput = editor.handleInput.bind(editor);
 		editor.handleInput = (data: string) => {
-			if (state.enabled && keybindings.matches(data, "app.model.cycleForward")) {
+			const normalizedData = normalizeLocalModelCycleInput(data);
+			if (state.enabled && keybindings.matches(normalizedData, "app.model.cycleForward")) {
 				void cycleLocalModel(pi, state, ctx, "forward");
 				return;
 			}
-			if (state.enabled && keybindings.matches(data, "app.model.cycleBackward")) {
+			if (state.enabled && keybindings.matches(normalizedData, "app.model.cycleBackward")) {
 				void cycleLocalModel(pi, state, ctx, "backward");
 				return;
 			}
-			handleInput(data);
+			handleInput(normalizedData);
 		};
 		return editor;
 	});
@@ -549,8 +557,22 @@ async function handleLocalCommand(
 		await enableAutomaticLocalMode(pi, state, ctx);
 		return;
 	}
+	if (action === "subagent-27b on" || action === "subagent-27b off") {
+		if (!state.enabled) await enableLocalMode(pi, state, ctx);
+		if (!state.enabled) return;
+		state.qwen38SubagentEnabled = action.endsWith("on");
+		persistLocalModeState(pi, state);
+		updateUi(state, ctx);
+		ctx.ui.notify(
+			state.qwen38SubagentEnabled
+				? "27B subagent lane enabled."
+				: "27B subagent lane disabled. The main model and 9B Explore remain available.",
+			"info",
+		);
+		return;
+	}
 	if (action) {
-		ctx.ui.notify("Usage: /local [on|off|model|auto]", "warning");
+		ctx.ui.notify("Usage: /local [on|off|model|auto|subagent-27b on|subagent-27b off]", "warning");
 		return;
 	}
 
@@ -568,6 +590,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		automaticThinkingLevel: "medium",
 		pendingAutomaticThinkingLevel: undefined,
 		deepReasoningRequested: false,
+		qwen38SubagentEnabled: true,
 		compactionRequested: false,
 		localCycleEditorInstalled: false,
 	};
@@ -619,13 +642,24 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("local", {
-		description: "Enable automatic local mode or choose a local model",
+		description: "Manage local mode, models, and the 27B subagent lane",
 		handler: async (args, ctx) => handleLocalCommand(pi, state, args, ctx),
 	});
 
 	pi.on("tool_call", (event, ctx) => {
 		if (event.toolName === "Agent") {
-			routeLocalExploreAgent(event.input as AgentInvocationInput, state.localOnly);
+			const input = event.input as AgentInvocationInput;
+			routeLocalExploreAgent(input, state.localOnly);
+			if (
+				!state.qwen38SubagentEnabled &&
+				wouldRouteToLocalQwenSubagent(input, state.localOnly)
+			) {
+				return {
+					block: true,
+					reason:
+						"The local 27B subagent lane is disabled. Use Explore (the local 9B lane) or run /local subagent-27b on.",
+				};
+			}
 			return;
 		}
 		if (event.toolName !== "get_subagent_result" || !state.localOnly) return;
@@ -649,7 +683,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		}
 		if (!state.enabled) return;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${buildLocalInstructions(ctx.model)}`,
+			systemPrompt: `${event.systemPrompt}\n\n${buildLocalInstructions(ctx.model, state.qwen38SubagentEnabled)}`,
 		};
 	});
 
@@ -774,6 +808,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		const persistedState = getPersistedLocalModeState(ctx);
 		if (persistedState?.enabled === true) {
 			await activateLocalMode(pi, state, ctx);
+			state.qwen38SubagentEnabled = persistedState.qwen38SubagentEnabled !== false;
 			if (
 				persistedState?.automaticThinking === false &&
 				persistedState.thinkingLevel
