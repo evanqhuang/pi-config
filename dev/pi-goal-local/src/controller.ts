@@ -16,7 +16,6 @@ import {
 } from "./types.js";
 import { buildVerifierPrompt, parseVerifierVerdict } from "./verifier.js";
 
-const restoredInProcess = new Set<string>();
 const WAKE_DEBOUNCE_MS = 250;
 
 function parentReady(ctx: ExtensionContext): boolean {
@@ -28,6 +27,7 @@ function contextPercent(ctx: ExtensionContext): number | undefined {
   const runtime = ctx as ExtensionContext & {
     getContextUsage?: () => { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;
   };
+  // SAFETY: pi versions expose equivalent context-usage fields under slightly different structural types.
   const usage = runtime.getContextUsage?.() as unknown as { percent?: number; contextPercent?: number; tokens?: number; maxTokens?: number } | undefined;
   if (!usage) return undefined;
   if (typeof usage.percent === "number") return usage.percent > 1 ? usage.percent / 100 : usage.percent;
@@ -134,12 +134,8 @@ export class GoalController {
   restore(ctx: ExtensionContext): void {
     this.sessionEpoch += 1;
     this.syncBranch(ctx);
-    const goal = this.state;
-    if (!goal || goal.status !== "active") return;
-    const key = `${ctx.sessionManager.getSessionId()}+${goal.id}+${goal.generation}`;
-    if (restoredInProcess.has(key)) return;
-    restoredInProcess.add(key);
-    this.scheduleResume(ctx, goal, this.sessionEpoch);
+    if (this.state?.status !== "active") return;
+    this.transition("paused", "Paused when the session was reopened.");
   }
 
   restoreSelectedBranch(ctx: ExtensionContext): void {

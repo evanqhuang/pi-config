@@ -55,6 +55,40 @@ beforeEach(() => {
 });
 
 describe("goal controller lifecycle guards", () => {
+  it("restores an active goal as paused until explicitly resumed", () => {
+    const { controller, ctx, pi, branch, setBranch } = harness();
+    const activeGoal: GoalStateV1 = {
+      schemaVersion: 1,
+      id: "goal-1",
+      generation: 1,
+      objective: "ship feature",
+      criteria: ["tests pass"],
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+      iteration: 0,
+      consecutiveJudgeFailures: 0,
+      verificationFailures: 0,
+      noProgressCycles: 0,
+    };
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal }]);
+
+    controller.restore(ctx);
+
+    expect(controller.current?.status).toBe("paused");
+    expect(goalEntries(branch()).at(-1)).toMatchObject({
+      status: "paused",
+      terminalReason: "Paused when the session was reopened.",
+    });
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    controller.resume(ctx);
+
+    expect(controller.current?.status).toBe("active");
+    expect(goalEntries(branch()).at(-1)?.status).toBe("active");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["pause", "paused"],
     ["stop", "stopped"],
