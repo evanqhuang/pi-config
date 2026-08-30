@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import notesExtension, {
+  DEFAULT_CONFIG,
   NOTES_CHECKPOINT_TYPE,
   NOTES_STATE_TYPE,
   type CheckpointPayload,
@@ -35,6 +36,16 @@ function latestCustom(entries: any[], customType: string): any | undefined {
     if (entry?.type === "custom" && entry.customType === customType) return entry;
   }
   return undefined;
+}
+
+function subagentResult(status: "running" | "completed") {
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Agent: research\nType: Explore | Status: ${status} | Tool uses: 1 | Duration: 1s\nDescription: research\n${status === "completed" ? "Findings are ready." : "Agent is still running."}`,
+    }],
+    details: undefined,
+  };
 }
 
 async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
@@ -168,35 +179,123 @@ describe("session lifecycle integration", () => {
     expect(await readFile(notesPath, "utf8")).toBe(expected);
   });
 
-  it("marks a clean checkpoint dirty on the first relevant read without making it due", async () => {
+  it("does not dirty or pressure a clean checkpoint for ordinary read/search results", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
     await h.command.handler("on", h.ctx);
     await h.checkpointTool.execute("cp-1", payload);
 
-    h.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/a.ts" }, isError: false });
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults; index += 1) {
+      const toolName = index % 2 === 0 ? "read" : "web_search";
+      h.handlers.get("tool_result")!({ toolName, input: { path: `src/${index}.ts` }, isError: false });
+    }
 
-    expect(await h.status()).toContain("dirty: true");
+    expect(await h.status()).toContain("dirty: false");
     expect(await h.status()).toContain("checkpoint due: false");
   });
 
-  it("applies checkpoint pressure after continuity-relevant results or dirty turns", async () => {
+  it("marks a checkpoint dirty only after the read-only turn threshold", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    for (let index = 0; index < DEFAULT_CONFIG.autoActivation.readOnlyLongTaskTurns - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/${index}.ts` }, isError: false });
+      h.handlers.get("turn_end")!({});
+      expect(await h.status()).toContain("dirty: false");
+    }
+    h.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/threshold.ts" }, isError: false });
+    h.handlers.get("turn_end")!({});
+
+    expect(await h.status()).toContain("dirty: true");
+  });
+
+  it("defers running subagent status lookups but dirties for completed handoffs", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    h.handlers.get("tool_result")!({
+      toolName: "get_subagent_result",
+      input: { agent_id: "research" },
+      isError: false,
+      ...subagentResult("running"),
+    });
+    expect(await h.status()).toContain("dirty: false");
+
+    h.handlers.get("tool_result")!({
+      toolName: "get_subagent_result",
+      input: { agent_id: "research" },
+      isError: false,
+      ...subagentResult("completed"),
+    });
+    expect(await h.status()).toContain("dirty: true");
+  });
+
+  it("marks high-signal mutations, verification, errors, and subagent completions immediately", async () => {
+    const cases: Array<Record<string, unknown>> = [
+      { toolName: "write", input: { path: "src/changed.ts" }, isError: false },
+      { toolName: "bash", input: { command: "npm test" }, isError: false },
+      { toolName: "bash", input: { command: "rg missing src" }, isError: true },
+      { toolName: "get_subagent_result", input: { agent_id: "research" }, isError: false, ...subagentResult("completed") },
+    ];
+
+    for (const activity of cases) {
+      const h = await makeHarness();
+      await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+      await h.command.handler("on", h.ctx);
+      await h.checkpointTool.execute("cp-1", payload);
+      h.handlers.get("tool_result")!(activity);
+      expect(await h.status()).toContain("dirty: true");
+    }
+  });
+
+  it("resets the read-only streak after checkpoint commit", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    const threshold = DEFAULT_CONFIG.autoActivation.readOnlyLongTaskTurns;
+    for (let index = 0; index < threshold - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/before-${index}.ts` }, isError: false });
+      h.handlers.get("turn_end")!({});
+    }
+    expect(await h.status()).toContain("dirty: false");
+
+    await h.checkpointTool.execute("cp-2", payload);
+    for (let index = 0; index < threshold - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/after-${index}.ts` }, isError: false });
+      h.handlers.get("turn_end")!({});
+    }
+    expect(await h.status()).toContain("dirty: false");
+    h.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/after-threshold.ts" }, isError: false });
+    h.handlers.get("turn_end")!({});
+    expect(await h.status()).toContain("dirty: true");
+  });
+
+  it("applies checkpoint pressure after high-signal results or dirty turns", async () => {
     const byResults = await makeHarness();
     await byResults.handlers.get("session_start")!({ reason: "new" }, byResults.ctx);
     await byResults.command.handler("on", byResults.ctx);
     await byResults.checkpointTool.execute("cp-1", payload);
-    for (let index = 0; index < 19; index += 1) {
-      byResults.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/${index}.ts` }, isError: false });
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults; index += 1) {
+      byResults.handlers.get("tool_result")!({
+        toolName: "get_subagent_result",
+        input: { agent_id: `research-${index}` },
+        isError: false,
+        ...subagentResult("completed"),
+      });
     }
-    expect(await byResults.status()).toContain("checkpoint due: false");
-    byResults.handlers.get("tool_result")!({ toolName: "web_search", input: { query: "notes freshness" }, isError: false });
     expect(await byResults.status()).toContain("checkpoint due: true");
 
     const byTurns = await makeHarness();
     await byTurns.handlers.get("session_start")!({ reason: "new" }, byTurns.ctx);
     await byTurns.command.handler("on", byTurns.ctx);
     await byTurns.checkpointTool.execute("cp-1", payload);
-    byTurns.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/a.ts" }, isError: false });
+    byTurns.handlers.get("tool_result")!({ toolName: "write", input: { path: "src/a.ts" }, isError: false });
     for (let index = 0; index < 5; index += 1) byTurns.handlers.get("turn_end")!({});
     expect(await byTurns.status()).toContain("checkpoint due: false");
     byTurns.handlers.get("turn_end")!({});
@@ -208,7 +307,12 @@ describe("session lifecycle integration", () => {
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
     await h.command.handler("on", h.ctx);
     await h.checkpointTool.execute("cp-1", payload);
-    h.handlers.get("tool_result")!({ toolName: "get_subagent_result", input: { agent_id: "research" }, isError: false });
+    h.handlers.get("tool_result")!({
+      toolName: "get_subagent_result",
+      input: { agent_id: "research" },
+      isError: false,
+      ...subagentResult("completed"),
+    });
 
     const blocked = await h.handlers.get("tool_call")!({
       toolName: "goal_progress",

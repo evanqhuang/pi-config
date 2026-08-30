@@ -1,6 +1,6 @@
 # pi-notes
 
-`pi-notes` keeps one compact durable execution checkpoint for the current top-level Pi session.
+`pi-notes` keeps one compact durable continuation/task-state handoff for the current top-level Pi session. `NOTES.md` is not general notes, a diary, or proof.
 
 ## Storage
 
@@ -24,17 +24,17 @@ Notes are never written into the project tree. Each top-level session owns:
 
 ## Tool
 
-`checkpoint_notes` is sequential, accepts bounded structured semantic state, and has no path/session/hash/generation arguments. The extension adds deterministic harness facts and atomically rewrites the fixed session-local `NOTES.md`.
+`checkpoint_notes` is sequential, accepts bounded structured semantic state, and has no path/session/hash/generation arguments. It writes a compact durable continuation/task-state handoff—not general notes—to the fixed session-local `NOTES.md`. Each payload field has a mutually exclusive role: `current` is the present objective/status; `completed` is finished work; `findings` are observed facts and constraints; `decisions` are chosen approaches and rationale; `failed_approaches` are failed attempts; `blockers` are unresolved impediments; `verification` contains verification commands/outcomes only; and `next_action` is the one next concrete action. Do not put verification in `completed`, repeat `current` in `next_action`, or copy deterministic working-set facts into authored sections. The extension adds deterministic harness facts internally and atomically rewrites the fixed session-local `NOTES.md`.
 
 While Notes is active, built-in `edit`/`write` calls targeting the canonical Notes file are blocked. Unexpected external changes are detected before checkpointing and, when goal integration is present, before allowing goal completion; `/notes restore` rematerializes the trusted committed snapshot.
 
 ## Lifecycle
 
-Automatic activation is intentionally conservative: 8 turns or 32 tool calls after high-signal activity, or 10 consecutive read-only turns. Activation signal and checkpoint freshness are independent. Once Notes are active, the first successful continuity-relevant result—such as source inspection, research, subagent output, verification, or mutation—marks a clean checkpoint dirty. Checkpoint pressure begins after 6 additional dirty turns or 20 continuity-relevant tool results; compaction and completion still enforce freshness immediately.
+Automatic activation is intentionally conservative: 8 turns or 32 tool calls after high-signal activity, or 10 consecutive read-only turns. Activation signal and checkpoint freshness are independent. Once the handoff is active, high-signal mutations, verification/build/test outcomes, errors, and completed subagent handoffs mark a clean checkpoint dirty immediately. Ordinary successful source reads, searches, and research remain low-signal continuity activity: they do not individually dirty a clean checkpoint or increment the 20-result pressure counter. Sustained read-only investigation marks the handoff dirty once the existing 10-consecutive-turn threshold is reached; normal dirty-turn pressure then applies. Checkpoint commit resets that read-only streak. Checkpoint pressure otherwise begins after 6 additional dirty turns or 20 continuity-relevant high-signal results; compaction and completion still enforce freshness immediately.
 
 The extension uses Pi core APIs only:
 
-- `tool_result` for independent high-signal activation, continuity-relevant freshness, and verification tracking.
+- `tool_result` for independent high-signal activation, hybrid freshness tracking, and verification tracking.
 - `before_agent_start` for the static Notes policy.
 - `context` for transient de-duplicated checkpoint/re-entry reminders.
 - `pi.appendEntry()` for branch-local dirty/checkpoint state.
@@ -42,7 +42,7 @@ The extension uses Pi core APIs only:
 
 It does not call `pi.setActiveTools()`. If another mode hides `checkpoint_notes`, reminder pressure pauses until the tool becomes available again.
 
-Lifecycle tests cover fresh identities, branch restoration, resume rematerialization, read/research freshness, delayed checkpoint pressure, compaction pressure, inherited-resume integrity, and external-mutation gating.
+Lifecycle tests cover fresh identities, branch restoration, resume rematerialization, deferred read/research freshness, read-only threshold and streak reset, delayed checkpoint pressure, compaction pressure, inherited-resume integrity, and external-mutation gating.
 
 ## Optional integrations
 
@@ -54,4 +54,4 @@ When present:
 - `Symbol.for("pi-subagents:child-context:v1")` prevents the extension from registering in child subagent sessions.
 - `pi-plan-mode` may explicitly allowlist `checkpoint_notes`; child sessions do not load `pi-notes`.
 
-A Notes checkpoint records continuity state. It is not verification evidence and does not replace a plan, goal, todo system, or completion verifier.
+A task-state checkpoint records continuity state. It is not verification evidence and does not replace a plan, goal, todo system, or completion verifier.

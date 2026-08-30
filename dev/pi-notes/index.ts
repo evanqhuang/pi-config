@@ -165,9 +165,9 @@ function bulletSection(title: string, values: readonly string[]): string {
 }
 
 export function renderNotes(payload: CheckpointPayload, runtime: NotesRuntime): string {
-  const facts = runtime.harnessFacts;
+  const modifiedFiles = [...runtime.harnessFacts.modifiedFiles].sort();
   const sections = [
-    "# Task Notes",
+    "# Task State",
     `## Current\n${payload.current.trim()}`,
     bulletSection("Completed", payload.completed),
     bulletSection("Findings", payload.findings),
@@ -176,14 +176,7 @@ export function renderNotes(payload: CheckpointPayload, runtime: NotesRuntime): 
     bulletSection("Verification", payload.verification),
     bulletSection("Blockers", payload.blockers),
     `## Next Action\n${payload.next_action.trim()}`,
-    [
-      "## Harness Facts",
-      `- Modified files: ${facts.modifiedFiles.size ? [...facts.modifiedFiles].sort().map((path) => `\`${path}\``).join(", ") : "none recorded"}`,
-      `- Last verification command: ${facts.lastVerificationCommand ? `\`${facts.lastVerificationCommand}\`` : "none recorded"}`,
-      `- Last verification outcome: ${facts.lastVerificationOutcome ?? "unknown"}`,
-      `- Recent failed commands: ${facts.recentFailedCommandCount}`,
-      `- Checkpoint generation: ${runtime.checkpointGeneration + 1}`,
-    ].join("\n"),
+    `## Working Set\n${modifiedFiles.length ? modifiedFiles.map((path) => `- \`${path}\``).join("\n") : "- None."}`,
     `<!-- pi-notes:v1 notesId=${runtime.notesId} generation=${runtime.checkpointGeneration + 1} -->`,
   ];
   return `${sections.join("\n\n")}\n`;
@@ -343,6 +336,7 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
     runtime.checkpointDue = false;
     runtime.turnsSinceCheckpoint = 0;
     runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
+    runtime.readOnlyTurns = 0;
     runtime.reentryRequired = false;
     runtime.harnessFacts.recentFailedCommandCount = 0;
     return { hash, generation };
@@ -494,6 +488,7 @@ const INSPECT_PATTERN = /\b(?:grep|rg|find|ls|cat|head|tail|git\s+(?:status|log|
 const READ_TOOL_PATTERN = /^(?:read|grep|find|ls|symbol_search|project_report|module_report|read_symbol|read_enclosing|lsp_diagnostics|lens_diagnostics|ast_grep_search|ast_grep_outline|lsp_navigation|ctx_execute_file)$/i;
 const RESEARCH_TOOL_PATTERN = /^(?:web_search|source_check|fetch_content|get_search_content|resolve-library-id|query-docs|ctx_execute|ctx_batch_execute|ctx_search|ctx_fetch_and_index)$/i;
 const SUBAGENT_RESULT_TOOL_PATTERN = /^(?:Agent|get_subagent_result)$/i;
+const SUBAGENT_COMPLETION_TOOL_PATTERN = /^get_subagent_result$/i;
 
 function commandFromInput(input: Record<string, unknown>): string | undefined {
   const command = input.command;
@@ -528,11 +523,89 @@ export function classifyToolResult(toolName: string, input: Record<string, unkno
   return { continuityRelevant: false, highSignal: false };
 }
 
-function recordActivity(pi: ExtensionAPI, runtime: NotesRuntime, toolName: string, input: Record<string, unknown>, isError: boolean): void {
+function isDeferredReadOnlyActivity(
+  classified: ReturnType<typeof classifyToolResult>,
+  isError: boolean,
+  meaningfulSubagentCompletion: boolean,
+): boolean {
+  return !isError
+    && classified.continuityRelevant
+    && !classified.highSignal
+    && !meaningfulSubagentCompletion;
+}
+
+type ToolResultOutput = {
+  content?: readonly unknown[];
+  details?: unknown;
+};
+
+type SubagentResultStatus = "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+const SUBAGENT_RESULT_STATUSES = new Set<SubagentResultStatus>([
+  "queued",
+  "running",
+  "completed",
+  "steered",
+  "aborted",
+  "stopped",
+  "error",
+]);
+
+function subagentResultStatus(value: unknown): SubagentResultStatus | undefined {
+  if (typeof value !== "string") return undefined;
+  const status = value.trim().toLowerCase();
+  return SUBAGENT_RESULT_STATUSES.has(status as SubagentResultStatus)
+    ? status as SubagentResultStatus
+    : undefined;
+}
+
+function statusFromSubagentResultText(content: readonly unknown[] | undefined): SubagentResultStatus | undefined {
+  for (const block of content ?? []) {
+    if (typeof block !== "object" || block === null) continue;
+    const text = (block as { type?: unknown; text?: unknown }).type === "text"
+      ? (block as { text?: unknown }).text
+      : undefined;
+    if (typeof text !== "string") continue;
+    const match = /\bStatus\s*:\s*(queued|running|completed|steered|aborted|stopped|error)\b/i.exec(text);
+    const status = subagentResultStatus(match?.[1]);
+    if (status) return status;
+  }
+  return undefined;
+}
+
+function indicatesCompletedSubagentResult(output: ToolResultOutput | undefined): boolean {
+  const details = output?.details;
+  const detailRecord = typeof details === "object" && details !== null && !Array.isArray(details)
+    ? details as Record<string, unknown>
+    : undefined;
+  const detailHasStatus = detailRecord !== undefined && Object.prototype.hasOwnProperty.call(detailRecord, "status");
+  const detailStatus = subagentResultStatus(detailRecord?.status);
+  const contentStatus = statusFromSubagentResultText(output?.content);
+
+  // Details are structured and therefore authoritative when present. If they
+  // disagree with the text, or contain an unrecognized status, fail closed.
+  if (detailHasStatus) {
+    return detailStatus !== undefined
+      && (contentStatus === undefined || contentStatus === detailStatus)
+      && (detailStatus === "completed" || detailStatus === "steered");
+  }
+  return contentStatus === "completed" || contentStatus === "steered";
+}
+
+function recordActivity(
+  pi: ExtensionAPI,
+  runtime: NotesRuntime,
+  toolName: string,
+  input: Record<string, unknown>,
+  isError: boolean,
+  output?: ToolResultOutput,
+): void {
   runtime.activationToolCalls += 1;
   runtime.toolCallsThisTurn += 1;
   const classified = classifyToolResult(toolName, input, isError);
-  if (classified.highSignal) {
+  const meaningfulSubagentCompletion = !isError
+    && SUBAGENT_COMPLETION_TOOL_PATTERN.test(toolName)
+    && indicatesCompletedSubagentResult(output);
+  if (classified.highSignal || isError || meaningfulSubagentCompletion) {
     runtime.sawHighSignalActivity = true;
     runtime.highSignalThisTurn = true;
   }
@@ -542,21 +615,38 @@ function recordActivity(pi: ExtensionAPI, runtime: NotesRuntime, toolName: strin
     runtime.harnessFacts.lastVerificationOutcome = isError ? "error" : "success";
   }
   if (classified.continuityRelevant && isError) runtime.harnessFacts.recentFailedCommandCount += 1;
-  if (runtime.active && classified.continuityRelevant) {
-    runtime.continuityRelevantToolResultsSinceCheckpoint += 1;
-    markDirty(pi, runtime);
-    if (runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
-      runtime.checkpointDue = true;
+  const deferredReadOnly = isDeferredReadOnlyActivity(classified, isError, meaningfulSubagentCompletion);
+  if (runtime.active && !deferredReadOnly && (classified.continuityRelevant || classified.highSignal || isError || meaningfulSubagentCompletion)) {
+    if (classified.continuityRelevant) {
+      runtime.continuityRelevantToolResultsSinceCheckpoint += 1;
+      if (runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
+        runtime.checkpointDue = true;
+      }
     }
+    markDirty(pi, runtime);
   }
   activateIfNeeded(pi, runtime);
 }
 
+const CHECKPOINT_FIELD_GUIDANCE = [
+  "Every checkpoint payload field has a mutually exclusive role; keep each fact in exactly one field.",
+  "current = the present objective and status.",
+  "completed = finished work only.",
+  "findings = observed facts, constraints, and discoveries.",
+  "decisions = chosen approaches and their rationale.",
+  "failed_approaches = attempts that failed and should not be repeated.",
+  "blockers = unresolved impediments.",
+  "verification = verification commands and outcomes only.",
+  "next_action = the one next concrete action.",
+  "Do not put verification in completed, repeat current in next_action, or copy deterministic working-set facts such as modified files into authored sections; the extension supplies those facts separately.",
+].join(" ");
+
 function notesPolicy(): string {
   return [
-    "DURABLE NOTES ARE ACTIVE.",
-    "Use checkpoint_notes after meaningful milestones, important findings/decisions, significant verification results, blockers, harness requests, and before reporting completion when Notes is dirty.",
-    "NOTES.md is continuation context, not proof. Live worktree/tool/test state is authoritative. Only the current top-level session writes its session-local Notes file.",
+    "DURABLE TASK-STATE HANDOFF IS ACTIVE.",
+    "NOTES.md is a compact durable continuation/task-state handoff, not general notes, a diary, or proof. Live worktree/tool/test state is authoritative. Only the current top-level session writes its session-local file.",
+    CHECKPOINT_FIELD_GUIDANCE,
+    "Use checkpoint_notes after meaningful milestones, important findings/decisions, significant verification results, blockers, harness requests, and before reporting completion when the handoff is dirty.",
   ].join("\n");
 }
 
@@ -572,10 +662,10 @@ export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime
   if (!runtime.active || !pi.getActiveTools().includes("checkpoint_notes")) return undefined;
   if (runtime.reentryRequired) {
     runtime.reentryRequired = false;
-    return "[TASK NOTES RE-ENTRY]\nReread the current Notes checkpoint and inspect live worktree/tool state before continuing. Notes is continuity context, not proof.";
+    return "[TASK NOTES RE-ENTRY]\nReread the current NOTES.md compact durable continuation/task-state handoff and inspect live worktree/tool state before continuing. It is not general notes or proof.";
   }
   if (runtime.checkpointDue) {
-    return "[TASK NOTES CHECKPOINT DUE]\nExecution state changed materially since the last durable checkpoint or a checkpoint was explicitly requested. Before doing substantially more work, call checkpoint_notes once with only durable state, then continue.";
+    return "[TASK NOTES CHECKPOINT DUE]\nExecution state changed materially since the last durable checkpoint or a checkpoint was explicitly requested. Before doing substantially more work, call checkpoint_notes once with only the current NOTES.md compact durable continuation/task-state handoff, not general notes, then continue.";
   }
   return undefined;
 }
@@ -617,9 +707,12 @@ export default function notesExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "checkpoint_notes",
     label: "Checkpoint Notes",
-    description: "Atomically rewrite the current top-level session's private NOTES.md with a bounded durable execution checkpoint.",
-    promptSnippet: "Checkpoint compact durable task state to the session-local NOTES.md",
-    promptGuidelines: ["Use checkpoint_notes only for durable continuation state; do not include secrets, large logs, hidden reasoning, or a chronological diary."],
+    description: "Atomically rewrite the current top-level session's private NOTES.md with a bounded compact durable continuation/task-state handoff, not general notes.",
+    promptSnippet: "Checkpoint a compact durable continuation/task-state handoff to the session-local NOTES.md",
+    promptGuidelines: [
+      "Use checkpoint_notes only for the compact durable continuation/task-state handoff in NOTES.md; it is not general notes, a diary, or proof. Do not include secrets, large logs, or hidden reasoning.",
+      CHECKPOINT_FIELD_GUIDANCE,
+    ],
     parameters: CHECKPOINT_SCHEMA,
     executionMode: "sequential",
     async execute(_toolCallId, params) {
@@ -667,7 +760,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
         runtime.checkpointDue = true;
         pi.sendMessage({
           customType: NOTES_REMINDER_TYPE,
-          content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current durable execution state, then continue.",
+          content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current NOTES.md compact durable continuation/task-state handoff, not general notes, then continue.",
           display: false,
         }, { triggerTurn: true, deliverAs: "followUp" });
         return;
@@ -731,6 +824,9 @@ export default function notesExtension(pi: ExtensionAPI): void {
     runtime.activationTurns += 1;
     if (runtime.toolCallsThisTurn > 0 && !runtime.highSignalThisTurn) runtime.readOnlyTurns += 1;
     else if (runtime.highSignalThisTurn) runtime.readOnlyTurns = 0;
+    if (runtime.active && runtime.readOnlyTurns >= DEFAULT_CONFIG.autoActivation.readOnlyLongTaskTurns) {
+      markDirty(pi, runtime);
+    }
     runtime.toolCallsThisTurn = 0;
     runtime.highSignalThisTurn = false;
     if (runtime.active && runtime.dirty) {
@@ -744,7 +840,10 @@ export default function notesExtension(pi: ExtensionAPI): void {
   });
   pi.on("tool_result", (event) => {
     if (event.toolName === "checkpoint_notes") return;
-    recordActivity(pi, runtime, event.toolName, event.input, event.isError);
+    recordActivity(pi, runtime, event.toolName, event.input, event.isError, {
+      content: event.content,
+      details: event.details,
+    });
   });
   pi.on("tool_call", async (event, ctx) => {
     if (isChildSession() && event.toolName === "checkpoint_notes") {

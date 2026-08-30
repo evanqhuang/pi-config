@@ -44,19 +44,22 @@ describe("runtime and rendering", () => {
     expect(runtime.notesPath.endsWith("NOTES.md")).toBe(true);
   });
 
-  it("renders bounded continuation sections and deterministic harness facts", () => {
+  it("renders task-state sections with only the deterministic working set", () => {
     const runtime = createRuntime("manual");
     runtime.harnessFacts.modifiedFiles.add("src/a.ts");
     runtime.harnessFacts.lastVerificationCommand = "pnpm test";
     runtime.harnessFacts.lastVerificationOutcome = "success";
+    runtime.harnessFacts.recentFailedCommandCount = 3;
     const notes = renderNotes(payload, runtime);
-    expect(notes).toContain("# Task Notes");
+    expect(notes).toContain("# Task State");
     expect(notes).toContain("## Current\nImplementing durable Notes.");
     expect(notes).toContain("## Failed Approaches\n- None.");
-    expect(notes).toContain("Modified files: `src/a.ts`");
-    expect(notes).toContain("Last verification outcome: success");
-    expect(notes).toContain("Checkpoint generation: 1");
-    expect(notes).toContain(`notesId=${runtime.notesId}`);
+    expect(notes).toContain("## Working Set\n- `src/a.ts`");
+    expect(notes).not.toContain("Last verification command");
+    expect(notes).not.toContain("Last verification outcome");
+    expect(notes).not.toContain("Recent failed commands");
+    expect(notes).not.toContain("Checkpoint generation: 1");
+    expect(notes).toContain(`notesId=${runtime.notesId} generation=1`);
   });
 });
 
@@ -85,7 +88,7 @@ describe("activity classification", () => {
     });
   });
 
-  it("separates continuity-relevant exploration from high-signal activation", () => {
+  it("separates ordinary continuity exploration from high-signal activation", () => {
     for (const toolName of ["read", "grep", "find", "web_search", "ctx_execute", "Agent", "get_subagent_result"]) {
       expect(classifyToolResult(toolName, { path: "src/a.ts" }, false)).toEqual({
         continuityRelevant: true,
