@@ -23,7 +23,7 @@ When enabled, the extension:
 - switches to the `local-green` theme, including green editor borders;
 - shows a green `LOCAL` status and working indicator;
 - shows the measured local output generation rate in the statusline after a response (`tok/s`) and keeps the latest rate visible across tool turns;
-- retries a local 27B provider turn up to five times when the final provider stop reason is `repetition`, preserving the conversation and discarding partial output from interrupted attempts;
+- retries every local provider turn, including the 9B `qwopus-subagent`, up to five times when the final provider stop reason is `repetition`, preserving the conversation and discarding partial output from interrupted attempts;
 - requires the main local agent to create and update parent-session todos for multi-step work; Explore remains read-only and cannot update those todos;
 - adds concise local working-style, parent-session todo, and non-blocking delegation instructions to each turn;
 - remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp` and blocks other child launches while the 27B child-agent lane is disabled;
@@ -49,6 +49,6 @@ There is no fixed tool-turn cutoff. Compaction and checkpoints are driven by con
 
 ## Repetition recovery
 
-Local mode wraps the `qwen38-main` and `qwen38-subagent` agent callers. If an attempt ends with provider `rawStopReason: "repetition"`, local mode buffers and discards that attempt, then retries the same conversation up to five times. Retry attempts add a transient instruction to continue from the conversation state and set `skip_reading_prefix_cache: true`; other stop reasons are not retried by this policy. If all retries repeat, only the final sanitized error is exposed—interrupted partial text is not rendered or persisted.
+Local mode wraps the `qwen38-main`, `qwen38-subagent`, and `qwopus-subagent` agent callers. If an attempt ends with provider `rawStopReason: "repetition"`, local mode buffers and discards that attempt, then retries the same conversation up to five times. Retry attempts add a transient instruction to continue from the conversation state and set `skip_reading_prefix_cache: true`; other stop reasons are not retried by this policy. If all retries repeat, only the final sanitized error is exposed—interrupted partial text is not rendered or persisted.
 
 Local mode enforces a process-wide local-provider and 27B profile policy. While it is active, main-session model changes and child subagent sessions are forced onto the registered `qwen38-main`, `qwen38-subagent`, or `qwopus-subagent` providers before a turn starts. A final provider-request guard aborts any non-local request rather than allowing it to leave the process. Child sessions launched with an explicit local subagent provider preserve that selection without inheriting the parent's local-mode UI state.

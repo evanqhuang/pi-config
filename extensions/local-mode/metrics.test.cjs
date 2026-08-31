@@ -232,7 +232,11 @@ test("imports without registering providers, then wires turn-start timing", asyn
 	assert.deepEqual(pi.providers, []);
 	let now = 1000;
 	localModeExtension(pi, () => now);
-	assert.deepEqual(pi.providers.map(({ name }) => name), ["qwen38-main", "qwen38-subagent"]);
+	assert.deepEqual(pi.providers.map(({ name }) => name), [
+		"qwen38-main",
+		"qwen38-subagent",
+		"qwopus-subagent",
+	]);
 	await pi.commands.get("local").handler("on", ctx);
 
 	await emit("turn_start");

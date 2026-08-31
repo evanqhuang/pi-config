@@ -633,7 +633,7 @@ export default function localModeExtension(
 	pi: ExtensionAPI,
 	clock: MonotonicClock = monotonicNow,
 ): void {
-	for (const provider of ["qwen38-main", "qwen38-subagent"]) {
+	for (const provider of ["qwen38-main", "qwen38-subagent", "qwopus-subagent"]) {
 		pi.registerProvider(provider, {
 			api: "openai-completions",
 			streamSimple: createRepetitionRetryStream,

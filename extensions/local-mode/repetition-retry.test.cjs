@@ -162,10 +162,10 @@ test("snapshots mutable partial events while buffering", async () => {
 	assert.equal(events[1].partial.content[0].text, "second");
 });
 
-test("registers the retry caller for both local 27B providers", () => {
+test("registers the retry caller for every local provider, including the 9B subagent", () => {
 	const source = readFileSync(join(__dirname, "index.ts"), "utf8");
 	assert.match(
 		source,
-		/for \(const provider of \["qwen38-main", "qwen38-subagent"\]\)[\s\S]*?registerProvider\(provider,[\s\S]*?streamSimple: createRepetitionRetryStream/,
+		/for \(const provider of \["qwen38-main", "qwen38-subagent", "qwopus-subagent"\]\)[\s\S]*?registerProvider\(provider,[\s\S]*?streamSimple: createRepetitionRetryStream/,
 	);
 });
