@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import goalExtension from "../src/index.js";
 import { GoalController } from "../src/controller.js";
+import { CLEARED_REASON } from "../src/state.js";
 import {
   GOAL_CONTINUE_MESSAGE,
   GOAL_STATE_TYPE,
@@ -22,32 +24,89 @@ function deferred<T>() {
 
 function harness() {
   let branch: any[] = [];
+  let leafId: string | null = "leaf-0";
+  let sessionId = "session-1";
+  let nextLeaf = 1;
   let idle = true;
   let pendingMessages = false;
+  const sessionManager = {
+    getBranch: () => branch,
+    buildContextEntries: () => branch,
+    getSessionId: () => sessionId,
+    getLeafId: () => leafId,
+  };
   const pi = {
     appendEntry: vi.fn((customType: string, data: GoalStateV1) => {
       branch.push({ type: "custom", customType, data });
+      leafId = `leaf-${nextLeaf++}`;
     }),
     sendMessage: vi.fn(),
   } as any;
-  const ctx = {
+  const createContext = () => ({
     cwd: "/repo",
     isIdle: () => idle,
     hasPendingMessages: () => pendingMessages,
-    sessionManager: {
-      getBranch: () => branch,
-      buildContextEntries: () => branch,
-      getSessionId: () => "session-1",
-    },
-  } as any;
+    sessionManager,
+  }) as any;
+  const ctx = createContext();
   return {
     pi,
     ctx,
+    createContext,
     controller: new GoalController(pi),
     branch: () => branch,
-    setBranch: (next: any[]) => { branch = next; },
+    setBranch: (next: any[], nextLeafId: string | null = `leaf-${nextLeaf++}`) => {
+      branch = next;
+      leafId = nextLeafId;
+    },
+    setSessionId: (next: string) => { sessionId = next; },
     setIdle: (next: boolean) => { idle = next; },
     setPendingMessages: (next: boolean) => { pendingMessages = next; },
+  };
+}
+
+function extensionHarness() {
+  let branch: any[] = [];
+  let leafId: string | null = "leaf-0";
+  let nextLeaf = 1;
+  const handlers = new Map<string, (...args: any[]) => unknown>();
+  let goalCommand: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const sessionManager = {
+    getBranch: () => branch,
+    buildContextEntries: () => branch,
+    getSessionId: () => "session-1",
+    getLeafId: () => leafId,
+  };
+  const ctx = {
+    cwd: "/repo",
+    hasUI: false,
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    sessionManager,
+  } as any;
+  const pi = {
+    on: vi.fn((event: string, handler: (...args: any[]) => unknown) => handlers.set(event, handler)),
+    events: { on: vi.fn() },
+    registerCommand: vi.fn((_name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+      goalCommand = command.handler;
+    }),
+    appendEntry: vi.fn((customType: string, data: GoalStateV1) => {
+      branch.push({ type: "custom", customType, data });
+      leafId = `leaf-${nextLeaf++}`;
+    }),
+    sendMessage: vi.fn(),
+  } as any;
+  goalExtension(pi);
+  return {
+    pi,
+    ctx,
+    branch: () => branch,
+    setBranch: (next: any[], nextLeafId: string | null) => {
+      branch = next;
+      leafId = nextLeafId;
+    },
+    emit: (event: string, data: any = { type: event }) => handlers.get(event)?.(data, { ...ctx }),
+    runGoal: async (args: string) => goalCommand?.(args, { ui: { notify: vi.fn() } }),
   };
 }
 
@@ -90,6 +149,34 @@ afterEach(() => {
 });
 
 describe("goal controller lifecycle guards", () => {
+  it("blocks late agent settlement while tree navigation is in progress", async () => {
+    const runtime = extensionHarness();
+    runtime.emit("session_start", { type: "session_start", reason: "startup" });
+    await runtime.runGoal("ship feature -- tests pass");
+    runtime.pi.sendMessage.mockClear();
+    subagents.runEvaluator.mockClear();
+
+    runtime.emit("session_before_tree", {
+      type: "session_before_tree",
+      preparation: { targetId: "earlier-message", oldLeafId: "leaf-1" },
+    });
+    runtime.emit("agent_settled");
+
+    expect(subagents.runEvaluator).not.toHaveBeenCalled();
+    expect(continueMessages(runtime.pi)).toHaveLength(0);
+
+    runtime.setBranch([{ id: "earlier-message", type: "message", parentId: null }], "earlier-message");
+    runtime.emit("session_tree", { type: "session_tree", oldLeafId: "leaf-1", newLeafId: "earlier-message" });
+    runtime.emit("agent_settled");
+
+    expect(goalEntries(runtime.branch()).at(-1)).toMatchObject({
+      status: "paused",
+      terminalReason: "Paused after rewinding the conversation.",
+    });
+    expect(subagents.runEvaluator).not.toHaveBeenCalled();
+    expect(continueMessages(runtime.pi)).toHaveLength(0);
+  });
+
   it("restores an active goal as paused until explicitly resumed", () => {
     const { controller, ctx, pi, branch, setBranch } = harness();
     const activeGoal: GoalStateV1 = {
@@ -124,6 +211,72 @@ describe("goal controller lifecycle guards", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("carries an active goal onto an empty rewound branch as paused", () => {
+    const { controller, ctx, pi, branch, setBranch } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "source-leaf");
+
+    controller.prepareForTreeNavigation(ctx);
+    setBranch([{ id: "earlier-message", type: "message", parentId: null }], "target-leaf");
+    controller.restoreSelectedBranch(ctx);
+
+    expect(controller.current).toMatchObject({
+      id: "goal-1",
+      status: "paused",
+      terminalReason: "Paused after rewinding the conversation.",
+    });
+    expect(goalEntries(branch())).toHaveLength(1);
+    expect(continueMessages(pi)).toHaveLength(0);
+    expect(subagents.runEvaluator).not.toHaveBeenCalled();
+
+    controller.resume(ctx);
+
+    expect(controller.current?.status).toBe("active");
+    expect(goalEntries(branch()).at(-1)?.status).toBe("active");
+    expect(continueMessages(pi)).toHaveLength(1);
+  });
+
+  it.each([
+    ["active", activeGoal()],
+    ["paused", activeGoal({ status: "paused" })],
+    ["completed", activeGoal({ status: "completed" })],
+    ["cleared", activeGoal({ status: "stopped", terminalReason: CLEARED_REASON })],
+  ] as const)("keeps an existing %s target-branch marker authoritative", (_label, targetGoal) => {
+    vi.useFakeTimers();
+    const { controller, ctx, pi, branch, setBranch } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal({ objective: "source" }) }], "source-leaf");
+    controller.prepareForTreeNavigation(ctx);
+
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: targetGoal }], "target-leaf");
+    controller.restoreSelectedBranch(ctx);
+    vi.runOnlyPendingTimers();
+
+    expect(goalEntries(branch())).toHaveLength(1);
+    expect(goalEntries(branch())[0]).toEqual(targetGoal);
+    expect(controller.current).toEqual(_label === "cleared" ? undefined : targetGoal);
+    expect(continueMessages(pi)).toHaveLength(_label === "active" ? 1 : 0);
+  });
+
+  it("consumes a tree carry once and clears it on non-tree navigation", () => {
+    const oneShot = harness();
+    oneShot.setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "source-leaf");
+    oneShot.controller.prepareForTreeNavigation(oneShot.ctx);
+    oneShot.setBranch([], "first-target");
+    oneShot.controller.restoreSelectedBranch(oneShot.ctx);
+    expect(goalEntries(oneShot.branch())).toHaveLength(1);
+
+    oneShot.setBranch([], "second-target");
+    oneShot.controller.restoreSelectedBranch(oneShot.ctx);
+    expect(goalEntries(oneShot.branch())).toHaveLength(0);
+
+    const cancelled = harness();
+    cancelled.setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "source-leaf");
+    cancelled.controller.prepareForTreeNavigation(cancelled.ctx);
+    cancelled.controller.prepareForNavigation();
+    cancelled.setBranch([], "target-leaf");
+    cancelled.controller.restoreSelectedBranch(cancelled.ctx);
+    expect(goalEntries(cancelled.branch())).toHaveLength(0);
+  });
+
   it("resumes a ready selected active branch exactly once", () => {
     vi.useFakeTimers();
     const { controller, ctx, pi, setBranch } = harness();
@@ -153,6 +306,87 @@ describe("goal controller lifecycle guards", () => {
     expect(continueMessages(pi)).toHaveLength(1);
     controller.retryPendingWake(ctx);
     expect(continueMessages(pi)).toHaveLength(1);
+  });
+
+  it("reattempts a pending wake with a fresh context for the same session and leaf", () => {
+    vi.useFakeTimers();
+    const { controller, ctx, createContext, pi, setBranch, setIdle } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "shared-leaf");
+    setIdle(false);
+
+    controller.restoreSelectedBranch(ctx);
+    vi.advanceTimersByTime(0);
+    setIdle(true);
+
+    expect(controller.retryPendingWake(createContext())).toBe(true);
+    expect(continueMessages(pi)).toHaveLength(1);
+    expect(controller.retryPendingWake(createContext())).toBe(false);
+  });
+
+  it.each(["leaf", "session"] as const)("invalidates a pending wake when the %s changes", changed => {
+    vi.useFakeTimers();
+    const { controller, ctx, createContext, pi, setBranch, setSessionId, setIdle } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "source-leaf");
+    setIdle(false);
+    controller.restoreSelectedBranch(ctx);
+    vi.advanceTimersByTime(0);
+
+    if (changed === "leaf") {
+      setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "other-leaf");
+    } else {
+      setSessionId("session-2");
+    }
+    setIdle(true);
+
+    expect(controller.retryPendingWake(createContext())).toBe(false);
+    expect(continueMessages(pi)).toHaveLength(0);
+  });
+
+  it.each(["id", "generation"] as const)("invalidates a pending wake when the goal %s changes on the same leaf", changed => {
+    vi.useFakeTimers();
+    const { controller, ctx, pi, setBranch, setIdle } = harness();
+    const entry = { type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() };
+    setBranch([entry], "shared-leaf");
+    setIdle(false);
+    controller.restoreSelectedBranch(ctx);
+    vi.advanceTimersByTime(0);
+
+    entry.data = changed === "id" ? activeGoal({ id: "goal-2" }) : activeGoal({ generation: 2 });
+    setIdle(true);
+
+    expect(controller.retryPendingWake(ctx)).toBe(false);
+    expect(continueMessages(pi)).toHaveLength(0);
+  });
+
+  it("invalidates a pending wake when navigation advances the epoch", () => {
+    vi.useFakeTimers();
+    const { controller, ctx, pi, setBranch, setIdle } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }], "shared-leaf");
+    setIdle(false);
+    controller.restoreSelectedBranch(ctx);
+    vi.advanceTimersByTime(0);
+
+    controller.prepareForNavigation();
+    setIdle(true);
+
+    expect(controller.retryPendingWake(ctx)).toBe(false);
+    expect(continueMessages(pi)).toHaveLength(0);
+  });
+
+  it("uses the complete branch path when leaf ids are unavailable", () => {
+    vi.useFakeTimers();
+    const { controller, ctx, pi, setBranch, setIdle } = harness();
+    const sharedGoal = { id: "goal-entry", type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() };
+    setBranch([{ id: "root", type: "message" }, sharedGoal, { id: "child-a", type: "message" }], null);
+    setIdle(false);
+    controller.restoreSelectedBranch(ctx);
+    vi.advanceTimersByTime(0);
+
+    setBranch([{ id: "root", type: "message" }, sharedGoal, { id: "child-b", type: "message" }], null);
+    setIdle(true);
+
+    expect(controller.retryPendingWake(ctx)).toBe(false);
+    expect(continueMessages(pi)).toHaveLength(0);
   });
 
   it("does not start ordinary evaluation while a pending wake is undeliverable", () => {
@@ -228,11 +462,11 @@ describe("goal controller lifecycle guards", () => {
       ([message]: any[]) => message.customType === GOAL_SUBAGENT_UPDATE_MESSAGE,
     );
 
-    const firstBranchEntry = { type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() };
+    const firstBranchEntry = { id: "branch-a", type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() };
     setBranch([firstBranchEntry]);
     controller.refresh(ctx);
     controller.scheduleSubagentWake();
-    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }]);
+    setBranch([{ id: "branch-b", type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }]);
     vi.advanceTimersByTime(250);
     expect(genericMessages()).toHaveLength(0);
 

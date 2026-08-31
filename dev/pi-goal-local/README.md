@@ -12,7 +12,7 @@ Owned native `/goal` implementation for this pi-config profile.
 - `/goal stop`
 - `/goal clear`
 
-Goal state is append-only under `pi-goal-state-v1` and is reconstructed from the currently selected session branch. Legacy `goal-state` entries are ignored.
+Goal state is append-only under `pi-goal-state-v1` and is reconstructed from the currently selected session branch. When tree rewind selects a point before an active goal's state entry, the goal is copied onto the otherwise goal-less target branch as paused; `/goal resume` is required to continue it. Existing target-branch goal state and explicit clear markers remain authoritative. Legacy `goal-state` entries are ignored.
 
 Evaluation runs only after `agent_settled`. Active/queued subagents conservatively defer evaluation. `GoalJudge` is a one-turn non-mutating completion judge; candidate completion must then pass the independent read-only `GoalVerifier` in a disposable source-snapshot worktree.
 

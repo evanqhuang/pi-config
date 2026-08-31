@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { buildJudgePrompt, parseGoalVerdict } from "./judge.js";
 import { CLEARED_REASON, latestGoalState, nextGeneration, terminalState } from "./state.js";
@@ -21,11 +21,15 @@ const WAKE_MAX_RETRY_MS = 2_000;
 const WAKE_MAX_RETRIES = 8;
 
 type PendingWake = {
-  ctx: ExtensionContext;
-  branchIdentity: string;
+  selectionIdentity: string;
   epoch: number;
   goalId: string;
   generation: number;
+};
+
+type TreeGoalCarry = {
+  sessionId: string;
+  goal: GoalStateV1;
 };
 
 function parentReady(ctx: ExtensionContext): boolean {
@@ -69,8 +73,8 @@ export class GoalController {
   private wakeRetryDelay = 0;
   private wakeAttempts = 0;
   private pendingWake: PendingWake | undefined;
-  private readonly branchEntryTokens = new WeakMap<object, number>();
-  private nextBranchEntryToken = 1;
+  private treeGoalCarry: TreeGoalCarry | undefined;
+  private navigationPending = false;
   private evaluatorAbort: AbortController | undefined;
 
   constructor(private readonly pi: ExtensionAPI) {}
@@ -82,35 +86,20 @@ export class GoalController {
   }
 
   private branchIdentity(ctx: ExtensionContext): string {
-    const entries = ctx.sessionManager.getBranch();
-    const latestGoalEntry = [...entries].reverse().find(entry => entry.type === "custom" && entry.customType === GOAL_STATE_TYPE);
-    if (latestGoalEntry) {
-      // Session entries are stable across getBranch() calls. The fallback token keeps
-      // lifecycle tests and older adapters branch-aware when ids are unavailable.
-      const entry = latestGoalEntry as unknown as object;
-      let token = this.branchEntryTokens.get(entry);
-      if (!token) {
-        token = this.nextBranchEntryToken++;
-        this.branchEntryTokens.set(entry, token);
-      }
-      return `goal-entry:${typeof latestGoalEntry.id === "string" ? latestGoalEntry.id : token}`;
-    }
+    const path = ctx.sessionManager.getBranch().map(entry =>
+      typeof entry.id === "string" ? `id:${entry.id}` : `entry:${JSON.stringify(entry)}`
+    ).join("/");
+    return createHash("sha256").update(path).digest("hex");
+  }
 
-    return `branch:${entries.map(entry => {
-      if (typeof entry.id === "string") return entry.id;
-      const object = entry as unknown as object;
-      let token = this.branchEntryTokens.get(object);
-      if (!token) {
-        token = this.nextBranchEntryToken++;
-        this.branchEntryTokens.set(object, token);
-      }
-      return token;
-    }).join("/")}`;
+  private selectionIdentity(ctx: ExtensionContext): string {
+    const leafId = ctx.sessionManager.getLeafId();
+    return `${ctx.sessionManager.getSessionId()}:${leafId ?? this.branchIdentity(ctx)}`;
   }
 
   private syncBranch(ctx: ExtensionContext): void {
-    const identity = this.branchIdentity(ctx);
-    if (this.pendingWake && (this.pendingWake.ctx !== ctx || this.pendingWake.branchIdentity !== identity)) {
+    const identity = this.selectionIdentity(ctx);
+    if (this.pendingWake && this.pendingWake.selectionIdentity !== identity) {
       this.invalidatePendingWake();
     }
     this.ctx = ctx;
@@ -192,14 +181,9 @@ export class GoalController {
 
   private attemptPendingWake(): boolean {
     const pending = this.pendingWake;
-    if (!pending) return false;
-    if (pending.epoch !== this.sessionEpoch || this.ctx !== pending.ctx) {
-      this.invalidatePendingWake();
-      return false;
-    }
-
-    const ctx = pending.ctx;
-    if (this.branchIdentity(ctx) !== pending.branchIdentity) {
+    const ctx = this.ctx;
+    if (!pending || !ctx) return false;
+    if (pending.epoch !== this.sessionEpoch || this.selectionIdentity(ctx) !== pending.selectionIdentity) {
       this.invalidatePendingWake();
       return false;
     }
@@ -224,15 +208,13 @@ export class GoalController {
   private scheduleResume(ctx: ExtensionContext, goal: GoalStateV1, epoch: number): void {
     if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
     const request: PendingWake = {
-      ctx,
-      branchIdentity: this.branchIdentity(ctx),
+      selectionIdentity: this.selectionIdentity(ctx),
       epoch,
       goalId: goal.id,
       generation: goal.generation,
     };
     if (this.pendingWake
-      && this.pendingWake.ctx === request.ctx
-      && this.pendingWake.branchIdentity === request.branchIdentity
+      && this.pendingWake.selectionIdentity === request.selectionIdentity
       && this.pendingWake.epoch === request.epoch
       && this.pendingWake.goalId === request.goalId
       && this.pendingWake.generation === request.generation) return;
@@ -250,9 +232,12 @@ export class GoalController {
    */
   retryPendingWake(ctx?: ExtensionContext): boolean {
     if (!this.pendingWake) return false;
-    if (ctx && ctx !== this.pendingWake.ctx) {
-      this.invalidatePendingWake();
-      return false;
+    if (ctx) {
+      if (this.selectionIdentity(ctx) !== this.pendingWake.selectionIdentity) {
+        this.invalidatePendingWake();
+        return false;
+      }
+      this.ctx = ctx;
     }
     const delivered = this.attemptPendingWake();
     if (this.pendingWake && this.wakeTimer === undefined && this.wakeAttempts < WAKE_MAX_RETRIES) {
@@ -263,6 +248,8 @@ export class GoalController {
 
   restore(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
+    this.treeGoalCarry = undefined;
+    this.navigationPending = false;
     this.syncBranch(ctx);
     if (this.state?.status !== "active") return;
     this.transition("paused", "Paused when the session was reopened.");
@@ -270,7 +257,26 @@ export class GoalController {
 
   restoreSelectedBranch(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
+    const carry = this.treeGoalCarry;
+    this.treeGoalCarry = undefined;
+    this.navigationPending = false;
     this.syncBranch(ctx);
+
+    const branchHasGoalMarker = ctx.sessionManager.getBranch().some(
+      entry => entry.type === "custom" && entry.customType === GOAL_STATE_TYPE,
+    );
+    if (!branchHasGoalMarker && carry?.sessionId === ctx.sessionManager.getSessionId()) {
+      const reason = "Paused after rewinding the conversation.";
+      this.persist({
+        ...carry.goal,
+        status: "paused",
+        updatedAt: Date.now(),
+        lastReason: reason,
+        terminalReason: reason,
+      });
+      return;
+    }
+
     const goal = this.state;
     if (!goal || goal.status !== "active") return;
     this.scheduleResume(ctx, goal, this.sessionEpoch);
@@ -283,10 +289,23 @@ export class GoalController {
 
   prepareForNavigation(): void {
     this.invalidatePendingEvaluation();
+    this.treeGoalCarry = undefined;
+    this.navigationPending = true;
+  }
+
+  prepareForTreeNavigation(ctx: ExtensionContext): void {
+    this.invalidatePendingEvaluation();
+    this.navigationPending = true;
+    const goal = this.branchState(ctx);
+    this.treeGoalCarry = goal?.status === "active"
+      ? { sessionId: ctx.sessionManager.getSessionId(), goal: { ...goal } }
+      : undefined;
   }
 
   shutdown(): void {
     this.invalidatePendingEvaluation();
+    this.treeGoalCarry = undefined;
+    this.navigationPending = true;
     this.evaluatorAbort = undefined;
     this.ctx = undefined;
     this.state = undefined;
@@ -363,6 +382,7 @@ export class GoalController {
   }
 
   scheduleSubagentWake(): void {
+    if (this.navigationPending) return;
     if (this.pendingWake) {
       this.retryPendingWake();
       return;
@@ -393,6 +413,7 @@ export class GoalController {
   }
 
   requestEvaluation(ctx: ExtensionContext): void {
+    if (this.navigationPending) return;
     this.syncBranch(ctx);
     if (this.retryPendingWake(ctx)) return;
     if (this.evaluationInFlight) {

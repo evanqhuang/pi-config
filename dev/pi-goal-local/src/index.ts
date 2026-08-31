@@ -28,8 +28,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.prepareForNavigation();
   });
 
-  pi.on("session_before_tree", () => {
-    controller.prepareForNavigation();
+  pi.on("session_before_tree", (_event, treeCtx) => {
+    controller.prepareForTreeNavigation(treeCtx);
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
