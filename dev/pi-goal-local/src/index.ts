@@ -260,7 +260,10 @@ function withGoalAutocomplete(current: AutocompleteProvider): AutocompleteProvid
       const line = lines[cursorLine] ?? "";
       const textBeforeCursor = line.slice(0, cursorCol);
       const argsStart = goalArgumentsStart(textBeforeCursor);
-      if (argsStart !== undefined && isPlanValueContext(textBeforeCursor.slice(argsStart))) {
+      if (argsStart === undefined) {
+        return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+      }
+      if (isPlanValueContext(textBeforeCursor.slice(argsStart))) {
         const pathLines = [...lines];
         pathLines[cursorLine] = line.slice(argsStart);
         const applied = current.applyCompletion(pathLines, cursorLine, cursorCol - argsStart, item, prefix);

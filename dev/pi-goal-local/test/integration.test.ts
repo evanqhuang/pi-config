@@ -68,6 +68,7 @@ function integrationHarness() {
   const branch: any[] = [];
   let provider: any;
   let command: any;
+  let baseCompletionApplications = 0;
   const sentMessages: any[] = [];
   const sessionManager = {
     getBranch: () => branch,
@@ -83,11 +84,13 @@ function integrationHarness() {
       return { items: [{ value: "plans/approved.md", label: "approved.md" }], prefix: "plans/" };
     },
     applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: any, prefix: string) {
+      baseCompletionApplications += 1;
       const line = lines[cursorLine] ?? "";
       const before = line.slice(0, cursorCol - prefix.length);
+      const completedValue = prefix.startsWith("/") ? `/${item.value}` : item.value;
       const result = [...lines];
-      result[cursorLine] = `${before}${item.value}${line.slice(cursorCol)}`;
-      return { lines: result, cursorLine, cursorCol: before.length + item.value.length };
+      result[cursorLine] = `${before}${completedValue}${line.slice(cursorCol)}`;
+      return { lines: result, cursorLine, cursorCol: before.length + completedValue.length };
     },
     shouldTriggerFileCompletion: () => true,
   };
@@ -135,7 +138,17 @@ function integrationHarness() {
     },
   } as any;
   goalExtension(pi);
-  return { pi, ctx, branch, handlers, command, sentMessages, get provider() { return provider; }, sessionManager };
+  return {
+    pi,
+    ctx,
+    branch,
+    handlers,
+    command,
+    sentMessages,
+    get provider() { return provider; },
+    get baseCompletionApplications() { return baseCompletionApplications; },
+    sessionManager,
+  };
 }
 
 type Message = ContextEvent["messages"][number];
@@ -242,6 +255,18 @@ describe("goal extension provider integration", () => {
   it("offers loop management and delegates --plan path completion to the ordinary provider", async () => {
     const harness = integrationHarness();
     await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+
+    const builtinLine = "/resume";
+    const builtin = harness.provider.applyCompletion(
+      [builtinLine],
+      0,
+      builtinLine.length,
+      { value: "resume", label: "resume" },
+      builtinLine,
+    );
+    expect(builtin.lines[0]).toBe("/resume");
+    expect(harness.baseCompletionApplications).toBe(1);
+
     const management = await harness.provider.getSuggestions(["/goal st"], 0, 9, { signal: new AbortController().signal });
     expect(management?.items.map((item: any) => item.value)).toContain("status");
     expect(harness.command.getArgumentCompletions("Implement --")?.[0]?.value).toBe("Implement --loop");
