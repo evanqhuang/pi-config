@@ -11,7 +11,7 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
@@ -267,16 +267,29 @@ export class FleetList {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard. pi's editor is an `Editor`
-   * subclass (CustomEditor) while every dialog/selector is not, and the loader
-   * aliases pi-tui to pi's own copy, so `instanceof` is a reliable identity
-   * check. `focusedComponent` is TUI-private (no public accessor), hence the
-   * best-effort peek: unknowable focus (no tui seen yet, nothing focused)
-   * counts as the editor so activation keeps working.
+   * True when pi's prompt editor owns the keyboard. Use structural detection
+   * because custom editors loaded through jiti can inherit from another copy of
+   * pi-tui, making `instanceof Editor` false across the module boundary. Dialogs
+   * and selectors do not expose the editor's text API. Unknowable focus (no TUI
+   * seen yet, nothing focused) counts as the editor so activation keeps working.
    */
   private editorHasFocus(): boolean {
-    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    const tui = this.tui as {
+      getFocusedComponent?: () => unknown;
+      focusedComponent?: unknown;
+    } | undefined;
+    const focused = tui?.getFocusedComponent?.() ?? tui?.focusedComponent;
+    if (focused == null) return true;
+    if (typeof focused !== "object") return false;
+
+    const candidate = focused as {
+      getText?: unknown;
+      setText?: unknown;
+      handleInput?: unknown;
+    };
+    return typeof candidate.getText === "function"
+      && typeof candidate.setText === "function"
+      && typeof candidate.handleInput === "function";
   }
 
   private deactivate(): void {
