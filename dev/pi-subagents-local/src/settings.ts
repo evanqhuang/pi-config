@@ -153,12 +153,10 @@ export interface SubagentsSettings {
    */
   rememberAgents?: boolean;
   /**
-   * Display mode for the persistent above-editor agent widget:
-   *   - `all`: show every agent (foreground + background).
-   *   - `background`: hide foreground agents — they already render inline as the
-   *     Agent tool result, so the widget would otherwise double-render them
-   *     (#118); everything else (background, queued, scheduled, RPC) stays.
-   *   - `off`: hide the widget entirely.
+   * Display mode for the persistent above-editor agent widget. Foreground agents
+   * always remain inline-only to prevent duplicate progress rows. `all` is kept
+   * as a compatibility alias for `background`; both show background, queued,
+   * scheduled, and RPC agents. `off` hides the widget entirely.
    * Defaults to `background`. Pure-UI and applied live (toggling refreshes the
    * widget).
    */

@@ -1140,10 +1140,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Live widget: show running agents above editor.
-  // widgetMode (default "background") selects what the widget shows: "all" =
-  // every agent; "background" = hide foreground (they already render inline as
-  // the Agent tool result, so showing them here too is a duplicate, #118), keep
-  // everything else; "off" = hide the widget entirely. Read live at render time.
+  // Foreground agents are always excluded because their Agent tool call already
+  // renders inline. Legacy "all" and "background" values therefore show the
+  // same widget-eligible agents; "off" hides the widget entirely.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
   const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
@@ -3219,7 +3218,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "widgetMode",
           label: "Widget",
-          description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
+          description: "Above-editor agent widget: foreground agents always stay inline; all/background show non-foreground agents; off hides the widget.",
           currentValue: getWidgetMode(),
           values: ["all", "background", "off"],
         },

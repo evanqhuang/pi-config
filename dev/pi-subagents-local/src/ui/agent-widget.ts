@@ -9,7 +9,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -49,6 +49,19 @@ export type UICtx = {
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
 };
+
+/**
+ * Keep the above-editor widget complementary to the inline Agent tool surface.
+ * Foreground agents always render inline, so they must never enter the widget,
+ * even when a legacy setting requests `all`.
+ */
+export function widgetEligibleAgents<T extends Pick<AgentRecord, "parentAgentId" | "isBackground">>(
+  agents: T[],
+  mode: WidgetMode,
+): T[] {
+  if (mode === "off") return [];
+  return agents.filter(agent => !agent.parentAgentId && agent.isBackground !== false);
+}
 
 /** Per-agent live activity state. */
 export interface AgentActivity {
@@ -271,11 +284,10 @@ export class AgentWidget {
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
     /**
-     * Read live at render time. Selects which agents the widget shows — see
-     * `WidgetMode`. Defaults to `"all"` when a caller supplies no policy; the
-     * extension supplies one defaulting to `"background"`.
+     * Read live at render time. Selects whether widget-eligible agents are
+     * visible; foreground agents remain inline regardless of this value.
      */
-    private mode: () => WidgetMode = () => "all",
+    private mode: () => WidgetMode = () => "background",
     /**
      * Read live at render time, like `mode`. Whether running agents show an
      * estimated cost beside their token count. Defaults to off — the extension
@@ -293,23 +305,12 @@ export class AgentWidget {
   ) {}
 
   /**
-   * Agents eligible for the widget, per the current `WidgetMode`:
-   *   - `off`: none (the widget's existing empty-state path hides it entirely).
-   *   - `background`: drop only agents *known* to be foreground
-   *     (`isBackground === false`); keep everything else — background, queued,
-   *     scheduled, or RPC-spawned (`undefined`). Keying off the `isBackground`
-   *     record flag rather than the UI-only `invocation` snapshot (which only the
-   *     Agent-tool path sets), and excluding rather than allow-listing, means
-   *     only proven-foreground runs drop out — nothing else silently vanishes.
-   *   - `all`: every agent.
+   * Foreground agents are never widget-eligible because their Agent tool call
+   * already owns the inline progress surface. `all` remains accepted for
+   * settings compatibility, but cannot reintroduce duplicate foreground rows.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents().filter(a => !a.parentAgentId);
-    switch (this.mode()) {
-      case "off": return [];
-      case "background": return all.filter(a => a.isBackground !== false);
-      default: return all;
-    }
+    return widgetEligibleAgents(this.manager.listAgents(), this.mode());
   }
 
   /** Set the UI context (grabbed from first tool execution). */

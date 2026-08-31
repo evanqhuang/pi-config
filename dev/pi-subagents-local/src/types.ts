@@ -102,11 +102,10 @@ export interface AgentConfig {
 export type JoinMode = 'async' | 'group' | 'smart';
 
 /**
- * Display mode for the persistent above-editor agent widget.
- * - `all`: show every agent (foreground + background).
- * - `background`: hide foreground agents (they already render inline as the
- *   Agent tool result, #118); show background/queued/scheduled/RPC.
- * - `off`: hide the widget entirely.
+ * Display mode for the persistent above-editor agent widget. Foreground agents
+ * are invariantly inline-only. `all` is retained as a compatibility alias for
+ * `background`; both show background/queued/scheduled/RPC agents. `off` hides
+ * the widget entirely.
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
