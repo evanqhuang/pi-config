@@ -235,6 +235,16 @@ describe("session lifecycle integration", () => {
     expect(prepared.completed).toEqual(tooMany);
     expect(Value.Check(h.checkpointTool.parameters, prepared)).toBe(false);
 
+    const arrowSplit = { ...payload } as Record<string, unknown>;
+    delete arrowSplit.findings;
+    const expectedFindings = ["await operation.catch(() => {}); then continue"];
+    const serialized = JSON.stringify(expectedFindings);
+    const arrow = serialized.indexOf("=>");
+    arrowSplit[`findings]\n${serialized.slice(0, arrow + 1)}`] = serialized.slice(arrow + 2);
+    const preparedArrowSplit = h.checkpointTool.prepareArguments(arrowSplit);
+    expect(preparedArrowSplit.findings).toEqual(expectedFindings);
+    expect(Value.Check(h.checkpointTool.parameters, preparedArrowSplit)).toBe(true);
+
     const tooLong = { ...payload } as Record<string, unknown>;
     delete tooLong.findings;
     tooLong[`findings]\n${JSON.stringify(["f".repeat(1025)])}\n</parameter`] = "";

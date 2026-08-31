@@ -35,6 +35,20 @@ describe("checkpoint argument compatibility", () => {
     });
   });
 
+  it("repairs an array field split at an arrow inside a string", () => {
+    const malformed = { ...payload } as Record<string, unknown>;
+    delete malformed.findings;
+    const findings = ["await operation.catch(() => {}); then continue"];
+    const serialized = JSON.stringify(findings);
+    const arrow = serialized.indexOf("=>");
+    malformed[`findings]\n${serialized.slice(0, arrow + 1)}`] = serialized.slice(arrow + 2);
+
+    expect(repairCheckpointArguments(malformed)).toEqual({
+      ...payload,
+      findings,
+    });
+  });
+
   it("repairs multiple exact fragments without weakening required fields", () => {
     const malformed = { ...payload } as Record<string, unknown>;
     delete malformed.completed;
@@ -53,6 +67,9 @@ describe("checkpoint argument compatibility", () => {
     ["canonical conflict", (input: Record<string, unknown>) => {
       input["findings]\n[\"replacement\"]\n</parameter"] = "";
     }],
+    ["arrow-split canonical conflict", (input: Record<string, unknown>) => {
+      input["findings]\n[\"await work(() ="] = " {});\"]";
+    }],
     ["duplicate fragments", (input: Record<string, unknown>) => {
       delete input.findings;
       input["findings]\n[\"first\"]\n</parameter"] = "";
@@ -69,6 +86,10 @@ describe("checkpoint argument compatibility", () => {
     ["non-empty sentinel", (input: Record<string, unknown>) => {
       delete input.findings;
       input["findings]\n[]\n</parameter"] = "not-empty";
+    }],
+    ["invalid arrow-split remainder", (input: Record<string, unknown>) => {
+      delete input.findings;
+      input["findings]\n[\"await work(() ="] = { unexpected: true };
     }],
     ["unknown or near-match names", (input: Record<string, unknown>) => {
       delete input.findings;

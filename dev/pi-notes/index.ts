@@ -131,6 +131,9 @@ const CHECKPOINT_FIELDS = new Set<string>([
 const MALFORMED_ARRAY_FIELD = new RegExp(
   `^(${CHECKPOINT_ARRAY_FIELDS.join("|")})\\]\\n([^\\r\\n]+)\\n</parameter$`,
 );
+const MALFORMED_ARROW_SPLIT_FIELD = new RegExp(
+  `^(${CHECKPOINT_ARRAY_FIELDS.join("|")})\\]\\n([^\\r\\n]+)=$`,
+);
 
 /**
  * Repair the one observed model serialization artifact without changing the
@@ -144,16 +147,29 @@ export function repairCheckpointArguments(args: unknown): unknown {
 
   for (const key of Object.keys(input)) {
     if (CHECKPOINT_FIELDS.has(key)) continue;
-    const match = MALFORMED_ARRAY_FIELD.exec(key);
-    if (!match || input[key] !== "") return args;
+
+    const closedFragment = MALFORMED_ARRAY_FIELD.exec(key);
+    const arrowSplitFragment = MALFORMED_ARROW_SPLIT_FIELD.exec(key);
+    let field: (typeof CHECKPOINT_ARRAY_FIELDS)[number];
+    let serialized: string;
+    if (closedFragment && input[key] === "") {
+      field = closedFragment[1] as (typeof CHECKPOINT_ARRAY_FIELDS)[number];
+      serialized = closedFragment[2];
+    } else if (arrowSplitFragment && typeof input[key] === "string") {
+      field = arrowSplitFragment[1] as (typeof CHECKPOINT_ARRAY_FIELDS)[number];
+      serialized = `${arrowSplitFragment[2]}=>${input[key]}`;
+    } else {
+      return args;
+    }
+
     let parsed: unknown;
     try {
-      parsed = JSON.parse(match[2]);
+      parsed = JSON.parse(serialized);
     } catch {
       return args;
     }
     if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === "string")) return args;
-    malformed.push({ key, field: match[1] as (typeof CHECKPOINT_ARRAY_FIELDS)[number], values: parsed });
+    malformed.push({ key, field, values: parsed });
   }
 
   if (!malformed.length) return args;
