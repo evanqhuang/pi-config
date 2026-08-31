@@ -17,6 +17,16 @@ import {
 import { buildVerifierPrompt, parseVerifierVerdict } from "./verifier.js";
 
 const WAKE_DEBOUNCE_MS = 250;
+const WAKE_MAX_RETRY_MS = 2_000;
+const WAKE_MAX_RETRIES = 8;
+
+type PendingWake = {
+  ctx: ExtensionContext;
+  branchIdentity: string;
+  epoch: number;
+  goalId: string;
+  generation: number;
+};
 
 function parentReady(ctx: ExtensionContext): boolean {
   const runtime = ctx as ExtensionContext & { isIdle?: () => boolean; hasPendingMessages?: () => boolean };
@@ -56,6 +66,11 @@ export class GoalController {
   private evaluationInFlight = false;
   private evaluationQueued = false;
   private wakeTimer: ReturnType<typeof setTimeout> | undefined;
+  private wakeRetryDelay = 0;
+  private wakeAttempts = 0;
+  private pendingWake: PendingWake | undefined;
+  private readonly branchEntryTokens = new WeakMap<object, number>();
+  private nextBranchEntryToken = 1;
   private evaluatorAbort: AbortController | undefined;
 
   constructor(private readonly pi: ExtensionAPI) {}
@@ -66,7 +81,38 @@ export class GoalController {
     return latestGoalState(ctx.sessionManager.getBranch());
   }
 
+  private branchIdentity(ctx: ExtensionContext): string {
+    const entries = ctx.sessionManager.getBranch();
+    const latestGoalEntry = [...entries].reverse().find(entry => entry.type === "custom" && entry.customType === GOAL_STATE_TYPE);
+    if (latestGoalEntry) {
+      // Session entries are stable across getBranch() calls. The fallback token keeps
+      // lifecycle tests and older adapters branch-aware when ids are unavailable.
+      const entry = latestGoalEntry as unknown as object;
+      let token = this.branchEntryTokens.get(entry);
+      if (!token) {
+        token = this.nextBranchEntryToken++;
+        this.branchEntryTokens.set(entry, token);
+      }
+      return `goal-entry:${typeof latestGoalEntry.id === "string" ? latestGoalEntry.id : token}`;
+    }
+
+    return `branch:${entries.map(entry => {
+      if (typeof entry.id === "string") return entry.id;
+      const object = entry as unknown as object;
+      let token = this.branchEntryTokens.get(object);
+      if (!token) {
+        token = this.nextBranchEntryToken++;
+        this.branchEntryTokens.set(object, token);
+      }
+      return token;
+    }).join("/")}`;
+  }
+
   private syncBranch(ctx: ExtensionContext): void {
+    const identity = this.branchIdentity(ctx);
+    if (this.pendingWake && (this.pendingWake.ctx !== ctx || this.pendingWake.branchIdentity !== identity)) {
+      this.invalidatePendingWake();
+    }
     this.ctx = ctx;
     this.state = this.branchState(ctx);
   }
@@ -105,11 +151,18 @@ export class GoalController {
     return "Use the main session's currently selected PLAN / ORCHESTRATOR / YOLO mode and available tools. Do not assume unavailable capabilities. Goal evaluation itself cannot mutate through GoalJudge; GoalVerifier is read-only acceptance verification.";
   }
 
+  private invalidatePendingWake(): void {
+    if (this.wakeTimer !== undefined) clearTimeout(this.wakeTimer);
+    this.wakeTimer = undefined;
+    this.wakeRetryDelay = 0;
+    this.wakeAttempts = 0;
+    this.pendingWake = undefined;
+  }
+
   private invalidatePendingEvaluation(): void {
     this.sessionEpoch += 1;
     this.evaluatorAbort?.abort();
-    if (this.wakeTimer) clearTimeout(this.wakeTimer);
-    this.wakeTimer = undefined;
+    this.invalidatePendingWake();
     this.evaluationQueued = false;
   }
 
@@ -121,25 +174,102 @@ export class GoalController {
       && this.state.status === "active";
   }
 
+  private armWakeTimer(delay: number): void {
+    if (!this.pendingWake || this.wakeTimer !== undefined) return;
+    this.wakeTimer = setTimeout(() => {
+      this.wakeTimer = undefined;
+      if (!this.pendingWake) return;
+      this.wakeAttempts += 1;
+      this.attemptPendingWake();
+      if (!this.pendingWake || this.wakeAttempts >= WAKE_MAX_RETRIES) return;
+      this.wakeRetryDelay = Math.min(
+        this.wakeRetryDelay > 0 ? this.wakeRetryDelay * 2 : WAKE_DEBOUNCE_MS,
+        WAKE_MAX_RETRY_MS,
+      );
+      this.armWakeTimer(this.wakeRetryDelay);
+    }, delay);
+  }
+
+  private attemptPendingWake(): boolean {
+    const pending = this.pendingWake;
+    if (!pending) return false;
+    if (pending.epoch !== this.sessionEpoch || this.ctx !== pending.ctx) {
+      this.invalidatePendingWake();
+      return false;
+    }
+
+    const ctx = pending.ctx;
+    if (this.branchIdentity(ctx) !== pending.branchIdentity) {
+      this.invalidatePendingWake();
+      return false;
+    }
+
+    // Re-read the selected branch for every attempt. Never use a state captured
+    // before navigation or a pause/stop/replacement transition.
+    const current = this.branchState(ctx);
+    this.state = current;
+    if (!current || current.id !== pending.goalId || current.generation !== pending.generation || current.status !== "active") {
+      this.invalidatePendingWake();
+      return false;
+    }
+    if (!parentReady(ctx) || hasActiveSubagents()) return false;
+
+    // Clear before sendMessage: triggerTurn can synchronously cause another
+    // lifecycle event, and that event must not enqueue a duplicate continuation.
+    this.invalidatePendingWake();
+    this.hidden(GOAL_CONTINUE_MESSAGE, `Resume autonomous pursuit of the active goal:\n\n${current.objective}`);
+    return true;
+  }
+
   private scheduleResume(ctx: ExtensionContext, goal: GoalStateV1, epoch: number): void {
-    setTimeout(() => {
-      if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
-      this.state = this.branchState(ctx);
-      if (this.state?.id !== goal.id || this.state.generation !== goal.generation || this.state.status !== "active") return;
-      if (!parentReady(ctx) || hasActiveSubagents()) return;
-      this.hidden(GOAL_CONTINUE_MESSAGE, `Resume autonomous pursuit of the active goal:\n\n${goal.objective}`);
-    }, 0);
+    if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
+    const request: PendingWake = {
+      ctx,
+      branchIdentity: this.branchIdentity(ctx),
+      epoch,
+      goalId: goal.id,
+      generation: goal.generation,
+    };
+    if (this.pendingWake
+      && this.pendingWake.ctx === request.ctx
+      && this.pendingWake.branchIdentity === request.branchIdentity
+      && this.pendingWake.epoch === request.epoch
+      && this.pendingWake.goalId === request.goalId
+      && this.pendingWake.generation === request.generation) return;
+
+    this.invalidatePendingWake();
+    this.pendingWake = request;
+    this.armWakeTimer(0);
+  }
+
+  /**
+   * Reattempt a pending tree-selection wake from an agent lifecycle event.
+   *
+   * A pending wake remains handled even when the current runtime is not ready;
+   * callers must not fall through to ordinary goal evaluation in that case.
+   */
+  retryPendingWake(ctx?: ExtensionContext): boolean {
+    if (!this.pendingWake) return false;
+    if (ctx && ctx !== this.pendingWake.ctx) {
+      this.invalidatePendingWake();
+      return false;
+    }
+    const delivered = this.attemptPendingWake();
+    if (this.pendingWake && this.wakeTimer === undefined && this.wakeAttempts < WAKE_MAX_RETRIES) {
+      this.armWakeTimer(WAKE_DEBOUNCE_MS);
+    }
+    return delivered || this.pendingWake !== undefined;
   }
 
   restore(ctx: ExtensionContext): void {
-    this.sessionEpoch += 1;
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (this.state?.status !== "active") return;
     this.transition("paused", "Paused when the session was reopened.");
   }
 
   restoreSelectedBranch(ctx: ExtensionContext): void {
-    this.sessionEpoch += 1;
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     const goal = this.state;
     if (!goal || goal.status !== "active") return;
@@ -163,6 +293,7 @@ export class GoalController {
   }
 
   start(ctx: ExtensionContext, objective: string, criteria: string[]): GoalStateV1 {
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
       this.evaluatorAbort?.abort();
@@ -195,6 +326,7 @@ export class GoalController {
   }
 
   pause(ctx: ExtensionContext): GoalStateV1 | undefined {
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (this.state?.status !== "active") return undefined;
     this.evaluatorAbort?.abort();
@@ -202,6 +334,7 @@ export class GoalController {
   }
 
   resume(ctx: ExtensionContext): GoalStateV1 | undefined {
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (!this.state || this.state.status !== "paused") return undefined;
     const next: GoalStateV1 = { ...this.state, status: "active", updatedAt: Date.now(), terminalReason: undefined };
@@ -211,6 +344,7 @@ export class GoalController {
   }
 
   stop(ctx: ExtensionContext, reason = "Stopped by user."): GoalStateV1 | undefined {
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (!this.state || this.state.status === "stopped") return undefined;
     this.evaluatorAbort?.abort();
@@ -218,6 +352,7 @@ export class GoalController {
   }
 
   clear(ctx: ExtensionContext): GoalStateV1 | undefined {
+    this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (!this.state) return undefined;
     this.evaluatorAbort?.abort();
@@ -228,21 +363,38 @@ export class GoalController {
   }
 
   scheduleSubagentWake(): void {
-    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    if (this.pendingWake) {
+      this.retryPendingWake();
+      return;
+    }
+    if (this.wakeTimer !== undefined) clearTimeout(this.wakeTimer);
+    this.wakeTimer = undefined;
     const ctx = this.ctx;
     const epoch = this.sessionEpoch;
     if (!ctx) return;
+    const scheduled = this.branchState(ctx);
+    if (!scheduled || scheduled.status !== "active") return;
+    const branchIdentity = this.branchIdentity(ctx);
+    const goalId = scheduled.id;
+    const generation = scheduled.generation;
     this.wakeTimer = setTimeout(() => {
       this.wakeTimer = undefined;
       if (epoch !== this.sessionEpoch || this.ctx !== ctx) return;
-      this.state = this.branchState(ctx);
-      if (this.state?.status !== "active" || hasActiveSubagents() || !parentReady(ctx)) return;
+      if (this.branchIdentity(ctx) !== branchIdentity) return;
+      const current = this.branchState(ctx);
+      this.state = current;
+      if (current?.id !== goalId
+        || current?.generation !== generation
+        || current?.status !== "active"
+        || hasActiveSubagents()
+        || !parentReady(ctx)) return;
       this.hidden(GOAL_SUBAGENT_UPDATE_MESSAGE, "Background subagent work has settled. Reassess the active goal using the new results.");
     }, WAKE_DEBOUNCE_MS);
   }
 
   requestEvaluation(ctx: ExtensionContext): void {
     this.syncBranch(ctx);
+    if (this.retryPendingWake(ctx)) return;
     if (this.evaluationInFlight) {
       this.evaluationQueued = true;
       return;

@@ -25,6 +25,7 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
+import { createToolLoopGuard } from "./tool-loop-guard.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -296,6 +297,57 @@ export function installExtensionToolScope(
     }
     return priorBeforeToolCall?.(context, signal);
   };
+}
+
+/**
+ * Install the LocalExplore-only repeated tool-action guard on one child session.
+ *
+ * The existing hooks remain authoritative: before hooks run first and a prior
+ * block is returned unchanged; after hooks run first and the guard observes the
+ * resulting (possibly overridden) completion while returning that override
+ * unchanged. This keeps extension scope and interception semantics intact.
+ */
+export function installLocalExploreToolLoopGuard(session: AgentSession): void {
+  const guard = createToolLoopGuard();
+
+  const priorBeforeToolCall = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (context, signal) => {
+    const priorResult = await priorBeforeToolCall?.(context, signal);
+    if (priorResult?.block) return priorResult;
+    return guard.beforeToolCall({ toolName: context.toolCall.name, args: context.args });
+  };
+
+  const priorAfterToolCall = session.agent.afterToolCall;
+  session.agent.afterToolCall = async (context, signal) => {
+    const priorResult = await priorAfterToolCall?.(context, signal);
+
+    // Agent-core applies after-hook overrides with nullish field-by-field merge.
+    // Mirror that merge solely for the signature, then return priorResult so the
+    // runtime applies the exact same override once, with no guard-side changes.
+    const result = priorResult
+      ? {
+          ...context.result,
+          content: priorResult.content ?? context.result.content,
+          details: priorResult.details ?? context.result.details,
+          usage: priorResult.usage ?? context.result.usage,
+          terminate: priorResult.terminate ?? context.result.terminate,
+        }
+      : context.result;
+    const isError = priorResult?.isError ?? context.isError;
+    guard.afterToolCall(
+      { toolName: context.toolCall.name, args: context.args },
+      { result, isError },
+    );
+    return priorResult;
+  };
+}
+
+/** Install the guard only for the exact resolved child card identity. */
+export function installLocalExploreToolLoopGuardForAgent(
+  session: AgentSession,
+  resolvedAgentName: string,
+): void {
+  if (resolvedAgentName === "LocalExplore") installLocalExploreToolLoopGuard(session);
 }
 
 /** Default max turns. undefined = unlimited (no turn limit). */
@@ -982,6 +1034,10 @@ export async function runAgent(
       nestedToolNames,
     });
   }
+  // This is deliberately keyed by the resolved card identity, not the caller's
+  // spelling or the parent session. Each run gets a fresh guard and therefore
+  // its own completion state.
+  installLocalExploreToolLoopGuardForAgent(session, agentConfig.name);
 
   options.onSessionCreated?.(session);
 

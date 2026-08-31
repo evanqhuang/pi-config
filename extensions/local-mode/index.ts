@@ -1,4 +1,5 @@
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -9,6 +10,12 @@ import {
 	type ExtensionContext,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import {
+	autoCompactModelIdentity,
+	createAutoCompactPolicyClient,
+	type AutoCompactPolicyClient,
+} from "./auto-compact-policy.js";
+import { createRepetitionRetryStream } from "./repetition-retry.js";
 import {
 	type AgentInvocationInput,
 	buildLocalQwenRequestPayload,
@@ -85,6 +92,7 @@ interface LocalModeState {
 	qwen38SubagentEnabled: boolean;
 	activeProfile?: LocalQwenProfile;
 	compactionRequested: boolean;
+	autoCompactPolicy: AutoCompactPolicyClient;
 }
 
 function modelKey(model: { provider: string; id: string }): string {
@@ -134,6 +142,7 @@ function resetState(state: LocalModeState): void {
 	state.qwen38SubagentEnabled = true;
 	state.activeProfile = undefined;
 	state.compactionRequested = false;
+	state.autoCompactPolicy.clear();
 }
 
 interface PersistedLocalModeState {
@@ -214,18 +223,47 @@ function updateUi(state: LocalModeState, ctx: ExtensionContext): void {
 	});
 }
 
+export type MonotonicClock = () => number;
+
+export function calculateTokensPerSecond(
+	outputTokens: number,
+	elapsedMilliseconds: number,
+): number | undefined {
+	if (
+		!Number.isFinite(outputTokens) ||
+		outputTokens <= 0 ||
+		!Number.isFinite(elapsedMilliseconds) ||
+		elapsedMilliseconds <= 0
+	) {
+		return undefined;
+	}
+
+	const tokensPerSecond = outputTokens / (elapsedMilliseconds / 1000);
+	return Number.isFinite(tokensPerSecond) && tokensPerSecond > 0
+		? tokensPerSecond
+		: undefined;
+}
+
+function monotonicNow(): number {
+	return performance.now();
+}
+
 function updateTokensPerSecond(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 	outputTokens: number,
+	clock: MonotonicClock,
 ): void {
 	const startedAt = state.generationStartedAt;
-	if (!startedAt || !Number.isFinite(outputTokens) || outputTokens <= 0) return;
+	if (startedAt === undefined) return;
 
-	const elapsedSeconds = (Date.now() - startedAt) / 1000;
-	if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) return;
+	const tokensPerSecond = calculateTokensPerSecond(
+		outputTokens,
+		clock() - startedAt,
+	);
+	if (tokensPerSecond === undefined) return;
 
-	state.tokensPerSecond = outputTokens / elapsedSeconds;
+	state.tokensPerSecond = tokensPerSecond;
 	updateLocalStatus(state, ctx);
 }
 
@@ -290,17 +328,29 @@ async function selectLocalModel(
 	return true;
 }
 
+function requestAutoCompactPolicy(
+	state: LocalModeState,
+	ctx: ExtensionContext,
+): void {
+	const identity = autoCompactModelIdentity(ctx.model);
+	if (identity) state.autoCompactPolicy.request(identity);
+}
+
 function enforceLocalThinkingProfile(
 	pi: ExtensionAPI,
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): LocalQwenProfile | undefined {
 	const contextTokens = ctx.getContextUsage()?.tokens ?? 0;
+	const identity = autoCompactModelIdentity(ctx.model);
+	const compactionThreshold =
+		state.autoCompactPolicy.snapshotFor(identity)?.thresholdTokens;
 	const profile = localQwenProfile(
 		ctx,
 		state.localOnly,
 		pi.getThinkingLevel(),
 		contextTokens,
+		compactionThreshold,
 	);
 	state.activeProfile = profile;
 	if (!profile) return undefined;
@@ -579,7 +629,17 @@ async function handleLocalCommand(
 	await enableAutomaticLocalMode(pi, state, ctx);
 }
 
-export default function localModeExtension(pi: ExtensionAPI): void {
+export default function localModeExtension(
+	pi: ExtensionAPI,
+	clock: MonotonicClock = monotonicNow,
+): void {
+	for (const provider of ["qwen38-main", "qwen38-subagent"]) {
+		pi.registerProvider(provider, {
+			api: "openai-completions",
+			streamSimple: createRepetitionRetryStream,
+		});
+	}
+
 	const state: LocalModeState = {
 		enabled: false,
 		localOnly: false,
@@ -593,6 +653,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		qwen38SubagentEnabled: true,
 		compactionRequested: false,
 		localCycleEditorInstalled: false,
+		autoCompactPolicy: createAutoCompactPolicyClient(pi.events),
 	};
 
 	pi.on("resources_discover", (_event, ctx) => {
@@ -675,6 +736,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		requestAutoCompactPolicy(state, ctx);
 		if (state.automaticThinking && ctx.model?.id === "qwen3.8-27b") {
 			state.automaticThinkingLevel = "medium";
 			state.deepReasoningRequested = false;
@@ -688,7 +750,9 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
+		state.autoCompactPolicy.clear();
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		requestAutoCompactPolicy(state, ctx);
 		if (!state.enabled) return;
 		state.generationStartedAt = undefined;
 		state.tokensPerSecond = undefined;
@@ -713,10 +777,12 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_start", async (_event, ctx) => {
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		requestAutoCompactPolicy(state, ctx);
 		applyAutomaticThinkingLevel(pi, state, ctx);
 		enforceLocalThinkingProfile(pi, state, ctx);
 		if (!state.enabled) return;
-		state.generationStartedAt = undefined;
+		state.generationStartedAt = clock();
+		state.tokensPerSecond = undefined;
 		updateLocalStatus(state, ctx);
 	});
 
@@ -742,6 +808,7 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
+		requestAutoCompactPolicy(state, ctx);
 		if (
 			!state.localOnly ||
 			ctx.model?.id !== "qwen3.8-27b" ||
@@ -762,21 +829,12 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("message_update", (event, ctx) => {
 		if (!state.enabled || event.message.role !== "assistant") return;
-		const streamEvent = event.assistantMessageEvent;
-		if (
-			state.generationStartedAt === undefined &&
-			(streamEvent.type === "text_delta" ||
-				streamEvent.type === "thinking_delta" ||
-				streamEvent.type === "toolcall_delta")
-		) {
-			state.generationStartedAt = Date.now();
-		}
-		updateTokensPerSecond(state, ctx, event.message.usage.output);
+		updateTokensPerSecond(state, ctx, event.message.usage.output, clock);
 	});
 
 	pi.on("message_end", (event, ctx) => {
 		if (!state.enabled || event.message.role !== "assistant") return;
-		updateTokensPerSecond(state, ctx, event.message.usage.output);
+		updateTokensPerSecond(state, ctx, event.message.usage.output, clock);
 	});
 
 	pi.on("session_compact", () => {
@@ -788,8 +846,14 @@ export default function localModeExtension(pi: ExtensionAPI): void {
 		state.compactionRequested = false;
 	});
 
+	pi.on("session_shutdown", () => {
+		state.autoCompactPolicy.stop();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
+		state.autoCompactPolicy.start();
 		resetState(state);
+		requestAutoCompactPolicy(state, ctx);
 		if (isSubagentSession(ctx)) {
 			state.localOnly = getProcessLocalProviderPolicy().enabled;
 			if (state.localOnly) await enforceLocalProvider(pi, state, ctx);

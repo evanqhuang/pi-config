@@ -115,6 +115,62 @@ const CHECKPOINT_SCHEMA = Type.Object({
   next_action: Type.String({ minLength: 1, maxLength: 2048 }),
 }, { additionalProperties: false });
 
+const CHECKPOINT_ARRAY_FIELDS = [
+  "completed",
+  "findings",
+  "decisions",
+  "failed_approaches",
+  "blockers",
+  "verification",
+] as const;
+const CHECKPOINT_FIELDS = new Set<string>([
+  "current",
+  ...CHECKPOINT_ARRAY_FIELDS,
+  "next_action",
+]);
+const MALFORMED_ARRAY_FIELD = new RegExp(
+  `^(${CHECKPOINT_ARRAY_FIELDS.join("|")})\\]\\n([^\\r\\n]+)\\n</parameter$`,
+);
+
+/**
+ * Repair the one observed model serialization artifact without changing the
+ * public checkpoint schema. Invalid or ambiguous input is deliberately left
+ * untouched so the normal strict validator remains authoritative.
+ */
+export function repairCheckpointArguments(args: unknown): unknown {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return args;
+  const input = args as Record<string, unknown>;
+  const malformed: Array<{ key: string; field: (typeof CHECKPOINT_ARRAY_FIELDS)[number]; values: string[] }> = [];
+
+  for (const key of Object.keys(input)) {
+    if (CHECKPOINT_FIELDS.has(key)) continue;
+    const match = MALFORMED_ARRAY_FIELD.exec(key);
+    if (!match || input[key] !== "") return args;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(match[2]);
+    } catch {
+      return args;
+    }
+    if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === "string")) return args;
+    malformed.push({ key, field: match[1] as (typeof CHECKPOINT_ARRAY_FIELDS)[number], values: parsed });
+  }
+
+  if (!malformed.length) return args;
+  const seen = new Set<string>();
+  for (const fragment of malformed) {
+    if (Object.prototype.hasOwnProperty.call(input, fragment.field) || seen.has(fragment.field)) return args;
+    seen.add(fragment.field);
+  }
+
+  const repaired: Record<string, unknown> = { ...input };
+  for (const fragment of malformed) {
+    delete repaired[fragment.key];
+    repaired[fragment.field] = fragment.values;
+  }
+  return repaired;
+}
+
 function freshHarnessFacts(): HarnessFacts {
   return { modifiedFiles: new Set(), recentFailedCommandCount: 0 };
 }
@@ -164,9 +220,39 @@ function bulletSection(title: string, values: readonly string[]): string {
   return `## ${title}\n${items.length ? items.map((value) => `- ${value}`).join("\n") : "- None."}`;
 }
 
+function boundedWorkingSet(
+  prefix: string,
+  suffix: string,
+  modifiedFiles: readonly string[],
+): string {
+  const pathLines = modifiedFiles.map((path) => `- \`${path}\``);
+  const omissionLine = (omitted: number) => `- … ${omitted} more paths retained in checkpoint metadata.`;
+  const render = (body: string) => `${prefix}${body}${suffix}`;
+  const empty = render("- None.");
+  if (Buffer.byteLength(empty, "utf8") > DEFAULT_CONFIG.notesMaxBytes) {
+    return pathLines.length ? render(omissionLine(pathLines.length)) : empty;
+  }
+  if (!pathLines.length) return empty;
+
+  const all = render(pathLines.join("\n"));
+  if (Buffer.byteLength(all, "utf8") <= DEFAULT_CONFIG.notesMaxBytes) return all;
+
+  for (let included = pathLines.length - 1; included >= 0; included -= 1) {
+    const omitted = pathLines.length - included;
+    const omission = omissionLine(omitted);
+    const body = [...pathLines.slice(0, included), omission].join("\n");
+    const candidate = render(body);
+    if (Buffer.byteLength(candidate, "utf8") <= DEFAULT_CONFIG.notesMaxBytes) return candidate;
+  }
+
+  // No accurate omission marker fits; keep the non-empty working set truthful
+  // and let the commit-time assertion preserve the hard failure.
+  return render(omissionLine(pathLines.length));
+}
+
 export function renderNotes(payload: CheckpointPayload, runtime: NotesRuntime): string {
   const modifiedFiles = [...runtime.harnessFacts.modifiedFiles].sort();
-  const sections = [
+  const authoredSections = [
     "# Task State",
     `## Current\n${payload.current.trim()}`,
     bulletSection("Completed", payload.completed),
@@ -176,10 +262,10 @@ export function renderNotes(payload: CheckpointPayload, runtime: NotesRuntime): 
     bulletSection("Verification", payload.verification),
     bulletSection("Blockers", payload.blockers),
     `## Next Action\n${payload.next_action.trim()}`,
-    `## Working Set\n${modifiedFiles.length ? modifiedFiles.map((path) => `- \`${path}\``).join("\n") : "- None."}`,
-    `<!-- pi-notes:v1 notesId=${runtime.notesId} generation=${runtime.checkpointGeneration + 1} -->`,
   ];
-  return `${sections.join("\n\n")}\n`;
+  const prefix = `${authoredSections.join("\n\n")}\n\n## Working Set\n`;
+  const suffix = `\n\n<!-- pi-notes:v1 notesId=${runtime.notesId} generation=${runtime.checkpointGeneration + 1} -->\n`;
+  return boundedWorkingSet(prefix, suffix, modifiedFiles);
 }
 
 function customEntry<T>(entry: SessionEntry, customType: string): T | undefined {
@@ -714,6 +800,9 @@ export default function notesExtension(pi: ExtensionAPI): void {
       CHECKPOINT_FIELD_GUIDANCE,
     ],
     parameters: CHECKPOINT_SCHEMA,
+    prepareArguments(args) {
+      return repairCheckpointArguments(args) as CheckpointPayload;
+    },
     executionMode: "sequential",
     async execute(_toolCallId, params) {
       const committed = await commitCheckpoint(pi, runtime, params as CheckpointPayload);
@@ -783,6 +872,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
         runtime.harnessFacts.modifiedFiles = new Set(inherited.harnessFacts.modifiedFiles);
         runtime.harnessFacts.lastVerificationCommand = inherited.harnessFacts.lastVerificationCommand;
         runtime.harnessFacts.lastVerificationOutcome = inherited.harnessFacts.lastVerificationOutcome;
+        runtime.harnessFacts.recentFailedCommandCount = inherited.harnessFacts.recentFailedCommandCount;
         const rendered = renderNotes(inherited.payload, runtime);
         if (Buffer.byteLength(rendered, "utf8") > DEFAULT_CONFIG.notesMaxBytes) throw new Error("Inherited Notes exceed configured bound");
         await ensureSafeDestination(runtime);

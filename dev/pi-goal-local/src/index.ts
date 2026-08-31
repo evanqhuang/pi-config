@@ -112,7 +112,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
       }
       return;
     }
-    controller.requestEvaluation(settledCtx);
+    // A wake that is still waiting for readiness is handled too; only fall
+    // through when there was no pending wake (or it was invalidated).
+    if (!controller.retryPendingWake(settledCtx)) controller.requestEvaluation(settledCtx);
   });
 
   pi.events.on("subagents:completed", () => controller.scheduleSubagentWake());

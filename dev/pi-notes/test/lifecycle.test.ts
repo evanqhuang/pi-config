@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import notesExtension, {
   DEFAULT_CONFIG,
   NOTES_CHECKPOINT_TYPE,
@@ -177,6 +178,80 @@ describe("session lifecycle integration", () => {
     expect(await resumed.status()).toContain("generation: 1");
     expect(await resumed.status()).toContain("dirty: false");
     expect(await readFile(notesPath, "utf8")).toBe(expected);
+  });
+
+  it("retains every sorted path and harness fact in checkpoint metadata across restore", async () => {
+    const source = await makeHarness();
+    await source.handlers.get("session_start")!({ reason: "new" }, source.ctx);
+    await source.command.handler("on", source.ctx);
+    for (const path of ["z/last.ts", "a/first.ts", "m/middle.ts"]) {
+      source.handlers.get("tool_result")!({
+        toolName: "write",
+        input: { path },
+        isError: false,
+      });
+    }
+    source.handlers.get("tool_result")!({
+      toolName: "bash",
+      input: { command: "pnpm test" },
+      isError: true,
+    });
+    source.handlers.get("tool_result")!({
+      toolName: "bash",
+      input: { command: "pnpm test" },
+      isError: true,
+    });
+
+    const committed = await source.checkpointTool.execute("cp-facts", payload);
+    const notesPath = committed.details.notesPath as string;
+    const checkpoint = latestCustom(source.branch, NOTES_CHECKPOINT_TYPE).data;
+    expect(checkpoint.harnessFacts).toEqual({
+      modifiedFiles: ["a/first.ts", "m/middle.ts", "z/last.ts"],
+      lastVerificationCommand: "pnpm test",
+      lastVerificationOutcome: "error",
+      recentFailedCommandCount: 2,
+    });
+
+    const branch = source.branch.slice();
+    const expected = await readFile(notesPath, "utf8");
+    await unlink(notesPath);
+    const resumed = await makeHarness(branch, source.root);
+    await resumed.handlers.get("session_start")!({ reason: "resume" }, resumed.ctx);
+    expect(await readFile(notesPath, "utf8")).toBe(expected);
+
+    await resumed.checkpointTool.execute("cp-facts-restored", payload);
+    const restoredCheckpoint = latestCustom(resumed.branch, NOTES_CHECKPOINT_TYPE).data;
+    expect(restoredCheckpoint.harnessFacts).toEqual(checkpoint.harnessFacts);
+  });
+
+  it("runs repaired arguments through the unchanged strict schema", async () => {
+    const h = await makeHarness();
+    const malformed = { ...payload } as Record<string, unknown>;
+    delete malformed.completed;
+    const tooMany = Array.from({ length: 41 }, (_, index) => `completed ${index}`);
+    malformed[`completed]\n${JSON.stringify(tooMany)}\n</parameter`] = "";
+
+    const prepared = h.checkpointTool.prepareArguments(malformed);
+    expect(prepared.completed).toEqual(tooMany);
+    expect(Value.Check(h.checkpointTool.parameters, prepared)).toBe(false);
+
+    const tooLong = { ...payload } as Record<string, unknown>;
+    delete tooLong.findings;
+    tooLong[`findings]\n${JSON.stringify(["f".repeat(1025)])}\n</parameter`] = "";
+    const preparedTooLong = h.checkpointTool.prepareArguments(tooLong);
+    expect(Value.Check(h.checkpointTool.parameters, preparedTooLong)).toBe(false);
+  });
+
+  it("fails when authored state alone exceeds the Notes byte bound", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+
+    await expect(h.checkpointTool.execute("cp-too-large", {
+      ...payload,
+      current: "c".repeat(2048),
+      completed: Array.from({ length: 40 }, () => "completed".repeat(128)),
+    })).rejects.toThrow(/Rendered Notes exceed 8192 bytes/);
   });
 
   it("does not dirty or pressure a clean checkpoint for ordinary read/search results", async () => {
