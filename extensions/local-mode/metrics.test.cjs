@@ -49,9 +49,11 @@ function eventBus() {
 function fixture() {
 	let model;
 	let thinkingLevel = "medium";
+	let contextTokens = 0;
 	let status;
 	let editorFactory;
 	const handlers = new Map();
+	const tools = new Map();
 	const events = eventBus();
 	const pi = {
 		events,
@@ -63,7 +65,9 @@ function fixture() {
 		on(name, handler) {
 			handlers.set(name, handler);
 		},
-		registerTool() {},
+		registerTool(tool) {
+			tools.set(tool.name, tool);
+		},
 		registerCommand(name, command) {
 			this.commands.set(name, command);
 		},
@@ -86,7 +90,7 @@ function fixture() {
 				provider === model?.provider && id === model?.id ? model : undefined,
 			getAvailable: () => [],
 		},
-		getContextUsage: () => ({ tokens: 0 }),
+		getContextUsage: () => ({ tokens: contextTokens }),
 		sessionManager: {
 			getEntries: () => [],
 			getHeader: () => ({}),
@@ -115,13 +119,19 @@ function fixture() {
 		api: "openai-completions",
 		provider: "qwen38-main",
 		id: "qwen3.8-27b",
-		contextWindow: 170000,
+		contextWindow: 190000,
 		maxTokens: 20480,
 	};
 	return {
 		pi,
 		ctx,
+		tools,
+		getModel: () => model,
 		getStatus: () => status,
+		getThinkingLevel: () => thinkingLevel,
+		setContextTokens: (tokens) => {
+			contextTokens = tokens;
+		},
 		emit: (name, event = {}) => handlers.get(name)?.(event, ctx),
 	};
 }
@@ -253,6 +263,71 @@ test("commits only successful repetition output for full-turn throughput", async
 	assert.equal(rate, 100);
 	await emit("message_end", { message: committed[0] });
 	assert.match(getStatus(), /100 tok\/s/);
+});
+
+test("successful compaction resets automatic xhigh to medium without renewing its one-shot lease", async () => {
+	const { pi, ctx, tools, getModel, getThinkingLevel, setContextTokens, emit } = fixture();
+	localModeExtension(pi, () => 1000);
+	await pi.commands.get("local").handler("on", ctx);
+
+	const deepReasoning = tools.get("request_deeper_reasoning");
+	const first = await deepReasoning.execute("deep-1", { reason: "transaction race" }, undefined, undefined, ctx);
+	assert.equal(first.details.applied, true);
+	assert.equal(getThinkingLevel(), "xhigh");
+	assert.equal(getModel().maxTokens, 98304);
+
+	setContextTokens(null);
+	await emit("session_compact");
+	assert.equal(getThinkingLevel(), "medium");
+	assert.equal(getModel().maxTokens, 20480);
+
+	const payload = await emit("before_provider_request", { payload: {} });
+	assert.equal(payload.reasoning_effort, "medium");
+	assert.equal(payload.thinking_token_budget, 8192);
+	assert.equal(payload.max_tokens, 20480);
+
+	const repeated = await deepReasoning.execute("deep-2", { reason: "same task" }, undefined, undefined, ctx);
+	assert.deepEqual(repeated.details, { applied: false, reason: "already-requested" });
+});
+
+test("failed compaction retains automatic xhigh", async () => {
+	const { pi, ctx, tools, getModel, getThinkingLevel, emit } = fixture();
+	localModeExtension(pi, () => 1000);
+	await pi.commands.get("local").handler("on", ctx);
+	await tools.get("request_deeper_reasoning").execute(
+		"deep-1",
+		{ reason: "transaction race" },
+		undefined,
+		undefined,
+		ctx,
+	);
+
+	await emit("session_compact_failed");
+	assert.equal(getThinkingLevel(), "xhigh");
+	assert.equal(getModel().maxTokens, 98304);
+});
+
+test("manual xhigh survives compaction while unknown usage uses medium budgets", async () => {
+	const { pi, ctx, getModel, getThinkingLevel, setContextTokens, emit } = fixture();
+	localModeExtension(pi, () => 1000);
+	await pi.commands.get("local").handler("on", ctx);
+	pi.setThinkingLevel("xhigh");
+	await emit("thinking_level_select", { level: "xhigh" });
+
+	setContextTokens(null);
+	await emit("session_compact");
+	assert.equal(getThinkingLevel(), "xhigh");
+	assert.equal(getModel().maxTokens, 20480);
+	const unknownPayload = await emit("before_provider_request", { payload: {} });
+	assert.equal(unknownPayload.reasoning_effort, "xhigh");
+	assert.equal(unknownPayload.thinking_token_budget, 8192);
+	assert.equal(unknownPayload.max_tokens, 20480);
+
+	setContextTokens(100000);
+	const measuredPayload = await emit("before_provider_request", { payload: {} });
+	assert.equal(measuredPayload.reasoning_effort, "xhigh");
+	assert.equal(measuredPayload.thinking_token_budget, 49152);
+	assert.equal(measuredPayload.max_tokens, 65536);
 });
 
 test("imports without registering providers, then wires turn-start timing", async () => {

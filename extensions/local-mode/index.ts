@@ -346,7 +346,8 @@ function enforceLocalThinkingProfile(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): LocalQwenProfile | undefined {
-	const contextTokens = ctx.getContextUsage()?.tokens ?? 0;
+	const usage = ctx.getContextUsage();
+	const contextTokens = usage?.tokens === null ? null : usage?.tokens ?? 0;
 	const identity = autoCompactModelIdentity(ctx.model);
 	const compactionThreshold =
 		state.autoCompactPolicy.snapshotFor(identity)?.thresholdTokens;
@@ -844,9 +845,14 @@ export default function localModeExtension(
 		updateTokensPerSecond(state, ctx, event.message.usage.output, clock);
 	});
 
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (_event, ctx) => {
 		state.compactionRequested = false;
 		state.activeProfile = undefined;
+		if (state.automaticThinking && state.localOnly && ctx.model?.id === "qwen3.8-27b") {
+			state.automaticThinkingLevel = "medium";
+			applyAutomaticThinkingLevel(pi, state, ctx);
+		}
+		enforceLocalThinkingProfile(pi, state, ctx);
 	});
 
 	pi.on("session_compact_failed", () => {

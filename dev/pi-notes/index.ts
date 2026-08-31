@@ -8,6 +8,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 
 export const NOTES_STATE_TYPE = "pi-notes-state";
 export const NOTES_CHECKPOINT_TYPE = "pi-notes-checkpoint";
@@ -185,6 +186,20 @@ export function repairCheckpointArguments(args: unknown): unknown {
     repaired[fragment.field] = fragment.values;
   }
   return repaired;
+}
+
+const INVALID_CHECKPOINT_MESSAGE = [
+  "Invalid checkpoint payload.",
+  "Limits: current and next_action 1-2048 characters; each list item 1-1024 characters;",
+  "completed, findings, decisions, and verification at most 40 items;",
+  "failed_approaches and blockers at most 30 items.",
+  "Summarize the continuation state and retry.",
+].join(" ");
+
+export function prepareCheckpointArguments(args: unknown): CheckpointPayload {
+  const repaired = repairCheckpointArguments(args);
+  if (!Value.Check(CHECKPOINT_SCHEMA, repaired)) throw new Error(INVALID_CHECKPOINT_MESSAGE);
+  return repaired as CheckpointPayload;
 }
 
 function freshHarnessFacts(): HarnessFacts {
@@ -741,6 +756,7 @@ const CHECKPOINT_FIELD_GUIDANCE = [
   "verification = verification commands and outcomes only.",
   "next_action = the one next concrete action.",
   "Do not put verification in completed, repeat current in next_action, or copy deterministic working-set facts such as modified files into authored sections; the extension supplies those facts separately.",
+  "Checkpoint limits: current and next_action are 1-2048 characters; every list item is 1-1024 characters; completed, findings, decisions, and verification allow at most 40 items; failed_approaches and blockers allow at most 30. Summarize before calling checkpoint_notes rather than exceeding these limits.",
 ].join(" ");
 
 function notesPolicy(): string {
@@ -817,7 +833,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     ],
     parameters: CHECKPOINT_SCHEMA,
     prepareArguments(args) {
-      return repairCheckpointArguments(args) as CheckpointPayload;
+      return prepareCheckpointArguments(args);
     },
     executionMode: "sequential",
     async execute(_toolCallId, params) {

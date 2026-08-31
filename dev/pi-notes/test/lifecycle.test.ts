@@ -231,9 +231,7 @@ describe("session lifecycle integration", () => {
     const tooMany = Array.from({ length: 41 }, (_, index) => `completed ${index}`);
     malformed[`completed]\n${JSON.stringify(tooMany)}\n</parameter`] = "";
 
-    const prepared = h.checkpointTool.prepareArguments(malformed);
-    expect(prepared.completed).toEqual(tooMany);
-    expect(Value.Check(h.checkpointTool.parameters, prepared)).toBe(false);
+    expect(() => h.checkpointTool.prepareArguments(malformed)).toThrow(/Invalid checkpoint payload/);
 
     const arrowSplit = { ...payload } as Record<string, unknown>;
     delete arrowSplit.findings;
@@ -248,8 +246,34 @@ describe("session lifecycle integration", () => {
     const tooLong = { ...payload } as Record<string, unknown>;
     delete tooLong.findings;
     tooLong[`findings]\n${JSON.stringify(["f".repeat(1025)])}\n</parameter`] = "";
-    const preparedTooLong = h.checkpointTool.prepareArguments(tooLong);
-    expect(Value.Check(h.checkpointTool.parameters, preparedTooLong)).toBe(false);
+    expect(() => h.checkpointTool.prepareArguments(tooLong)).toThrow(/Invalid checkpoint payload/);
+  });
+
+  it("rejects an oversized current field without echoing or changing committed state", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    const committed = await h.checkpointTool.execute("cp-1", payload);
+    const notesPath = committed.details.notesPath as string;
+    const notesBefore = await readFile(notesPath, "utf8");
+    const branchLengthBefore = h.branch.length;
+    const statusBefore = await h.status();
+    const oversizedCurrent = `DO_NOT_ECHO_${"x".repeat(3580)}`;
+    expect(oversizedCurrent).toHaveLength(3592);
+
+    let failure: Error | undefined;
+    try {
+      h.checkpointTool.prepareArguments({ ...payload, current: oversizedCurrent });
+    } catch (error) {
+      failure = error as Error;
+    }
+    expect(failure?.message).toMatch(/Invalid checkpoint payload.*Summarize/s);
+    expect(failure?.message).not.toContain("DO_NOT_ECHO");
+    expect(failure?.message.length).toBeLessThan(400);
+    expect(h.branch).toHaveLength(branchLengthBefore);
+    expect(await readFile(notesPath, "utf8")).toBe(notesBefore);
+    expect(await h.status()).toBe(statusBefore);
+    expect(latestCustom(h.branch, NOTES_CHECKPOINT_TYPE).data.generation).toBe(1);
   });
 
   it("fails when authored state alone exceeds the Notes byte bound", async () => {

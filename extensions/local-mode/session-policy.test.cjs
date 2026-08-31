@@ -25,7 +25,7 @@ function context(
 	sessionName = "general-purpose#1234abcd",
 	modelId,
 	contextWindow = provider === "qwen38-main"
-		? 170000
+		? 190000
 		: provider === "qwen38-subagent"
 			? 96000
 			: 98304,
@@ -47,33 +47,47 @@ test("maps the bounded low and medium local Qwen profiles", () => {
 		thinkingLevel: "low",
 		thinkingBudget: 4096,
 		maxTokens: 12288,
-		contextWindow: 170000,
+		contextWindow: 190000,
 		requiresCompaction: false,
 	});
 	assert.deepEqual(localQwenProfile(ctx, true, "medium"), {
 		thinkingLevel: "medium",
 		thinkingBudget: 8192,
 		maxTokens: 20480,
-		contextWindow: 170000,
+		contextWindow: 190000,
 		requiresCompaction: false,
 	});
 });
 
-test("scales the main xhigh profile within the 170K window", () => {
+test("scales the main xhigh profile within the 190K window", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
 	for (const [contextTokens, thinkingBudget, maxTokens, requiresCompaction] of [
 		[0, 65536, 98304, false],
-		[99999, 57713, 61809, false],
-		[100000, 49152, 61808, false],
-		[144499, 13213, 17309, false],
-		[144500, 13212, 17308, true],
+		[99999, 65536, 81809, false],
+		[100000, 49152, 65536, false],
+		[140000, 32768, 41808, false],
+		[161499, 16213, 20309, false],
+		[161500, 16212, 20308, true],
 	]) {
-		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens, 144500), {
+		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens, 161500), {
 			thinkingLevel: "xhigh",
 			thinkingBudget,
 			maxTokens,
-			contextWindow: 170000,
+			contextWindow: 190000,
 			requiresCompaction,
+		});
+	}
+});
+
+test("uses medium budgets while post-compaction context is unknown", () => {
+	for (const provider of ["qwen38-main", "qwen38-subagent"]) {
+		const ctx = context(provider, provider === "qwen38-main" ? undefined : "/tmp/parent.jsonl", undefined, "qwen3.8-27b");
+		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", null, provider === "qwen38-main" ? 161500 : 81600), {
+			thinkingLevel: "xhigh",
+			thinkingBudget: 8192,
+			maxTokens: 20480,
+			contextWindow: provider === "qwen38-main" ? 190000 : 96000,
+			requiresCompaction: false,
 		});
 	}
 });
@@ -104,11 +118,11 @@ test("uses a smaller xhigh schedule for the 96K subagent", () => {
 
 test("clamps generation to remaining context while reserving answer space", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
-	assert.deepEqual(localQwenProfile(ctx, true, "xhigh", 160000), {
+	assert.deepEqual(localQwenProfile(ctx, true, "xhigh", 180000), {
 		thinkingLevel: "xhigh",
 		thinkingBudget: 0,
 		maxTokens: 1808,
-		contextWindow: 170000,
+		contextWindow: 190000,
 		requiresCompaction: true,
 	});
 });
@@ -137,7 +151,7 @@ test("does not invent threshold compaction when policy is unavailable", () => {
 		false,
 	);
 	assert.equal(
-		localQwenProfile(ctx, true, "medium", 160000)?.requiresCompaction,
+		localQwenProfile(ctx, true, "medium", 180000)?.requiresCompaction,
 		true,
 	);
 });
@@ -278,7 +292,7 @@ test("builds a preserved-thinking request from the dynamic profile", () => {
 			model: "qwen3.8-27b",
 			reasoning_effort: "xhigh",
 			thinking_token_budget: 49152,
-			max_tokens: 61808,
+			max_tokens: 65536,
 			chat_template_kwargs: {
 				custom_flag: true,
 				enable_thinking: true,
@@ -290,7 +304,7 @@ test("builds a preserved-thinking request from the dynamic profile", () => {
 
 test("keeps an emergency answer allowance when compaction is pending", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
-	const profile = localQwenProfile(ctx, true, "xhigh", 169000);
+	const profile = localQwenProfile(ctx, true, "xhigh", 189000);
 	assert.ok(profile);
 	const payload = buildLocalQwenRequestPayload({}, profile);
 	assert.equal(payload.max_tokens, 1024);

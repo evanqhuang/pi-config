@@ -169,7 +169,7 @@ export function localQwenProfile(
 	ctx: LocalSessionContext,
 	localOnly: boolean,
 	requestedLevel: string,
-	contextTokens = 0,
+	contextTokens: number | null = 0,
 	compactionThreshold?: number,
 ): LocalQwenProfile | undefined {
 	if (
@@ -186,6 +186,15 @@ export function localQwenProfile(
 	if (contextWindow === 0) return undefined;
 
 	const thinkingLevel = normalizeLocalQwenThinkingLevel(requestedLevel);
+	if (contextTokens === null) {
+		return {
+			thinkingLevel,
+			...FIXED_LOCAL_QWEN_PROFILES.medium,
+			contextWindow,
+			requiresCompaction: false,
+		};
+	}
+
 	const normalizedContextTokens = Math.max(0, Math.floor(contextTokens));
 	const normalizedCompactionThreshold =
 		compactionThreshold === undefined

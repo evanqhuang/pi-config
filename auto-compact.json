@@ -2,19 +2,19 @@
   "defaultThresholdTokens": 217600,
   "rules": [
     {
-      "name": "Qwen3.8 27B Main at 80%",
+      "name": "Qwen3.8 27B Main at 85%",
       "provider": "qwen38-main",
       "model": "qwen3.8-27b",
-      "thresholdTokens": 144500
+      "thresholdTokens": 161500
     },
     {
-      "name": "Qwen3.8 27B Subagent at 80%",
+      "name": "Qwen3.8 27B Subagent at 85%",
       "provider": "qwen38-subagent",
       "model": "qwen3.8-27b",
       "thresholdTokens": 81600
     },
     {
-      "name": "Qwopus3.5 9B MTP at 80%",
+      "name": "Qwopus3.5 9B MTP at 85%",
       "provider": "qwopus-subagent",
       "model": "qwopus3.5-9b-coder-mtp",
       "thresholdTokens": 83558

@@ -5,6 +5,7 @@ import {
   classifyToolResult,
   createRuntime,
   notesPathFor,
+  prepareCheckpointArguments,
   renderNotes,
   repairCheckpointArguments,
   selectReminder,
@@ -114,6 +115,28 @@ describe("checkpoint argument compatibility", () => {
 
     const repaired = repairCheckpointArguments(malformed) as Record<string, unknown>;
     expect(repaired.completed).toEqual(tooMany);
+  });
+
+  it("accepts exact field boundaries and rejects oversized payloads concisely", () => {
+    const boundary: CheckpointPayload = {
+      current: "c".repeat(2048),
+      completed: Array.from({ length: 40 }, () => "d".repeat(1024)),
+      findings: [],
+      decisions: [],
+      failed_approaches: Array.from({ length: 30 }, () => "f"),
+      blockers: [],
+      verification: [],
+      next_action: "n".repeat(2048),
+    };
+    expect(prepareCheckpointArguments(boundary)).toBe(boundary);
+
+    for (const invalid of [
+      { ...payload, current: "c".repeat(2049) },
+      { ...payload, findings: ["f".repeat(1025)] },
+      { ...payload, blockers: Array.from({ length: 31 }, () => "blocked") },
+    ]) {
+      expect(() => prepareCheckpointArguments(invalid)).toThrow(/Invalid checkpoint payload.*Summarize/s);
+    }
   });
 });
 
