@@ -661,11 +661,23 @@ async function restorePlanContext(ctx: ExtensionContext) {
 }
 
 function detectChildSession(): boolean {
+  let probe: unknown;
   try {
-    const probe = (globalThis as unknown as Record<PropertyKey, unknown>)[CHILD_CONTEXT_PROBE];
-    return typeof probe === "function" && probe() === true;
+    probe = (globalThis as unknown as Record<PropertyKey, unknown>)[CHILD_CONTEXT_PROBE];
   } catch {
-    return false;
+    // A probe that cannot be read is not evidence of a fresh parent. Fail
+    // closed so a child can never inherit unrestricted mutation tools.
+    return true;
+  }
+  // An absent probe is the only signal for a genuine fresh parent. Any other
+  // malformed value is treated as a child because the safe fallback is PLAN.
+  if (probe === undefined) return false;
+  if (typeof probe !== "function") return true;
+  try {
+    const result: unknown = probe();
+    return typeof result === "boolean" ? result : true;
+  } catch {
+    return true;
   }
 }
 
@@ -684,7 +696,9 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   // future context bridge starts through the native sandbox wrapper.
   const contextPatch = await installContextBridgeSandboxPatch();
   const state: State = {
-    mode: "YOLO",
+    // Child detection is fail-closed, so a child starts in PLAN even before
+    // the session_start hook has had a chance to apply its persisted state.
+    mode: isChild ? "PLAN" : "YOLO",
     pendingApprovalArmed: false,
     transitionPromises: new Map(),
     transitionStarted: new Set(),
@@ -836,6 +850,10 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   };
 
   const requestMode = async (mode: Mode, ctx: ExtensionContext) => {
+    if (isChild && mode !== "PLAN") {
+      notify(ctx, "Child PLAN sessions cannot activate unrestricted execution modes", "error");
+      return;
+    }
     if (!ctx.isIdle()) {
       state.pendingMode = mode;
       notify(ctx, `${mode} mode queued until the current run finishes`);
@@ -1348,7 +1366,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     state.pendingApprovalArmed = false;
     // Tree navigation re-evaluates the branch but never prompts or consumes an
     // approval. A valid pending record still forces the hard PLAN gate.
-    await apply(recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
+    await apply(isChild ? "PLAN" : recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

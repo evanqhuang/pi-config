@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveDefaultModel, runAgent } from "./agent-runner.js";
 import { getAgentSafetyPolicy, getUnavailableAgentSafetyPolicyError } from "./agent-safety-policy.js";
-import { registerAgents } from "./agent-types.js";
+import { registerAgents, resolveType } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled } from "./worktree.js";
@@ -64,7 +64,10 @@ function createService(): PiSubagentsServiceV3 {
     async runEphemeralAgent(options: EphemeralAgentOptions): Promise<EphemeralAgentResult> {
       // Refresh cards just before an evaluator run so edits do not require a Pi restart.
       registerAgents(loadCustomAgents(options.ctx.cwd, false));
-      const type = options.type as SubagentType;
+      // Safety policies are keyed by the registry's canonical card name. Resolve
+      // caller spellings before looking up policy so case variants cannot bypass
+      // an immutable verifier constraint.
+      const type = (resolveType(options.type) ?? options.type) as SubagentType;
       const policy = getAgentSafetyPolicy(type);
       const policyError = getUnavailableAgentSafetyPolicyError(type, policy, isWorktreeIsolationEnabled());
       if (policyError) throw new Error(policyError);
@@ -103,6 +106,10 @@ function createService(): PiSubagentsServiceV3 {
           model,
           thinkingLevel: options.thinkingLevel,
           disallowedTools: policy?.disallowedTools,
+          // Capture ownership as soon as runAgent creates the session. If a
+          // later await rejects, its result is never returned to this service,
+          // so the callback is the only way to ensure ephemeral cleanup runs.
+          onSessionCreated: createdSession => { session = createdSession; },
         });
         session = result.session;
         return {

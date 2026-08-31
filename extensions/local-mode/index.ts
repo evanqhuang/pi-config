@@ -65,6 +65,10 @@ interface SubagentResultInput {
 	wait?: boolean;
 }
 
+type LocalCycleEditorFactory = NonNullable<
+	ReturnType<ExtensionContext["ui"]["getEditorComponent"]>
+>;
+
 const DEFAULT_LOCAL_MODEL: LocalModelSelection = LOCAL_MODELS[0];
 const DEFAULT_LOCAL_SUBAGENT_MODEL: LocalModelSelection = {
 	provider: "qwen38-subagent",
@@ -82,6 +86,7 @@ interface LocalModeState {
 	generationStartedAt?: number;
 	tokensPerSecond?: number;
 	localCycleEditorInstalled: boolean;
+	localCycleEditorFactory?: LocalCycleEditorFactory;
 	previousModel?: Model<Api>;
 	previousThinkingLevel?: ThinkingLevel;
 	previousTheme?: Theme;
@@ -460,10 +465,10 @@ export function normalizeLocalModelCycleInput(data: string): string {
 }
 
 function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: ExtensionContext): void {
-	if (state.localCycleEditorInstalled) return;
-
 	const previousFactory = ctx.ui.getEditorComponent();
-	ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+	if (state.localCycleEditorInstalled && state.localCycleEditorFactory === previousFactory) return;
+
+	const wrapperFactory: LocalCycleEditorFactory = (tui, theme, keybindings) => {
 		const editor = previousFactory
 			? previousFactory(tui, theme, keybindings)
 			: new CustomEditor(tui, theme, keybindings);
@@ -481,7 +486,9 @@ function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: E
 			handleInput(normalizedData);
 		};
 		return editor;
-	});
+	};
+	ctx.ui.setEditorComponent(wrapperFactory);
+	state.localCycleEditorFactory = wrapperFactory;
 	state.localCycleEditorInstalled = true;
 }
 

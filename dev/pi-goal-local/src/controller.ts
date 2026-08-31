@@ -75,6 +75,7 @@ export class GoalController {
   private pendingWake: PendingWake | undefined;
   private treeGoalCarry: TreeGoalCarry | undefined;
   private navigationPending = false;
+  private navigationGeneration = 0;
   private evaluatorAbort: AbortController | undefined;
 
   constructor(private readonly pi: ExtensionAPI) {}
@@ -153,6 +154,23 @@ export class GoalController {
     this.evaluatorAbort?.abort();
     this.invalidatePendingWake();
     this.evaluationQueued = false;
+  }
+
+  private clearNavigationPending(): void {
+    this.navigationGeneration += 1;
+    this.navigationPending = false;
+  }
+
+  private deferNavigationFallback(): void {
+    const generation = ++this.navigationGeneration;
+    // The host has no completion callback for a canceled or failed navigation.
+    // Keep the guard through this lifecycle callback, then release it so an
+    // operation that never reaches restore cannot leave the controller wedged.
+    queueMicrotask(() => {
+      // A successful navigation or shutdown owns the lifecycle transition and
+      // may have already changed this state. Never let this fallback undo it.
+      if (generation === this.navigationGeneration) this.navigationPending = false;
+    });
   }
 
   private refreshEvaluationState(ctx: ExtensionContext, epoch: number, current: GoalStateV1): boolean {
@@ -249,7 +267,7 @@ export class GoalController {
   restore(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
-    this.navigationPending = false;
+    this.clearNavigationPending();
     this.syncBranch(ctx);
     if (this.state?.status !== "active") return;
     this.transition("paused", "Paused when the session was reopened.");
@@ -259,7 +277,7 @@ export class GoalController {
     this.invalidatePendingEvaluation();
     const carry = this.treeGoalCarry;
     this.treeGoalCarry = undefined;
-    this.navigationPending = false;
+    this.clearNavigationPending();
     this.syncBranch(ctx);
 
     const branchHasGoalMarker = ctx.sessionManager.getBranch().some(
@@ -291,11 +309,13 @@ export class GoalController {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
     this.navigationPending = true;
+    this.deferNavigationFallback();
   }
 
   prepareForTreeNavigation(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
     this.navigationPending = true;
+    this.deferNavigationFallback();
     const goal = this.branchState(ctx);
     this.treeGoalCarry = goal?.status === "active"
       ? { sessionId: ctx.sessionManager.getSessionId(), goal: { ...goal } }
@@ -305,6 +325,7 @@ export class GoalController {
   shutdown(): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
+    this.navigationGeneration += 1;
     this.navigationPending = true;
     this.evaluatorAbort = undefined;
     this.ctx = undefined;

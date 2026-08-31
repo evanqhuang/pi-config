@@ -13,6 +13,8 @@ export interface AutoCompactModelIdentity {
 export interface AutoCompactPolicySnapshot {
 	protocolVersion: 1;
 	model: AutoCompactModelIdentity;
+	/** Echoed from the request so responses can be ordered across model changes. */
+	requestId?: string;
 	thresholdTokens: number;
 	source: string;
 	configPath: string;
@@ -62,6 +64,7 @@ export function parseAutoCompactPolicySnapshot(
 		(value.thresholdTokens as number) < 0 ||
 		typeof value.source !== "string" ||
 		typeof value.configPath !== "string" ||
+		(value.requestId !== undefined && typeof value.requestId !== "string") ||
 		(value.configError !== undefined && typeof value.configError !== "string")
 	) {
 		return undefined;
@@ -74,6 +77,7 @@ export function parseAutoCompactPolicySnapshot(
 			provider: value.model.provider,
 			id: value.model.id,
 		},
+		...(typeof value.requestId === "string" ? { requestId: value.requestId } : {}),
 		thresholdTokens: value.thresholdTokens as number,
 		source: value.source,
 		configPath: value.configPath,
@@ -93,10 +97,12 @@ export interface AutoCompactPolicyClient {
 	): AutoCompactPolicySnapshot | undefined;
 }
 
+let nextAutoCompactRequestId = 0;
+
 export function createAutoCompactPolicyClient(
 	events: PolicyEvents,
 ): AutoCompactPolicyClient {
-	const requestedKeys = new Set<string>();
+	const requestedIds = new Map<string, string>();
 	const snapshots = new Map<string, AutoCompactPolicySnapshot>();
 	let unsubscribe: Unsubscribe | undefined;
 
@@ -107,25 +113,29 @@ export function createAutoCompactPolicyClient(
 				const snapshot = parseAutoCompactPolicySnapshot(value);
 				if (!snapshot) return;
 				const key = autoCompactModelKey(snapshot.model);
-				if (!requestedKeys.has(key)) return;
+				// A response without the request ID cannot be safely associated with the
+				// current request: it may have been delayed across clear/model changes.
+				if (!snapshot.requestId || requestedIds.get(key) !== snapshot.requestId) return;
 				snapshots.set(key, snapshot);
 			});
 		},
 		stop() {
 			unsubscribe?.();
 			unsubscribe = undefined;
-			requestedKeys.clear();
+			requestedIds.clear();
 			snapshots.clear();
 		},
 		clear() {
-			requestedKeys.clear();
+			requestedIds.clear();
 			snapshots.clear();
 		},
 		request(model) {
 			const key = autoCompactModelKey(model);
-			requestedKeys.add(key);
+			const requestId = `local-mode-${++nextAutoCompactRequestId}`;
+			requestedIds.set(key, requestId);
 			events.emit(AUTO_COMPACT_POLICY_REQUEST_EVENT, {
 				protocolVersion: 1,
+				requestId,
 				model,
 			});
 		},

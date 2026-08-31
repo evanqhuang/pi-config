@@ -859,20 +859,33 @@ test("session tree restores branch-local mode and managed plan context", async (
   await pi.handlers.get("session_shutdown")({}, ctx);
 });
 
-test("malformed child probe safely defaults to the YOLO contract", async (t) => {
+test("malformed and throwing child probes fail closed while an absent probe preserves fresh-parent YOLO", async (t) => {
   isolatedEnvironment(t);
   const key = Symbol.for("pi-subagents:child-context:v1");
   const registry = globalThis;
   const previous = registry[key];
-  registry[key] = { malformed: true };
   try {
-    const pi = mockPi();
-    await registerPlanMode(pi);
-    const ctx = mockContext([], undefined);
-    await pi.handlers.get("session_start")({}, ctx);
-    assert.deepEqual(pi.active, [...pi.tools.keys()]);
-    assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
-    await pi.handlers.get("session_shutdown")({}, ctx);
+    for (const probe of [{ malformed: true }, () => { throw new Error("probe unavailable"); }]) {
+      registry[key] = probe;
+      const pi = mockPi();
+      await registerPlanMode(pi);
+      const ctx = mockContext([], undefined);
+      await pi.handlers.get("session_start")({}, ctx);
+      assert.equal(pi.active.includes("write"), false);
+      assert.match((await pi.handlers.get("before_agent_start")({ systemPrompt: "base" })).systemPrompt, /child planning agent/);
+      await pi.commands.get("yolo").handler(undefined, ctx);
+      assert.equal(pi.active.includes("write"), false, "a child cannot switch into YOLO after a probe failure");
+      await pi.handlers.get("session_shutdown")({}, ctx);
+    }
+
+    delete registry[key];
+    const parentPi = mockPi();
+    await registerPlanMode(parentPi);
+    const parentCtx = mockContext([], undefined);
+    await parentPi.handlers.get("session_start")({}, parentCtx);
+    assert.deepEqual(parentPi.active, [...parentPi.tools.keys()]);
+    assert.equal(await parentPi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
+    await parentPi.handlers.get("session_shutdown")({}, parentCtx);
   } finally {
     if (previous === undefined) delete registry[key];
     else registry[key] = previous;

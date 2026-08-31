@@ -373,6 +373,31 @@ describe("goal controller lifecycle guards", () => {
     expect(continueMessages(pi)).toHaveLength(0);
   });
 
+  it.each([
+    ["canceled session navigation", "session"],
+    ["failed tree navigation", "tree"],
+  ] as const)("recovers lifecycle work after %s", async (_label, kind) => {
+    vi.useFakeTimers();
+    const { controller, ctx, pi, setBranch } = harness();
+    setBranch([{ type: "custom", customType: GOAL_STATE_TYPE, data: activeGoal() }]);
+    controller.refresh(ctx);
+
+    if (kind === "session") controller.prepareForNavigation();
+    else controller.prepareForTreeNavigation(ctx);
+
+    // No completion event is emitted for a canceled/failed navigation. The
+    // fallback must release the guard on the next lifecycle turn.
+    await Promise.resolve();
+    controller.scheduleSubagentWake();
+    vi.advanceTimersByTime(250);
+    expect(pi.sendMessage.mock.calls.filter(
+      ([message]: any[]) => message.customType === GOAL_SUBAGENT_UPDATE_MESSAGE,
+    )).toHaveLength(1);
+
+    controller.requestEvaluation(ctx);
+    expect(subagents.runEvaluator).toHaveBeenCalledTimes(1);
+  });
+
   it("uses the complete branch path when leaf ids are unavailable", () => {
     vi.useFakeTimers();
     const { controller, ctx, pi, setBranch, setIdle } = harness();

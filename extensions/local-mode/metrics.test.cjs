@@ -50,6 +50,7 @@ function fixture() {
 	let model;
 	let thinkingLevel = "medium";
 	let status;
+	let editorFactory;
 	const handlers = new Map();
 	const events = eventBus();
 	const pi = {
@@ -101,8 +102,10 @@ function fixture() {
 			setWorkingIndicator() {},
 			getTheme: () => undefined,
 			setTheme() {},
-			getEditorComponent: () => undefined,
-			setEditorComponent() {},
+			getEditorComponent: () => editorFactory,
+			setEditorComponent(factory) {
+				editorFactory = factory;
+			},
 			notify() {},
 		},
 		compact() {},
@@ -139,6 +142,31 @@ test("calculates valid speed and rejects invalid inputs", () => {
 	]) {
 		assert.equal(calculateTokensPerSecond(tokens, elapsed), undefined);
 	}
+});
+
+test("reinstalls the cycle wrapper after a disabled editor replacement", async () => {
+	const { pi, ctx } = fixture();
+	const firstInputs = [];
+	const firstFactory = () => ({ handleInput: (data) => firstInputs.push(data) });
+	ctx.ui.setEditorComponent(firstFactory);
+	localModeExtension(pi, () => 1000);
+
+	await pi.commands.get("local").handler("on", ctx);
+	await pi.commands.get("local").handler("off", ctx);
+
+	const replacementInputs = [];
+	const replacementFactory = () => ({
+		handleInput: (data) => replacementInputs.push(data),
+	});
+	ctx.ui.setEditorComponent(replacementFactory);
+	await pi.commands.get("local").handler("on", ctx);
+
+	const wrapperFactory = ctx.ui.getEditorComponent();
+	assert.notEqual(wrapperFactory, replacementFactory);
+	const editor = wrapperFactory({}, {}, { matches: () => false });
+	editor.handleInput("ordinary input");
+	assert.deepEqual(replacementInputs, ["ordinary input"]);
+	assert.deepEqual(firstInputs, []);
 });
 
 test("commits only successful repetition output for full-turn throughput", async () => {
