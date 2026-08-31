@@ -3,7 +3,6 @@ import {
   createPlanBridge,
   PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL,
   PLAN_MODE_BRIDGE_VERSION,
-  PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL,
   type ApprovedPlanBridgeResult,
 } from "../src/plan-bridge.js";
 
@@ -65,24 +64,20 @@ describe("goal-local pi-plan-mode bridge", () => {
     bridge.dispose();
   });
 
-  it("carries PREWALK requirements and de-duplicates notifications", () => {
+  it("preserves PREWALK requirements in explicit approved-plan queries", async () => {
     const bus = fakeBus();
     const bridge = createPlanBridge(bus, 10);
-    const received: ApprovedPlanBridgeResult[] = [];
-    const unsubscribe = bridge.onImplementationStarted(result => received.push(result));
-    const event = {
-      version: PLAN_MODE_BRIDGE_VERSION,
-      ...prewalkPlan,
-      transitionId: "transition-1",
-    };
-    bus.emit(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, event);
-    bus.emit(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, event);
-    expect(received).toEqual([prewalkPlan]);
-    unsubscribe();
-    bus.emit(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, { ...event, transitionId: "transition-2" });
-    expect(received).toHaveLength(1);
+    bus.on(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL, request => {
+      const requestId = (request as { requestId: string }).requestId;
+      bus.emit(`${PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL}:reply:${requestId}`, {
+        version: PLAN_MODE_BRIDGE_VERSION,
+        requestId,
+        result: prewalkPlan,
+      });
+    });
+
+    await expect(bridge.queryApprovedPlan()).resolves.toEqual(prewalkPlan);
     bridge.dispose();
-    expect(bus.listenerCount(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL)).toBe(0);
   });
 
   it("fails closed on malformed or absent replies and settles a query on disposal", async () => {

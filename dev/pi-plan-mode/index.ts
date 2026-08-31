@@ -86,7 +86,6 @@ type ApprovalAction = "yolo-direct" | "yolo-compact" | "orchestrator-direct" | "
 /** Versioned cross-extension bridge for the explicit plan approval boundary. */
 export const PLAN_MODE_BRIDGE_VERSION = 1 as const;
 export const PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL = "pi-plan-mode:approved-plan-query-v1" as const;
-export const PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL = "pi-plan-mode:implementation-started-v1" as const;
 export type PlanModeApprovalAction = ApprovalAction;
 export type PlanModeExecutionStrategy = ParentRecommendation;
 export interface PlanModeBridgePlan {
@@ -165,7 +164,6 @@ type State = {
   pendingApprovalArmed: boolean;
   transitionPromises: Map<string, Promise<void>>;
   transitionStarted: Set<string>;
-  implementationStarted: Set<string>;
   compactionCallbacks: Set<string>;
   allTools: string[];
   sandboxed: boolean;
@@ -760,7 +758,6 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     pendingApprovalArmed: false,
     transitionPromises: new Map(),
     transitionStarted: new Set(),
-    implementationStarted: new Set(),
     compactionCallbacks: new Set(),
     allTools: [],
     sandboxed: false,
@@ -960,23 +957,11 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     await requestMode(requested.toUpperCase() as Mode, ctx);
   };
 
-  const notifyImplementationStarted = (pending: PendingApproval) => {
-    const key = approvalTransitionKey(pending);
-    if (state.implementationStarted.has(key)) return;
-    state.implementationStarted.add(key);
-    eventBus?.emit(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, {
-      version: PLAN_MODE_BRIDGE_VERSION,
-      ...bridgePlanForAction(pending.planPath, pending.action),
-      ...(pending.transitionId ? { transitionId: pending.transitionId } : {}),
-    });
-  };
-
   const startImplementation = async (pending: PendingApproval, ctx: ExtensionContext, mode: Exclude<Mode, "PLAN">) => {
     await apply(mode, ctx);
     const history = pending.transcriptPath
-      ? ` A snapshot of the full pre-compaction chat history is available at ${pending.transcriptPath} if details are needed.`
+      ? ` A snapshot of the planning chat is available at ${pending.transcriptPath} if details are needed.`
       : "";
-    notifyImplementationStarted(pending);
     pi.sendUserMessage(`Implement the approved plan saved at ${pending.planPath} in ${mode} mode.${history}`);
   };
 
@@ -987,7 +972,6 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       : "";
     const task = `Implement the approved plan below. The durable plan is at ${pending.planPath}.${history}\n\n${pending.plan}\n`;
     notify(ctx, "PREWALK started; this session will wait and report its result");
-    notifyImplementationStarted(pending);
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
       const child = spawn(launcher, ["--prompt-stdin"], { cwd: ctx.cwd, stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "";

@@ -379,29 +379,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let shutDown = false;
   const eventUnsubscribers: Array<() => void> = [];
 
-  const dispatchApprovedPlan = (plan: GoalPlanBridgeResult, target?: ExtensionContext): void => {
-    const initial = target ?? ctx;
-    if (!initial || shutDown) return;
-    const selection = selectionOf(initial);
-    if (!selection || plan.sourceKind !== "approved" || shutDown) return;
-    void (async () => {
-      // A plan transition can settle while the user navigates. Do not let it
-      // install a loop on another selected branch or session.
-      const current = ctx;
-      if (!current || !sameSelection(current, selection)) return;
-      try {
-        const state = await startResolvedLoop(controller, current, plan, "Implement the approved plan.", []);
-        if (!shutDown && ctx && sameSelection(ctx, selection)) notifyLoopStart(ctx, state);
-      } catch (error) {
-        if (!shutDown && ctx && sameSelection(ctx, selection) && ctx.hasUI) {
-          ctx.ui.notify(`Approved plan could not start a goal loop: ${error instanceof Error ? error.message : String(error)}`, "error");
-        }
-      }
-    })();
-  };
-
-  bridge.onImplementationStarted(plan => dispatchApprovedPlan(plan));
-
   pi.on("session_start", (_event, nextCtx) => {
     if (shutDown) return;
     ctx = nextCtx;

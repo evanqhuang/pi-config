@@ -20,7 +20,7 @@ The startup flags `--goal-loop`, `--goal-plan <path>`, and `--goal-max-cycles <n
 
 V1 goals retain their existing behavior and format. Only an active V2 loop (`implementing`, `verifying`, or `replanning`) changes provider context: the `context` hook retains the latest valid loop epoch marker and complete current tool traffic. V1 goals, ordinary/non-loop `/goal` commands, paused loops, and terminal loops are not filtered.
 
-`/goal status` for a loop includes its loop ID, generation, correction cycle/max, context epoch, phase, and the latest bounded reason. Plan-mode approval actions also dispatch the approved plan into a goal loop with their approved YOLO, ORCHESTRATOR, or PREWALK strategy; the goal controller does not silently substitute another strategy.
+`/goal status` for a loop includes its loop ID, generation, correction cycle/max, context epoch, phase, and the latest bounded reason. Goal loops are strictly opt-in: plan approval and PLAN, YOLO, ORCHESTRATOR, or PREWALK transitions never start one. An explicit `/goal ... --loop` command may resolve the latest approved plan and preserves its approved YOLO, ORCHESTRATOR, or PREWALK strategy; the goal controller does not silently substitute another strategy.
 
 ## Artifacts and recovery
 

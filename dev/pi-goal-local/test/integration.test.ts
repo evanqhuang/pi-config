@@ -154,6 +154,26 @@ function integrationHarness() {
 type Message = ContextEvent["messages"][number];
 
 describe("goal extension provider integration", () => {
+  it("does not activate a goal from plan or mode transition events", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+
+    harness.pi.events.emit("pi-plan-mode:implementation-started-v1", {
+      version: 1,
+      sourceKind: "approved",
+      sourcePath: "/agent/plans/approved/plan.md",
+      planPath: "/agent/plans/approved/plan.md",
+      action: "yolo-direct",
+      strategy: "YOLO",
+      transitionId: "transition-1",
+    });
+    await Promise.resolve();
+
+    expect(harness.branch.some(entry => entry.customType === GOAL_STATE_V2_TYPE)).toBe(false);
+    expect(harness.sentMessages).toEqual([]);
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+  });
+
   it("filters an active V2 epoch without old traffic and keeps the selected session stable", async () => {
     const harness = integrationHarness();
     await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);

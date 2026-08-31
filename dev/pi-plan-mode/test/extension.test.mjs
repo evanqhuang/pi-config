@@ -12,7 +12,6 @@ const jiti = createJiti(join(planModeRoot, "index.ts"));
 const {
   default: registerPlanMode,
   PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL,
-  PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL,
   PLAN_MODE_BRIDGE_VERSION,
 } = await jiti.import(join(planModeRoot, "index.ts"));
 
@@ -240,7 +239,7 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.equal(pi.entries.at(-1).customType, "pi-plan-mode-state");
   assert.equal(pi.entries.at(-1).data.mode, "YOLO");
   assert.match(pi.sentMessages.at(-1), /Implement the approved plan/);
-  assert.match(pi.sentMessages.at(-1), /full pre-compaction chat history/);
+  assert.match(pi.sentMessages.at(-1), /snapshot of the planning chat/);
 
   await pi.commands.get("plan").handler(undefined, ctx);
   const compactPath = await createDraft("# Compact plan\n\n1. Preserve it.");
@@ -1186,7 +1185,7 @@ test("child PLAN captures the global probe and cannot own plan approval", async 
   }
 });
 
-test("versioned bridge exposes only approved canonical plans and emits implementation-started once", async (t) => {
+test("versioned bridge exposes only approved canonical plans without activating goals", async (t) => {
   if (process.platform !== "darwin" && process.platform !== "linux") {
     t.skip("native sandbox is only supported on macOS/Linux");
     return;
@@ -1202,11 +1201,6 @@ test("versioned bridge exposes only approved canonical plans and emits implement
   const draft = await draftTool.execute("bridge-draft", { action: "create", plan: "# Bridge plan\\n\\n1. Implement it." }, undefined, undefined, ctx);
   assert.equal((await queryBridge(pi, "draft-query")).result, null);
 
-  const started = [];
-  const order = [];
-  const unsubscribeStarted = pi.events.on(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, (event) => { started.push(event); order.push("started"); });
-  const sendUserMessage = pi.sendUserMessage;
-  pi.sendUserMessage = (message) => { order.push("kickoff"); sendUserMessage.call(pi, message); };
   ctx.selections.push("Implement with YOLO");
   await approvalTool.execute("bridge-approval", { planPath: draft.details.planPath }, undefined, undefined, ctx);
 
@@ -1214,22 +1208,16 @@ test("versioned bridge exposes only approved canonical plans and emits implement
   assert.deepEqual(pending.result, { planPath: draft.details.planPath, action: "yolo-direct", strategy: "YOLO" });
   assert.equal(Object.hasOwn(pending.result, "plan"), false, "bridge never exposes plan contents");
   await pi.handlers.get("agent_settled")({}, ctx);
-  assert.deepEqual(order, ["started", "kickoff"]);
-  assert.equal(started.length, 1);
-  assert.equal(started[0].version, PLAN_MODE_BRIDGE_VERSION);
-  assert.equal(started[0].planPath, draft.details.planPath);
+  assert.match(pi.sentMessages.at(-1), /Implement the approved plan/);
   const transitionIndex = pi.entries.findIndex((entry) => entry.customType === "pi-plan-mode-plan-context" && entry.data.status === "transition-started");
   assert.ok(transitionIndex >= 0);
   await pi.handlers.get("agent_settled")({}, ctx);
-  assert.equal(started.length, 1, "duplicate settlement does not re-emit implementation-started");
 
   await pi.commands.get("plan").handler(undefined, ctx);
   const revised = await draftTool.execute("bridge-revised", { action: "create", plan: "# Revised only" }, undefined, undefined, ctx);
   ctx.selections.push("Request revisions…");
   await approvalTool.execute("bridge-revision", { planPath: revised.details.planPath }, undefined, undefined, ctx);
   assert.equal((await queryBridge(pi, "revised-query")).result, null);
-  unsubscribeStarted();
   await pi.handlers.get("session_shutdown")({}, ctx);
   assert.equal(pi.eventListeners.get(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL)?.size ?? 0, 0);
-  assert.equal(pi.eventListeners.get(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL)?.size ?? 0, 0);
 });

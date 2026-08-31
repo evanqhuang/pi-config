@@ -6,7 +6,6 @@ import type { GoalLoopStrategy } from "./types.js";
 /** Versioned cross-extension contract shared with pi-plan-mode. */
 export const PLAN_MODE_BRIDGE_VERSION = 1 as const;
 export const PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL = "pi-plan-mode:approved-plan-query-v1" as const;
-export const PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL = "pi-plan-mode:implementation-started-v1" as const;
 
 export type PlanModeApprovalAction =
   | "yolo-direct"
@@ -34,21 +33,15 @@ export interface ExplicitPlanBridgeResult {
 }
 
 export type GoalPlanBridgeResult = ApprovedPlanBridgeResult | ExplicitPlanBridgeResult;
-export type ImplementationStartedListener = (result: ApprovedPlanBridgeResult) => void;
 
 export interface PlanBridge {
   /** Query the latest explicit approval, if plan-mode has one on its active branch. */
   queryApprovedPlan(): Promise<ApprovedPlanBridgeResult | undefined>;
   /** Resolve plan source precedence without inspecting plan-mode private state. */
   resolvePlan(options?: { explicitPlanPath?: string }): Promise<GoalPlanBridgeResult | undefined>;
-  /** Listen for a later approval transition; duplicate notifications are ignored. */
-  onImplementationStarted(listener: ImplementationStartedListener): () => void;
-  /** Remove all event-bus listeners and settle pending queries as no result. */
+  /** Settle pending queries as no result and release their reply listeners. */
   dispose(): void;
 }
-
-const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
-const TRANSITION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -75,7 +68,7 @@ function isSafeCanonicalPlanPath(value: unknown): value is string {
     && isAbsolute(value);
 }
 
-function parsePlan(value: unknown, allowTransitionId: boolean): (ApprovedPlanBridgeResult & { transitionId?: string }) | undefined {
+function parsePlan(value: unknown): ApprovedPlanBridgeResult | undefined {
   if (!isRecord(value)
     || !isSafeCanonicalPlanPath(value.planPath)
     || !isApprovalAction(value.action)) return undefined;
@@ -83,7 +76,7 @@ function parsePlan(value: unknown, allowTransitionId: boolean): (ApprovedPlanBri
   if (value.strategy !== strategy) return undefined;
   if (value.version !== undefined && value.version !== PLAN_MODE_BRIDGE_VERSION) return undefined;
   const keys = Object.keys(value);
-  const allowed = new Set(["version", "sourceKind", "sourcePath", "planPath", "action", "strategy", "prewalk", ...(allowTransitionId ? ["transitionId"] : [])]);
+  const allowed = new Set(["version", "sourceKind", "sourcePath", "planPath", "action", "strategy", "prewalk"]);
   if (keys.some(key => !allowed.has(key))) return undefined;
   if (value.sourceKind !== undefined && value.sourceKind !== "approved") return undefined;
   if (value.sourcePath !== undefined && value.sourcePath !== value.planPath) return undefined;
@@ -91,8 +84,6 @@ function parsePlan(value: unknown, allowTransitionId: boolean): (ApprovedPlanBri
     && (!isRecord(value.prewalk) || value.prewalk.required !== true || Object.keys(value.prewalk).some(key => key !== "required"))) return undefined;
   if (value.action === "prewalk" && (!isRecord(value.prewalk) || value.prewalk.required !== true)) return undefined;
   if (value.action !== "prewalk" && value.prewalk !== undefined) return undefined;
-  if (value.transitionId !== undefined
-    && (!allowTransitionId || typeof value.transitionId !== "string" || !TRANSITION_ID_PATTERN.test(value.transitionId))) return undefined;
   return {
     sourceKind: "approved",
     sourcePath: value.planPath,
@@ -100,7 +91,6 @@ function parsePlan(value: unknown, allowTransitionId: boolean): (ApprovedPlanBri
     action: value.action,
     strategy,
     ...(value.prewalk === undefined ? {} : { prewalk: { required: true } }),
-    ...(typeof value.transitionId === "string" ? { transitionId: value.transitionId } : {}),
   };
 }
 
@@ -108,12 +98,7 @@ function parseReply(raw: unknown, requestId: string): ApprovedPlanBridgeResult |
   if (!isRecord(raw) || raw.version !== PLAN_MODE_BRIDGE_VERSION || raw.requestId !== requestId) return undefined;
   if (!("result" in raw)) return undefined;
   if (raw.result === null) return null;
-  return parsePlan(raw.result, false);
-}
-
-function parseStarted(raw: unknown): (ApprovedPlanBridgeResult & { transitionId?: string }) | undefined {
-  if (!isRecord(raw) || raw.version !== PLAN_MODE_BRIDGE_VERSION) return undefined;
-  return parsePlan(raw, true);
+  return parsePlan(raw.result);
 }
 
 /**
@@ -125,8 +110,6 @@ export function createPlanBridge(events: EventBus, timeoutMs = 100): PlanBridge 
   let disposed = false;
   const subscriptions = new Set<() => void>();
   const pendingQueries = new Set<() => void>();
-  const startedListeners = new Set<ImplementationStartedListener>();
-  const seenStarted = new Set<string>();
 
   const queryApprovedPlan = (): Promise<ApprovedPlanBridgeResult | undefined> => {
     if (disposed) return Promise.resolve(undefined);
@@ -166,32 +149,6 @@ export function createPlanBridge(events: EventBus, timeoutMs = 100): PlanBridge 
     });
   };
 
-  const onImplementationStarted = (listener: ImplementationStartedListener): (() => void) => {
-    if (disposed) return () => {};
-    startedListeners.add(listener);
-    return () => startedListeners.delete(listener);
-  };
-
-  const startedUnsubscribe = events.on(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, raw => {
-    const parsed = parseStarted(raw);
-    if (!parsed) return;
-    const key = parsed.transitionId ?? `${parsed.planPath}:${parsed.action}`;
-    if (seenStarted.has(key)) return;
-    seenStarted.add(key);
-    const result: ApprovedPlanBridgeResult = {
-      sourceKind: parsed.sourceKind,
-      sourcePath: parsed.sourcePath,
-      planPath: parsed.planPath,
-      action: parsed.action,
-      strategy: parsed.strategy,
-      ...(parsed.prewalk ? { prewalk: parsed.prewalk } : {}),
-    };
-    for (const listener of [...startedListeners]) {
-      try { listener(result); } catch { /* one consumer cannot break the bridge */ }
-    }
-  });
-  if (typeof startedUnsubscribe === "function") subscriptions.add(startedUnsubscribe);
-
   return {
     queryApprovedPlan,
     async resolvePlan(options = {}) {
@@ -199,7 +156,6 @@ export function createPlanBridge(events: EventBus, timeoutMs = 100): PlanBridge 
       if (explicit) return { sourceKind: "explicit", sourcePath: explicit, planPath: explicit };
       return queryApprovedPlan();
     },
-    onImplementationStarted,
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -208,8 +164,6 @@ export function createPlanBridge(events: EventBus, timeoutMs = 100): PlanBridge 
         try { unsubscribe(); } catch {}
       }
       subscriptions.clear();
-      startedListeners.clear();
-      seenStarted.clear();
     },
   };
 }

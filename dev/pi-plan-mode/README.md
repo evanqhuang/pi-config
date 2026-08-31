@@ -32,7 +32,7 @@ A typical substantial task therefore flows from three parallel explorers, throug
 
 ## Goal-loop bridge
 
-The extension exposes a version-1 `pi.events` bridge for `pi-goal-local`: `pi-plan-mode:approved-plan-query-v1` replies on a request-scoped `:reply:<requestId>` channel with only the current canonical managed `planPath`, explicit approval `action`, selected `strategy`, and PREWALK-required metadata when applicable. A null result is returned for drafts, revisions, recommendations, failed/stale/cancelled approvals, symlinked paths, and malformed records. `pi-plan-mode:implementation-started-v1` is emitted once, after the durable `transition-started` entry and immediately before direct/compacted implementation or PREWALK kickoff. Consumers must use the typed goal-local bridge and dispose it on shutdown; PREWALK metadata is retained so corrective loops cannot silently switch strategy.
+The extension exposes a version-1 request/reply bridge for explicit goal commands: `pi-plan-mode:approved-plan-query-v1` replies on a request-scoped `:reply:<requestId>` channel with only the current canonical managed `planPath`, explicit approval `action`, selected `strategy`, and PREWALK-required metadata when applicable. A null result is returned for drafts, revisions, recommendations, failed/stale/cancelled approvals, symlinked paths, and malformed records. Plan approval and mode transitions never activate a goal loop; `pi-goal-local` consumes approved plan metadata only after an explicit `/goal ... --loop` command. Consumers must use the typed bridge and dispose it on shutdown; PREWALK metadata is retained so corrective loops cannot silently switch strategy.
 
 ## Lifecycle and security model
 
