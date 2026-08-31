@@ -88,6 +88,22 @@ test("requests policy and caches only a matching requested model", () => {
 	assert.deepEqual(client.snapshotFor(main), snapshot(main, 136000, request.value.requestId));
 });
 
+test("accepts synchronous legacy responses but rejects delayed ones", () => {
+	const events = eventBus();
+	const client = createAutoCompactPolicyClient(events);
+	events.on(AUTO_COMPACT_POLICY_REQUEST_EVENT, (request) => {
+		events.emit(AUTO_COMPACT_POLICY_EVENT, snapshot(request.model, 136000));
+	});
+	client.start();
+	client.request(main);
+	assert.equal(client.snapshotFor(main)?.thresholdTokens, 136000);
+
+	// Once the request stack has returned, an uncorrelated legacy response may
+	// have come from an earlier request and must not overwrite the snapshot.
+	events.emit(AUTO_COMPACT_POLICY_EVENT, snapshot(main, 120000));
+	assert.equal(client.snapshotFor(main)?.thresholdTokens, 136000);
+});
+
 test("clear drops stale snapshots and permits a replacement request", () => {
 	const events = eventBus();
 	const client = createAutoCompactPolicyClient(events);

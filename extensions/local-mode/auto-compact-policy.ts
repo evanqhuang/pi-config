@@ -103,6 +103,7 @@ export function createAutoCompactPolicyClient(
 	events: PolicyEvents,
 ): AutoCompactPolicyClient {
 	const requestedIds = new Map<string, string>();
+	const legacyResponseKeys = new Set<string>();
 	const snapshots = new Map<string, AutoCompactPolicySnapshot>();
 	let unsubscribe: Unsubscribe | undefined;
 
@@ -113,9 +114,14 @@ export function createAutoCompactPolicyClient(
 				const snapshot = parseAutoCompactPolicySnapshot(value);
 				if (!snapshot) return;
 				const key = autoCompactModelKey(snapshot.model);
-				// A response without the request ID cannot be safely associated with the
-				// current request: it may have been delayed across clear/model changes.
-				if (!snapshot.requestId || requestedIds.get(key) !== snapshot.requestId) return;
+				if (snapshot.requestId) {
+					if (requestedIds.get(key) !== snapshot.requestId) return;
+				} else if (!legacyResponseKeys.has(key)) {
+					// Legacy responders do not echo request IDs. They are only safe to
+					// accept while synchronously handling this request; delayed legacy
+					// responses may belong to an earlier request for the same model.
+					return;
+				}
 				snapshots.set(key, snapshot);
 			});
 		},
@@ -123,21 +129,28 @@ export function createAutoCompactPolicyClient(
 			unsubscribe?.();
 			unsubscribe = undefined;
 			requestedIds.clear();
+			legacyResponseKeys.clear();
 			snapshots.clear();
 		},
 		clear() {
 			requestedIds.clear();
+			legacyResponseKeys.clear();
 			snapshots.clear();
 		},
 		request(model) {
 			const key = autoCompactModelKey(model);
 			const requestId = `local-mode-${++nextAutoCompactRequestId}`;
 			requestedIds.set(key, requestId);
-			events.emit(AUTO_COMPACT_POLICY_REQUEST_EVENT, {
-				protocolVersion: 1,
-				requestId,
-				model,
-			});
+			legacyResponseKeys.add(key);
+			try {
+				events.emit(AUTO_COMPACT_POLICY_REQUEST_EVENT, {
+					protocolVersion: 1,
+					requestId,
+					model,
+				});
+			} finally {
+				legacyResponseKeys.delete(key);
+			}
 		},
 		snapshotFor(model) {
 			return model ? snapshots.get(autoCompactModelKey(model)) : undefined;
