@@ -1,14 +1,24 @@
 import { createHash } from "node:crypto";
 
-/** The non-terminal explanation returned when a repeated action is blocked. */
+/** The non-terminal explanation returned when a repeated action is first blocked. */
 export const TOOL_LOOP_GUARD_REASON =
-  "This tool action has produced the same result twice. Change approach or summarize your findings.";
+  "This tool action has produced the same result twice. The tool budget is exhausted; provide your final answer without calling any tools.";
+
+/** User-level recovery instruction queued after the first blocked retry. */
+export const TOOL_LOOP_GUARD_RECOVERY_STEER =
+  "The tool budget is exhausted because the same action produced the same result repeatedly. Provide your final answer now as ordinary text only. Do not use tool-call syntax or request any tool.";
+
+/** Explicit failure surfaced when the text-only recovery turn requests a tool. */
+export const TOOL_LOOP_GUARD_FAILURE =
+  "Local-model tool loop detected: the agent requested another tool after being instructed to provide a text-only final answer.";
 
 export interface ToolLoopAction {
   /** The exact, canonical full tool name supplied by the agent runtime. */
   toolName: string;
   /** Arguments after the runtime has validated them against the tool schema. */
   args: unknown;
+  /** Object identity of the assistant message that requested this call. */
+  assistantMessage: object;
 }
 
 export interface ToolLoopCompletion {
@@ -21,15 +31,27 @@ export interface ToolLoopCompletion {
 export interface ToolLoopBlock {
   block: true;
   reason: string;
+  /** Present only on the first blocked retry. The runner queues it exactly once. */
+  steer?: string;
+  /** Terminal blocks also request result-level termination for single-tool turns. */
+  terminate?: true;
 }
 
 export interface ToolLoopGuard {
-  /** Check an action against completed calls. No state is reserved by this check. */
+  /** Check an action against completed calls and advance recovery state when needed. */
   beforeToolCall(action: ToolLoopAction): ToolLoopBlock | undefined;
   /** Record a completed action and its complete result/error signature. */
   afterToolCall(action: ToolLoopAction, completion: ToolLoopCompletion): void;
   /** Number of action signatures currently retained by this session's guard. */
   readonly size: number;
+  /** True after the first blocked retry while a text-only answer is required. */
+  readonly awaitingFinalAnswer: boolean;
+  /** True once a recovery-turn tool request requires the current turn to stop. */
+  readonly mustStopAfterTurn: boolean;
+  /** Monotonic terminal-block count used to distinguish failures across resumes. */
+  readonly failureVersion: number;
+  /** Dedicated failure message once terminal loop detection has occurred. */
+  readonly failureMessage: string | undefined;
 }
 
 /**
@@ -107,13 +129,15 @@ interface ActionState {
   blocked: boolean;
 }
 
+type GuardPhase = "normal" | "awaiting-final-answer" | "failed";
+
 /** Keep a resumed session's loop bookkeeping bounded while retaining recent actions. */
 const MAX_RETAINED_ACTIONS = 128;
 /** Before the threshold, retain only the minimum recent signatures needed for repeats. */
 const MAX_RETAINED_COMPLETION_SIGNATURES = 2;
 
 /**
- * Create the per-session LocalExplore loop guard.
+ * Create one per-session local-model tool loop guard.
  *
  * Preflight deliberately only reads completed state. Calls that have already
  * passed preflight may execute in parallel; their later completions update this
@@ -121,6 +145,15 @@ const MAX_RETAINED_COMPLETION_SIGNATURES = 2;
  */
 export function createToolLoopGuard(): ToolLoopGuard {
   const actions = new Map<string, ActionState>();
+  let phase: GuardPhase = "normal";
+  let recoveryBatch: object | undefined;
+  let failureVersion = 0;
+
+  const terminalBlock = (): ToolLoopBlock => {
+    phase = "failed";
+    failureVersion += 1;
+    return { block: true, reason: TOOL_LOOP_GUARD_FAILURE, terminate: true };
+  };
 
   const retain = (actionHash: string, state: ActionState): void => {
     // Map insertion order provides deterministic oldest-first eviction. Delete
@@ -135,10 +168,27 @@ export function createToolLoopGuard(): ToolLoopGuard {
 
   return {
     beforeToolCall(action): ToolLoopBlock | undefined {
+      if (phase === "failed") return terminalBlock();
+
+      if (phase === "awaiting-final-answer") {
+        if (action.assistantMessage !== recoveryBatch) return terminalBlock();
+
+        const currentBatchState = actions.get(hashToolAction(action.toolName, action.args));
+        return currentBatchState?.blocked
+          ? { block: true, reason: TOOL_LOOP_GUARD_REASON }
+          : undefined;
+      }
+
       const actionHash = hashToolAction(action.toolName, action.args);
       const state = actions.get(actionHash);
       if (state?.blocked) {
-        return { block: true, reason: TOOL_LOOP_GUARD_REASON };
+        phase = "awaiting-final-answer";
+        recoveryBatch = action.assistantMessage;
+        return {
+          block: true,
+          reason: TOOL_LOOP_GUARD_REASON,
+          steer: TOOL_LOOP_GUARD_RECOVERY_STEER,
+        };
       }
       return undefined;
     },
@@ -170,6 +220,22 @@ export function createToolLoopGuard(): ToolLoopGuard {
 
     get size(): number {
       return actions.size;
+    },
+
+    get awaitingFinalAnswer(): boolean {
+      return phase === "awaiting-final-answer";
+    },
+
+    get mustStopAfterTurn(): boolean {
+      return phase === "failed";
+    },
+
+    get failureVersion(): number {
+      return failureVersion;
+    },
+
+    get failureMessage(): string | undefined {
+      return phase === "failed" ? TOOL_LOOP_GUARD_FAILURE : undefined;
     },
   };
 }

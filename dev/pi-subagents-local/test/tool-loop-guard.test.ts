@@ -4,13 +4,22 @@ import {
   createToolLoopGuard,
   hashToolAction,
   hashToolCompletion,
+  TOOL_LOOP_GUARD_FAILURE,
+  TOOL_LOOP_GUARD_RECOVERY_STEER,
 } from "../src/tool-loop-guard.js";
 import {
-  installLocalExploreToolLoopGuard,
-  installLocalExploreToolLoopGuardForAgent,
+  getToolLoopGuard,
+  installLocalModelToolLoopGuard,
+  isLocalToolLoopGuardProvider,
+  toolLoopFailureSince,
 } from "../src/agent-runner.js";
 
-const action = (toolName = "read", args: unknown = { path: "file" }) => ({ toolName, args });
+const defaultAssistantMessage = {};
+const action = (
+  toolName = "read",
+  args: unknown = { path: "file" },
+  assistantMessage: object = defaultAssistantMessage,
+) => ({ toolName, args, assistantMessage });
 const completion = (result: unknown = { content: [{ type: "text", text: "same" }] }, isError = false) => ({
   result,
   isError,
@@ -21,9 +30,10 @@ function toolContext(
   args: unknown = { path: "file" },
   result: unknown = { content: [{ type: "text", text: "same" }] },
   isError = false,
+  assistantMessage: object = defaultAssistantMessage,
 ): any {
   return {
-    assistantMessage: {},
+    assistantMessage,
     toolCall: { id: "call-1", name: toolName, arguments: args },
     args,
     context: {},
@@ -32,12 +42,19 @@ function toolContext(
   };
 }
 
-function fakeSession(beforeToolCall?: any, afterToolCall?: any): any {
-  return { agent: { beforeToolCall, afterToolCall } };
+function fakeSession(
+  beforeToolCall?: any,
+  afterToolCall?: any,
+  shouldStopAfterTurn?: any,
+): any {
+  return {
+    agent: { beforeToolCall, afterToolCall, shouldStopAfterTurn },
+    steer: vi.fn(async () => {}),
+  };
 }
 
-describe("LocalExplore tool loop guard", () => {
-  it("allows two identical completions and blocks the next identical action", () => {
+describe("local-model tool loop guard", () => {
+  it("allows two identical completions and makes the first blocked retry recoverable", () => {
     const guard = createToolLoopGuard();
     const sameAction = action();
 
@@ -47,9 +64,62 @@ describe("LocalExplore tool loop guard", () => {
     guard.afterToolCall(sameAction, completion());
 
     const blocked = guard.beforeToolCall(sameAction);
-    expect(blocked?.block).toBe(true);
-    expect(blocked?.reason).toMatch(/change approach/i);
-    expect(blocked?.reason).toMatch(/summarize/i);
+    expect(blocked).toMatchObject({ block: true, steer: TOOL_LOOP_GUARD_RECOVERY_STEER });
+    expect(blocked?.terminate).toBeUndefined();
+    expect(guard.awaitingFinalAnswer).toBe(true);
+    expect(guard.mustStopAfterTurn).toBe(false);
+    expect(guard.failureMessage).toBeUndefined();
+  });
+
+  it("treats sibling calls in the first blocked assistant message as the current batch", () => {
+    const guard = createToolLoopGuard();
+    const firstBatch = {};
+    const repeated = action("read", { path: "same" }, firstBatch);
+
+    guard.afterToolCall(repeated, completion());
+    guard.afterToolCall(repeated, completion());
+    expect(guard.beforeToolCall(repeated)?.steer).toBe(TOOL_LOOP_GUARD_RECOVERY_STEER);
+
+    expect(guard.beforeToolCall(action("grep", { query: "different" }, firstBatch))).toBeUndefined();
+    const secondBlockedInBatch = guard.beforeToolCall(repeated);
+    expect(secondBlockedInBatch?.block).toBe(true);
+    expect(secondBlockedInBatch?.steer).toBeUndefined();
+    expect(secondBlockedInBatch?.terminate).toBeUndefined();
+    expect(guard.failureVersion).toBe(0);
+  });
+
+  it("terminally blocks any tool in the next assistant message", () => {
+    const guard = createToolLoopGuard();
+    const firstBatch = {};
+    const recoveryBatch = {};
+    const repeated = action("read", { path: "same" }, firstBatch);
+
+    guard.afterToolCall(repeated, completion());
+    guard.afterToolCall(repeated, completion());
+    guard.beforeToolCall(repeated);
+
+    const terminal = guard.beforeToolCall(action("write", { path: "other" }, recoveryBatch));
+    expect(terminal).toEqual({ block: true, reason: TOOL_LOOP_GUARD_FAILURE, terminate: true });
+    expect(guard.mustStopAfterTurn).toBe(true);
+    expect(guard.failureMessage).toBe(TOOL_LOOP_GUARD_FAILURE);
+    expect(guard.failureVersion).toBe(1);
+
+    const later = guard.beforeToolCall(action("bash", { command: "true" }, {}));
+    expect(later?.terminate).toBe(true);
+    expect(guard.failureVersion).toBe(2);
+  });
+
+  it("allows clean text-only recovery to remain successful", () => {
+    const guard = createToolLoopGuard();
+    const repeated = action();
+    guard.afterToolCall(repeated, completion());
+    guard.afterToolCall(repeated, completion());
+    guard.beforeToolCall(repeated);
+
+    // A text-only assistant turn does not invoke preflight at all.
+    expect(guard.awaitingFinalAnswer).toBe(true);
+    expect(guard.mustStopAfterTurn).toBe(false);
+    expect(toolLoopFailureSince(guard, 0)).toBeUndefined();
   });
 
   it("evicts the oldest action at the cap while retaining recent threshold state", () => {
@@ -67,7 +137,6 @@ describe("LocalExplore tool loop guard", () => {
     }
     expect(guard.size).toBe(128);
 
-    // Refreshing a retained action makes it recent and keeps its threshold state.
     guard.afterToolCall(recentAction, completion());
     expect(guard.beforeToolCall(recentAction)?.block).toBe(true);
 
@@ -126,49 +195,135 @@ describe("LocalExplore tool loop guard", () => {
     expect(first).not.toBe(second);
   });
 
-  it("composes existing before and after hooks without changing their results", async () => {
+  it("composes existing hooks and hashes the effective after-hook result", async () => {
     const priorBefore = vi.fn(async () => undefined);
     const override = { content: [{ type: "text", text: "overridden" }], details: { source: "existing" } };
     const priorAfter = vi.fn(async () => override);
-    const session = fakeSession(priorBefore, priorAfter);
-    installLocalExploreToolLoopGuard(session);
+    const priorStop = vi.fn(async () => false);
+    const session = fakeSession(priorBefore, priorAfter, priorStop);
+    const guard = installLocalModelToolLoopGuard(session, "qwopus-subagent");
     const signal = new AbortController().signal;
     const context = toolContext();
 
+    expect(guard).toBeDefined();
     expect(await session.agent.beforeToolCall(context, signal)).toBeUndefined();
     expect(priorBefore).toHaveBeenCalledWith(context, signal);
     expect(await session.agent.afterToolCall(context, signal)).toBe(override);
+    expect(await session.agent.afterToolCall(context, signal)).toBe(override);
     expect(priorAfter).toHaveBeenCalledWith(context, signal);
+    expect((await session.agent.beforeToolCall(context, signal))?.block).toBe(true);
+    expect(await session.agent.shouldStopAfterTurn({}, signal)).toBe(false);
+    expect(priorStop).toHaveBeenCalledWith({}, signal);
 
     const blockingBefore = vi.fn(async () => ({ block: true, reason: "existing scope", terminate: true }));
     const blockedSession = fakeSession(blockingBefore);
-    installLocalExploreToolLoopGuard(blockedSession);
+    installLocalModelToolLoopGuard(blockedSession, "qwopus-subagent");
     const priorBlock = await blockedSession.agent.beforeToolCall(context, signal);
     expect(priorBlock).toEqual({ block: true, reason: "existing scope", terminate: true });
+
+    const stoppingSession = fakeSession(undefined, undefined, vi.fn(async () => true));
+    installLocalModelToolLoopGuard(stoppingSession, "qwen38-main");
+    expect(await stoppingSession.agent.shouldStopAfterTurn({}, signal)).toBe(true);
   });
 
-  it("keeps an established threshold through sequential and parallel completion order", async () => {
-    const sequentialGuard = createToolLoopGuard();
-    const sequentialAction = action("sequential", { nested: { values: [1, 2, 3] } });
+  it("lets terminal loop failure override a prior block on the recovery turn", async () => {
+    const firstBatch = {};
+    const recoveryBatch = {};
+    const priorBlock = { block: true, reason: "existing scope" };
+    const priorBefore = vi.fn(async (context: any) => (
+      context.assistantMessage === recoveryBatch ? priorBlock : undefined
+    ));
+    const session = fakeSession(priorBefore);
+    installLocalModelToolLoopGuard(session, "qwopus-subagent");
+    const repeatedContext = toolContext("grep", { query: "loop" }, undefined, false, firstBatch);
 
-    sequentialGuard.afterToolCall(sequentialAction, completion({ value: "A" }));
-    sequentialGuard.afterToolCall(sequentialAction, completion({ value: "A" }));
-    sequentialGuard.afterToolCall(sequentialAction, completion({ value: "B" }));
-    expect(sequentialGuard.beforeToolCall(sequentialAction)?.block).toBe(true);
+    await session.agent.afterToolCall(repeatedContext);
+    await session.agent.afterToolCall(repeatedContext);
+    expect((await session.agent.beforeToolCall(repeatedContext))?.steer)
+      .toBe(TOOL_LOOP_GUARD_RECOVERY_STEER);
 
-    const parallelGuard = createToolLoopGuard();
-    const parallelAction = action("parallel", { nested: { values: [1, 2, 3] } });
+    const recoveryContext = toolContext("read", { path: "different" }, undefined, false, recoveryBatch);
+    expect(await session.agent.beforeToolCall(recoveryContext)).toEqual({
+      block: true,
+      reason: TOOL_LOOP_GUARD_FAILURE,
+      terminate: true,
+    });
+    expect(priorBefore).toHaveBeenLastCalledWith(recoveryContext, undefined);
+    expect(await session.agent.shouldStopAfterTurn({})).toBe(true);
+  });
+
+  it("contains recovery steering failures without breaking preflight", async () => {
+    const session = fakeSession();
+    session.steer = vi.fn(async () => { throw new Error("queue unavailable"); });
+    installLocalModelToolLoopGuard(session, "qwopus-subagent");
+    const context = toolContext();
+
+    await session.agent.afterToolCall(context);
+    await session.agent.afterToolCall(context);
+
+    await expect(session.agent.beforeToolCall(context)).resolves.toMatchObject({
+      block: true,
+      steer: TOOL_LOOP_GUARD_RECOVERY_STEER,
+    });
+    expect(session.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it("executes the real tool at most twice, steers once, then stops with failure", async () => {
+    const session = fakeSession();
+    const guard = installLocalModelToolLoopGuard(session, "qwen38-subagent");
+    const firstBatch = {};
+    const recoveryBatch = {};
+    let executions = 0;
+
+    const execute = async (context: any) => {
+      const preflight = await session.agent.beforeToolCall(context);
+      if (preflight?.block) return preflight;
+      executions += 1;
+      await session.agent.afterToolCall(context);
+      return undefined;
+    };
+
+    expect(await execute(toolContext("grep", { query: "loop" }, undefined, false, firstBatch))).toBeUndefined();
+    expect(await execute(toolContext("grep", { query: "loop" }, undefined, false, firstBatch))).toBeUndefined();
+    const recoveryBlock = await execute(toolContext("grep", { query: "loop" }, undefined, false, firstBatch));
+    expect(recoveryBlock?.terminate).toBeUndefined();
+    expect(executions).toBe(2);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer).toHaveBeenCalledWith(TOOL_LOOP_GUARD_RECOVERY_STEER);
+
+    const sameBatchBlock = await execute(
+      toolContext("grep", { query: "loop" }, undefined, false, firstBatch),
+    );
+    expect(sameBatchBlock?.terminate).toBeUndefined();
+    expect(session.steer).toHaveBeenCalledTimes(1);
+
+    const terminal = await execute(toolContext("read", { path: "different" }, undefined, false, recoveryBatch));
+    expect(terminal?.terminate).toBe(true);
+    expect(executions).toBe(2);
+    expect(await session.agent.shouldStopAfterTurn({})).toBe(true);
+    expect(toolLoopFailureSince(guard, 0)).toBe(TOOL_LOOP_GUARD_FAILURE);
+  });
+
+  it("retains terminal stop for mixed and parallel completion ordering", async () => {
+    const guard = createToolLoopGuard();
+    const firstBatch = {};
+    const repeated = action("parallel", { nested: { values: [1, 2, 3] } }, firstBatch);
     const preflightResults = await Promise.all([
-      Promise.resolve(parallelGuard.beforeToolCall(parallelAction)),
-      Promise.resolve(parallelGuard.beforeToolCall(parallelAction)),
-      Promise.resolve(parallelGuard.beforeToolCall(parallelAction)),
+      Promise.resolve(guard.beforeToolCall(repeated)),
+      Promise.resolve(guard.beforeToolCall(repeated)),
+      Promise.resolve(guard.beforeToolCall(repeated)),
     ]);
     expect(preflightResults).toEqual([undefined, undefined, undefined]);
 
-    parallelGuard.afterToolCall(parallelAction, completion({ value: "A" }));
-    parallelGuard.afterToolCall(parallelAction, completion({ value: "A" }));
-    parallelGuard.afterToolCall(parallelAction, completion({ value: "B" }));
-    expect(parallelGuard.beforeToolCall(parallelAction)?.block).toBe(true);
+    guard.afterToolCall(repeated, completion({ value: "A" }));
+    guard.afterToolCall(repeated, completion({ value: "A" }));
+    guard.afterToolCall(repeated, completion({ value: "B" }));
+    expect(guard.beforeToolCall(repeated)?.block).toBe(true);
+    expect(guard.beforeToolCall(action("other", {}, {}))?.terminate).toBe(true);
+
+    guard.afterToolCall(repeated, completion({ value: "C" }));
+    expect(guard.mustStopAfterTurn).toBe(true);
+    expect(guard.beforeToolCall(action("later", {}, {}))?.terminate).toBe(true);
   });
 
   it("keeps completion state per guard/session", () => {
@@ -183,16 +338,43 @@ describe("LocalExplore tool loop guard", () => {
     expect(secondSession.size).toBe(0);
   });
 
-  it("does not install for a non-LocalExplore resolved identity", () => {
-    const before = vi.fn(async () => undefined);
-    const after = vi.fn(async () => undefined);
-    const session = fakeSession(before, after);
+  it("installs only for approved local providers and only once per session", () => {
+    for (const provider of ["qwopus-subagent", "qwen38-main", "qwen38-subagent"]) {
+      expect(isLocalToolLoopGuardProvider(provider)).toBe(true);
+      const session = fakeSession();
+      const first = installLocalModelToolLoopGuard(session, provider);
+      const wrappedBefore = session.agent.beforeToolCall;
+      const second = installLocalModelToolLoopGuard(session, provider);
+      expect(first).toBeDefined();
+      expect(second).toBe(first);
+      expect(getToolLoopGuard(session)).toBe(first);
+      expect(session.agent.beforeToolCall).toBe(wrappedBefore);
+    }
 
-    installLocalExploreToolLoopGuardForAgent(session, "Explore");
-    expect(session.agent.beforeToolCall).toBe(before);
-    expect(session.agent.afterToolCall).toBe(after);
+    for (const provider of [undefined, "openai-codex", "anthropic", "google"]) {
+      expect(isLocalToolLoopGuardProvider(provider)).toBe(false);
+      const before = vi.fn(async () => undefined);
+      const session = fakeSession(before);
+      expect(installLocalModelToolLoopGuard(session, provider)).toBeUndefined();
+      expect(session.agent.beforeToolCall).toBe(before);
+      expect(getToolLoopGuard(session)).toBeUndefined();
+    }
+  });
 
-    installLocalExploreToolLoopGuardForAgent(session, "LocalExplore");
-    expect(session.agent.beforeToolCall).not.toBe(before);
+  it("uses failure checkpoints to ignore stale resume failures", () => {
+    const guard = createToolLoopGuard();
+    const firstBatch = {};
+    const repeated = action("read", {}, firstBatch);
+    guard.afterToolCall(repeated, completion());
+    guard.afterToolCall(repeated, completion());
+    guard.beforeToolCall(repeated);
+    guard.beforeToolCall(action("read", {}, {}));
+
+    expect(toolLoopFailureSince(guard, 0)).toBe(TOOL_LOOP_GUARD_FAILURE);
+    const resumeCheckpoint = guard.failureVersion;
+    expect(toolLoopFailureSince(guard, resumeCheckpoint)).toBeUndefined();
+
+    guard.beforeToolCall(action("read", {}, {}));
+    expect(toolLoopFailureSince(guard, resumeCheckpoint)).toBe(TOOL_LOOP_GUARD_FAILURE);
   });
 });

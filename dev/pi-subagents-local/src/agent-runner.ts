@@ -25,7 +25,7 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import { createToolLoopGuard } from "./tool-loop-guard.js";
+import { createToolLoopGuard, type ToolLoopGuard } from "./tool-loop-guard.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -299,22 +299,66 @@ export function installExtensionToolScope(
   };
 }
 
+/** Providers backed by the local Qwen/Qwopus servers. */
+const LOCAL_TOOL_LOOP_GUARD_PROVIDERS: ReadonlySet<string> = new Set([
+  "qwopus-subagent",
+  "qwen38-main",
+  "qwen38-subagent",
+]);
+
+/** In-memory controller ownership keeps resumed sessions bounded without persistence changes. */
+const toolLoopGuards = new WeakMap<AgentSession, ToolLoopGuard>();
+
+export function isLocalToolLoopGuardProvider(provider: string | undefined): boolean {
+  return provider !== undefined && LOCAL_TOOL_LOOP_GUARD_PROVIDERS.has(provider);
+}
+
+/** Return the controller already installed on this process-local session, if any. */
+export function getToolLoopGuard(session: AgentSession): ToolLoopGuard | undefined {
+  return toolLoopGuards.get(session);
+}
+
 /**
- * Install the LocalExplore-only repeated tool-action guard on one child session.
+ * Install the repeated tool-action guard on one local-model child session.
  *
- * The existing hooks remain authoritative: before hooks run first and a prior
- * block is returned unchanged; after hooks run first and the guard observes the
- * resulting (possibly overridden) completion while returning that override
- * unchanged. This keeps extension scope and interception semantics intact.
+ * Existing hooks remain authoritative until deterministic loop recovery itself
+ * must fail: prior blocks are preserved in normal operation, prior after-hook
+ * overrides are hashed exactly as agent-core applies them, and prior stop
+ * decisions are ORed with the guard's terminal stop state.
  */
-export function installLocalExploreToolLoopGuard(session: AgentSession): void {
+export function installLocalModelToolLoopGuard(
+  session: AgentSession,
+  provider: string | undefined,
+): ToolLoopGuard | undefined {
+  if (!isLocalToolLoopGuardProvider(provider)) return undefined;
+
+  const installed = toolLoopGuards.get(session);
+  if (installed) return installed;
+
   const guard = createToolLoopGuard();
+  toolLoopGuards.set(session, guard);
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
     const priorResult = await priorBeforeToolCall?.(context, signal);
-    if (priorResult?.block) return priorResult;
-    return guard.beforeToolCall({ toolName: context.toolCall.name, args: context.args });
+    if (priorResult?.block && !guard.awaitingFinalAnswer && !guard.mustStopAfterTurn) {
+      return priorResult;
+    }
+
+    const guardResult = guard.beforeToolCall({
+      toolName: context.toolCall.name,
+      args: context.args,
+      assistantMessage: context.assistantMessage,
+    });
+    if (guardResult?.steer) {
+      try {
+        void session.steer(guardResult.steer).catch(() => {});
+      } catch {
+        // Steering is best-effort; the non-terminal blocked result still reaches the model.
+      }
+    }
+    if (guardResult?.terminate) return guardResult;
+    return priorResult?.block ? priorResult : guardResult;
   };
 
   const priorAfterToolCall = session.agent.afterToolCall;
@@ -335,19 +379,23 @@ export function installLocalExploreToolLoopGuard(session: AgentSession): void {
       : context.result;
     const isError = priorResult?.isError ?? context.isError;
     guard.afterToolCall(
-      { toolName: context.toolCall.name, args: context.args },
+      {
+        toolName: context.toolCall.name,
+        args: context.args,
+        assistantMessage: context.assistantMessage,
+      },
       { result, isError },
     );
     return priorResult;
   };
-}
 
-/** Install the guard only for the exact resolved child card identity. */
-export function installLocalExploreToolLoopGuardForAgent(
-  session: AgentSession,
-  resolvedAgentName: string,
-): void {
-  if (resolvedAgentName === "LocalExplore") installLocalExploreToolLoopGuard(session);
+  const priorShouldStopAfterTurn = session.agent.shouldStopAfterTurn;
+  session.agent.shouldStopAfterTurn = async (context, signal) => {
+    const priorStop = await priorShouldStopAfterTurn?.(context, signal);
+    return Boolean(priorStop || guard.mustStopAfterTurn);
+  };
+
+  return guard;
 }
 
 /** Default max turns. undefined = unlimited (no turn limit). */
@@ -527,13 +575,12 @@ export interface RunResult {
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
   /**
-   * A failure message for the run's FINAL assistant turn, when that turn failed:
-   * a provider error (stopReason "error"), or a "length" stop that produced no
-   * text (a silent max-token death). pi resolves an exhausted-retries failure
-   * normally instead of rejecting, so without this the manager would report such
-   * a run as completed — with an empty result, or worse, an earlier turn's text
-   * presented as the answer (#144). Undefined for a clean stop, or a "length"
-   * stop that produced text (a legitimate truncated answer).
+   * A failure message when deterministic loop recovery failed or the run's FINAL
+   * assistant turn failed with a provider error / silent empty length stop. Pi
+   * resolves these paths normally instead of rejecting, so the explicit failure
+   * prevents the manager from reporting completed with empty or stale output.
+   * Undefined for a clean stop, a successful text-only loop recovery, or a
+   * length-limited turn that still produced useful text.
    */
   failure?: string;
 }
@@ -602,6 +649,14 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
     return undefined;
   }
   return undefined;
+}
+
+/** Return only a loop failure newly observed since this invocation began. */
+export function toolLoopFailureSince(
+  guard: ToolLoopGuard | undefined,
+  checkpoint: number,
+): string | undefined {
+  return guard && guard.failureVersion > checkpoint ? guard.failureMessage : undefined;
 }
 
 /**
@@ -1034,10 +1089,11 @@ export async function runAgent(
       nestedToolNames,
     });
   }
-  // This is deliberately keyed by the resolved card identity, not the caller's
-  // spelling or the parent session. Each run gets a fresh guard and therefore
-  // its own completion state.
-  installLocalExploreToolLoopGuardForAgent(session, agentConfig.name);
+  const toolLoopGuard = installLocalModelToolLoopGuard(
+    session,
+    session.model?.provider ?? model?.provider,
+  );
+  const toolLoopFailureCheckpoint = toolLoopGuard?.failureVersion ?? 0;
 
   options.onSessionCreated?.(session);
 
@@ -1114,7 +1170,14 @@ export async function runAgent(
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
+  return {
+    responseText,
+    session,
+    aborted,
+    steered: softLimitReached,
+    failure: toolLoopFailureSince(toolLoopGuard, toolLoopFailureCheckpoint)
+      ?? finalTurnError(session, startLen),
+  };
 }
 
 /**
@@ -1134,6 +1197,8 @@ export async function resumeAgent(
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
+  const toolLoopGuard = getToolLoopGuard(session);
+  const toolLoopFailureCheckpoint = toolLoopGuard?.failureVersion ?? 0;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1167,7 +1232,8 @@ export async function resumeAgent(
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    failure: toolLoopFailureSince(toolLoopGuard, toolLoopFailureCheckpoint)
+      ?? finalTurnError(session, startLen),
   };
 }
 

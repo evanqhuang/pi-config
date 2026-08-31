@@ -7,6 +7,7 @@ extensions: false
 skills: true
 model: qwopus-subagent/qwopus3.5-9b-coder-mtp
 thinking: medium
+max_turns: 64
 prompt_mode: replace
 ---
 # Read-only local exploration

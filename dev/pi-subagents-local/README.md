@@ -15,6 +15,31 @@ read dynamically from the async-local context, so concurrent parent and child
 session loading remains isolated. The versioned global is a local divergence
 from upstream and is intentionally limited to this compatibility contract.
 
+## Local-model tool-loop safety
+
+Child sessions using `qwopus-subagent`, `qwen38-main`, or
+`qwen38-subagent` have a deterministic repeated-tool circuit breaker. It hashes
+the complete validated tool name/arguments and the complete effective result,
+including error status. After the same action produces the same completion
+twice, the next retry is blocked and the session receives one user-level
+instruction to return an ordinary-text final answer without tools. Calls from
+that already-issued assistant tool batch remain part of the current turn. If
+the following assistant message requests any tool, the request is blocked
+terminally, the turn is stopped even for a mixed tool batch, and the child is
+reported as failed instead of silently completed. Changed results remain valid
+progress and do not trip the threshold.
+
+Guard state is process-local and retained per child session for same-process
+resume. Per-invocation failure checkpoints prevent an old terminal state from
+being reported as a new failure when a resume returns clean text. Cloud-backed
+child sessions are not modified. This cross-turn circuit breaker is independent
+of local-mode's provider retry for a single generation ending with
+`rawStopReason: "repetition"`.
+
+The global `LocalExplore` card has a 64-turn soft limit. At turn 64 the existing
+wrap-up steer requests a final answer; the existing five-turn grace hard-aborts
+at turn 69. An explicit call-site `maxTurns` still has higher precedence.
+
 ## Durable routing and verifier contracts
 
 **Fresh type resolution.** Every fresh spawn reloads the current project/global
