@@ -2,18 +2,41 @@
 
 Owned native `/goal` implementation for this pi-config profile.
 
-## Commands
+## Commands and syntax
 
-- `/goal <objective>`
-- `/goal <objective> -- <criterion 1>; <criterion 2>`
-- `/goal status`
-- `/goal pause`
-- `/goal resume`
-- `/goal stop`
-- `/goal clear`
+- `/goal <objective>` — the existing branch-local V1 goal.
+- `/goal <objective> -- <criterion 1>; <criterion 2>` — add acceptance criteria.
+- `/goal <objective> --loop --plan <path>` — start an opt-in V2 fixed-point loop from an explicit plan.
+- `/goal <objective> --loop` — start from the latest plan approved by `pi-plan-mode`.
+- `/goal <objective> --loop --max-cycles <n>` — bound corrective replans (`1`–`100`).
+- `/goal fresh` — start a new V2 loop from the latest approved plan.
+- `/goal status`, `/goal pause`, `/goal resume`, `/goal stop`, `/goal clear`
 
-Goal state is append-only under `pi-goal-state-v1` and is reconstructed from the currently selected session branch. When tree rewind selects a point before an active goal's state entry, the goal is copied onto the otherwise goal-less target branch as paused; `/goal resume` is required to continue it. Existing target-branch goal state and explicit clear markers remain authoritative. Legacy `goal-state` entries are ignored.
+Loop flags may be combined with an objective and criteria in any order. Quoted plan paths are supported. The `/goal` autocomplete offers management commands and loop flags; while editing a `--plan` value it delegates to Pi's ordinary file/path completion.
 
-Evaluation runs only after `agent_settled`. Active/queued subagents conservatively defer evaluation. `GoalJudge` is a one-turn non-mutating completion judge; candidate completion must then pass the independent read-only `GoalVerifier` in a disposable source-snapshot worktree.
+The startup flags `--goal-loop`, `--goal-plan <path>`, and `--goal-max-cycles <n>` provide the equivalent initial loop dispatch. An explicit plan always wins over the approved-plan bridge. Without either source, a loop start fails closed rather than treating an ordinary V1 goal as a loop.
 
-This package intentionally does **not** implement runtime-task infrastructure, background shell execution, task ownership/attribution, foreground detachment, Pi-core changes, or automatic code review.
+## Effective boundary
+
+V1 goals retain their existing behavior and format. Only an active V2 loop (`implementing`, `verifying`, or `replanning`) changes provider context: the `context` hook retains the latest valid loop epoch marker and complete current tool traffic. V1 goals, ordinary/non-loop `/goal` commands, paused loops, and terminal loops are not filtered.
+
+`/goal status` for a loop includes its loop ID, generation, correction cycle/max, context epoch, phase, and the latest bounded reason. Plan-mode approval actions also dispatch the approved plan into a goal loop with their approved YOLO, ORCHESTRATOR, or PREWALK strategy; the goal controller does not silently substitute another strategy.
+
+## Artifacts and recovery
+
+Loop-owned files are private, append-once artifacts under:
+
+```text
+~/.pi/agent/goal-loops/<loopId>/original-plan.md
+~/.pi/agent/goal-loops/<loopId>/cycle-<n>-plan.md
+```
+
+The original plan is copied and hashed before V2 state is published. Corrective plans are similarly bounded, immutable, and hash-recorded. Durable V2 state and hidden context-epoch markers are reconstructed from the selected session branch; mutable source plans are never used for later evaluation.
+
+A reopened active loop is paused and requires `/goal resume`. Compaction and tree selection re-anchor an active loop at a fresh epoch; navigation invalidates stale wakes and in-flight evaluations. Failed or aborted compaction is not treated as a recovery boundary. Session shutdown cancels pending work and removes bridge listeners.
+
+## Safety
+
+Loop state is strict V2 data and malformed/latest conflicting markers fail closed. Epoch bootstraps are canonical, size-bounded, hash-checked, and tied to the loop generation, correction cycle, and context epoch. The context filter never mutates its input and never keeps an incomplete tool-call/result suffix. Artifact sources and destinations must be regular, non-symlinked files in the intended roots. User pause/stop/clear, navigation, aborts, missing approved plans, unavailable evaluators, and unsafe PREWALK continuation do not fall back to unrestricted automation.
+
+This package intentionally does **not** implement runtime-task infrastructure, background shell execution, task ownership/attribution, foreground detachment, Pi-core changes, automatic code review, or plan-mode approval itself.

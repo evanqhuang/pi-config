@@ -2,10 +2,28 @@ import { describe, expect, it } from "vitest";
 import { parseGoalCommand } from "../src/commands.js";
 import { agentRunWasAborted } from "../src/index.js";
 import { parseGoalVerdict } from "../src/judge.js";
-import { CLEARED_REASON, latestGoalState, parseGoalState } from "../src/state.js";
+import {
+  CLEARED_REASON,
+  latestGoalLoopState,
+  latestGoalState,
+  latestGoalStateMarker,
+  parseGoalState,
+  parseGoalStateV2,
+} from "../src/state.js";
 import { fingerprintEvidence } from "../src/transcript.js";
 import { parseVerifierVerdict } from "../src/verifier.js";
-import { GOAL_CONTINUE_MESSAGE, GOAL_STATE_TYPE, type GoalStateV1 } from "../src/types.js";
+import {
+  DEFAULT_GOAL_LOOP_SETTINGS,
+  GOAL_LOOP_SETTING_BOUNDS,
+} from "../src/settings.js";
+import {
+  GOAL_CONTINUE_MESSAGE,
+  GOAL_STATE_TYPE,
+  GOAL_STATE_V2_TYPE,
+  type GoalStateV1,
+  type GoalStateV2,
+} from "../src/types.js";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 function goal(overrides: Partial<GoalStateV1> = {}): GoalStateV1 {
   return {
@@ -71,24 +89,117 @@ describe("goal command parser", () => {
   it("parses management commands and criteria", () => {
     expect(parseGoalCommand("status")).toEqual({ kind: "status" });
     expect(parseGoalCommand("pause")).toEqual({ kind: "pause" });
+    expect(parseGoalCommand("fresh")).toEqual({ kind: "fresh" });
     expect(parseGoalCommand("build it -- tests pass; docs updated")).toEqual({
       kind: "start",
       objective: "build it",
       criteria: ["tests pass", "docs updated"],
     });
   });
+
+  it("parses loop flags in any position and supports quoted plan paths", () => {
+    expect(parseGoalCommand('Implement the plan --loop --max-cycles 5 --plan "plans/my plan.md" -- tests pass; docs updated')).toEqual({
+      kind: "start",
+      objective: "Implement the plan",
+      criteria: ["tests pass", "docs updated"],
+      loop: true,
+      planPath: "plans/my plan.md",
+      maxCycles: 5,
+    });
+    expect(parseGoalCommand('--loop --plan "plans/my plan.md"')).toEqual({
+      kind: "start",
+      objective: "Implement the referenced plan.",
+      criteria: [],
+      loop: true,
+      planPath: "plans/my plan.md",
+    });
+    expect(parseGoalCommand("Implement -- tests pass --loop --max-cycles=2")).toEqual({
+      kind: "start",
+      objective: "Implement",
+      criteria: ["tests pass"],
+      loop: true,
+      maxCycles: 2,
+    });
+  });
+
+  it("rejects malformed loop flags and objective omission without a plan", () => {
+    expect(() => parseGoalCommand("--loop --loop implement")).toThrow(/only once/);
+    expect(() => parseGoalCommand("--loop --plan one.md --plan two.md")).toThrow(/--plan may be provided only once/);
+    expect(() => parseGoalCommand("--loop --plan")).toThrow(/requires a value/);
+    expect(() => parseGoalCommand("--loop --max-cycles 0 implement")).toThrow(/positive integer/);
+    expect(() => parseGoalCommand("--loop --max-cycles 1.5 implement")).toThrow(/positive integer/);
+    expect(() => parseGoalCommand("--loop --unknown implement")).toThrow(/Unknown goal option/);
+    expect(() => parseGoalCommand("--loop -- tests pass")).toThrow(/objective cannot be empty/);
+  });
 });
 
 describe("goal state", () => {
+  const hash = "a".repeat(64);
+
+  function loopState(overrides: Partial<GoalStateV2> = {}): GoalStateV2 {
+    return {
+      schemaVersion: 2,
+      loopId: "loop-1",
+      generation: 1,
+      contextEpoch: 0,
+      phase: "implementing",
+      cycle: 0,
+      maxCycles: 5,
+      objective: "ship feature",
+      criteria: ["tests pass"],
+      plan: { sourceKind: "explicit", sourcePath: "/repo/plan.md", snapshotPath: "/agent/plan.md", snapshotHash: hash },
+      ...overrides,
+    };
+  }
+
   it("rejects legacy/malformed state and restores latest native branch state", () => {
     expect(parseGoalState({ schemaVersion: 0 })).toBeUndefined();
     const entries = [
       { type: "custom", customType: "goal-state", data: { status: "active" } },
       { type: "custom", customType: GOAL_STATE_TYPE, data: goal({ status: "paused" }) },
       { type: "custom", customType: GOAL_STATE_TYPE, data: goal({ status: "active", generation: 2 }) },
-    ] as any;
+    ] as unknown as SessionEntry[];
     expect(latestGoalState(entries)?.generation).toBe(2);
     expect(latestGoalState(entries)?.status).toBe("active");
+  });
+
+  it("strictly restores v2 loops and fails closed on malformed loop markers", () => {
+    const valid = loopState({
+      verifier: {
+        outcome: "replan",
+        repositoryFingerprint: "repo-fingerprint",
+        evidenceFingerprint: "evidence-fingerprint",
+        correctionPath: "/agent/cycle-1-plan.md",
+        correctionHash: hash,
+      },
+      epochMarker: { id: "epoch-1", hash },
+      reasons: { stagnation: "No change yet." },
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    expect(parseGoalStateV2(valid)).toEqual(valid);
+    expect(parseGoalState(valid)).toEqual(valid);
+    const entries = [
+      { type: "custom", customType: GOAL_STATE_TYPE, data: goal() },
+      { type: "custom", customType: GOAL_STATE_V2_TYPE, data: valid },
+    ] as unknown as SessionEntry[];
+    expect(latestGoalStateMarker(entries)).toEqual(valid);
+    expect(latestGoalLoopState(entries)).toEqual(valid);
+
+    const malformed = { ...valid, maxCycles: 0 };
+    expect(parseGoalStateV2(malformed)).toBeUndefined();
+    expect(latestGoalStateMarker([
+      ...entries,
+      { type: "custom", customType: GOAL_STATE_V2_TYPE, data: malformed } as unknown as SessionEntry,
+    ])).toBeUndefined();
+  });
+
+  it("keeps conservative loop settings bounded", () => {
+    expect(DEFAULT_GOAL_LOOP_SETTINGS.maxCycles).toBeGreaterThan(0);
+    expect(DEFAULT_GOAL_LOOP_SETTINGS.maxCycles).toBeLessThanOrEqual(GOAL_LOOP_SETTING_BOUNDS.maxCycles.max);
+    expect(DEFAULT_GOAL_LOOP_SETTINGS.maxPlanBytes).toBeLessThanOrEqual(GOAL_LOOP_SETTING_BOUNDS.maxPlanBytes.max);
+    expect(DEFAULT_GOAL_LOOP_SETTINGS.maxCorrectionBytes).toBeLessThanOrEqual(GOAL_LOOP_SETTING_BOUNDS.maxCorrectionBytes.max);
+    expect(DEFAULT_GOAL_LOOP_SETTINGS.maxBootstrapBytes).toBeLessThanOrEqual(GOAL_LOOP_SETTING_BOUNDS.maxBootstrapBytes.max);
   });
 
   it("treats the newest native clear marker as no effective branch goal", () => {
@@ -99,7 +210,7 @@ describe("goal state", () => {
         customType: GOAL_STATE_TYPE,
         data: goal({ status: "stopped", terminalReason: CLEARED_REASON, lastReason: CLEARED_REASON }),
       },
-    ] as any;
+    ] as unknown as SessionEntry[];
     expect(latestGoalState(entries)).toBeUndefined();
   });
 });

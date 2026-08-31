@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import goalExtension from "../src/index.js";
 import { GoalController } from "../src/controller.js";
 import { CLEARED_REASON } from "../src/state.js";
 import {
+  GOAL_CONTEXT_EPOCH_TYPE,
   GOAL_CONTINUE_MESSAGE,
   GOAL_STATE_TYPE,
+  GOAL_STATE_V2_TYPE,
   GOAL_SUBAGENT_UPDATE_MESSAGE,
   type GoalStateV1,
 } from "../src/types.js";
@@ -116,6 +121,12 @@ function goalEntries(entries: any[]): GoalStateV1[] {
     .map(entry => entry.data as GoalStateV1);
 }
 
+function loopEntries(entries: any[]): any[] {
+  return entries
+    .filter(entry => entry.type === "custom" && entry.customType === GOAL_STATE_V2_TYPE)
+    .map(entry => entry.data);
+}
+
 function activeGoal(overrides: Partial<GoalStateV1> = {}): GoalStateV1 {
   return {
     schemaVersion: 1,
@@ -136,6 +147,10 @@ function activeGoal(overrides: Partial<GoalStateV1> = {}): GoalStateV1 {
 
 function continueMessages(pi: any): any[] {
   return pi.sendMessage.mock.calls.filter(([message]: any[]) => message.customType === GOAL_CONTINUE_MESSAGE);
+}
+
+function epochMessages(pi: any): any[] {
+  return pi.sendMessage.mock.calls.filter(([message]: any[]) => message.customType === GOAL_CONTEXT_EPOCH_TYPE);
 }
 
 beforeEach(() => {
@@ -664,5 +679,166 @@ describe("goal controller lifecycle guards", () => {
 
     expect(controller.current?.status).toBe("active");
     expect(goalEntries(branch()).some(state => state.status === "completed")).toBe(false);
+  });
+
+  it.each(["blocked", "inconclusive"] as const)(
+    "transitions a V2 verifier %s outcome to a safe blocked state without continuing the epoch",
+    async outcome => {
+      const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-controller-terminal-"));
+      const cwd = join(root, "workspace");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd);
+      await mkdir(agentDir);
+      const planPath = join(cwd, "approved-plan.md");
+      await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+
+      let branch: any[] = [];
+      let leafId = "leaf-0";
+      const sessionManager = {
+        getBranch: () => branch,
+        buildContextEntries: () => branch,
+        getSessionId: () => "loop-session",
+        getLeafId: () => leafId,
+      };
+      const pi = {
+        appendEntry: vi.fn((customType: string, data: any) => {
+          branch.push({ type: "custom", customType, data });
+          leafId = `leaf-${branch.length}`;
+        }),
+        sendMessage: vi.fn(),
+      } as any;
+      const ctx = {
+        cwd,
+        isIdle: () => true,
+        hasPendingMessages: () => false,
+        sessionManager,
+      } as any;
+      const controller = new GoalController(pi);
+      subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => type === "GoalJudge"
+        ? Promise.resolve({
+          output: JSON.stringify({ ok: true, reason: "candidate complete" }),
+          aborted: false,
+          steered: false,
+        })
+        : Promise.resolve({
+          output: JSON.stringify({
+            outcome,
+            reason: `Verifier cannot establish a safe ${outcome} result.`,
+            repositoryFingerprint: `repo-${outcome}`,
+            evidenceFingerprint: `evidence-${outcome}`,
+          }),
+          aborted: false,
+          steered: false,
+        }));
+
+      try {
+        await controller.startLoop(ctx, "ship feature", ["tests pass"], { planPath, agentDir });
+        await vi.waitFor(() => expect(epochMessages(pi)).toHaveLength(1));
+        await vi.waitFor(() => expect(continueMessages(pi)).toHaveLength(1));
+        const initialEpochMessages = epochMessages(pi).length;
+        const initialContinuationMessages = continueMessages(pi).length;
+
+        controller.requestEvaluation(ctx);
+        await vi.waitFor(() => expect(controller.currentLoop?.phase).toBe("blocked"));
+
+        expect(subagents.runEvaluator).toHaveBeenCalledTimes(2);
+        expect(controller.currentLoop).toMatchObject({
+          phase: "blocked",
+          cycle: 0,
+          contextEpoch: 0,
+          verifier: {
+            outcome,
+            repositoryFingerprint: `repo-${outcome}`,
+            evidenceFingerprint: `evidence-${outcome}`,
+          },
+          reasons: { block: `GoalVerifier ${outcome}: Verifier cannot establish a safe ${outcome} result.` },
+        });
+        expect(loopEntries(branch).at(-1)).toMatchObject({
+          phase: "blocked",
+          cycle: 0,
+          contextEpoch: 0,
+          verifier: { outcome },
+        });
+        expect(epochMessages(pi)).toHaveLength(initialEpochMessages);
+        expect(continueMessages(pi)).toHaveLength(initialContinuationMessages);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("runs an actual V2 verifier replan through a new immutable context epoch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-controller-"));
+    const cwd = join(root, "workspace");
+    const agentDir = join(root, "agent");
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    const planPath = join(cwd, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+
+    let branch: any[] = [];
+    let leafId = "leaf-0";
+    let verifierCalls = 0;
+    const sessionManager = {
+      getBranch: () => branch,
+      buildContextEntries: () => branch,
+      getSessionId: () => "loop-session",
+      getLeafId: () => leafId,
+    };
+    const pi = {
+      appendEntry: vi.fn((customType: string, data: any) => {
+        branch.push({ type: "custom", customType, data });
+        leafId = `leaf-${branch.length}`;
+      }),
+      sendMessage: vi.fn(),
+    } as any;
+    const ctx = {
+      cwd,
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      sessionManager,
+    } as any;
+    const controller = new GoalController(pi);
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      verifierCalls += 1;
+      return Promise.resolve({
+        output: verifierCalls === 1
+          ? JSON.stringify({
+            outcome: "replan",
+            reason: "One acceptance check is still missing.",
+            correction: "Add the missing acceptance check and run the focused test.\n",
+            repositoryFingerprint: "repo-before-fix",
+            evidenceFingerprint: "verifier-evidence-1",
+          })
+          : JSON.stringify({
+            outcome: "pass",
+            reason: "All acceptance checks pass.",
+            repositoryFingerprint: "repo-after-fix",
+            evidenceFingerprint: "verifier-evidence-2",
+          }),
+        aborted: false,
+        steered: false,
+      });
+    });
+
+    try {
+      await controller.startLoop(ctx, "ship feature", ["tests pass"], { planPath, agentDir });
+      await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(2));
+      controller.requestEvaluation(ctx);
+      await vi.waitFor(() => expect(controller.currentLoop?.cycle).toBe(1));
+      expect(controller.currentLoop).toMatchObject({ phase: "implementing", contextEpoch: 1, cycle: 1 });
+      expect(controller.currentLoop?.verifier).toMatchObject({ outcome: "replan", repositoryFingerprint: "repo-before-fix" });
+      expect(controller.currentLoop?.verifier?.correctionPath).toContain("cycle-1-plan.md");
+      await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(4));
+      controller.requestEvaluation(ctx);
+      await vi.waitFor(() => expect(controller.currentLoop?.phase).toBe("completed"));
+      expect(loopEntries(branch).at(-1)).toMatchObject({ phase: "completed", cycle: 1, contextEpoch: 1 });
+      expect(verifierCalls).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

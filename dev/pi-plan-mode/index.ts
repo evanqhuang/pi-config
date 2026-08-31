@@ -82,6 +82,21 @@ type PlanRecommendation = {
   signals: string[];
 };
 type ApprovalAction = "yolo-direct" | "yolo-compact" | "orchestrator-direct" | "orchestrator-compact" | "prewalk";
+
+/** Versioned cross-extension bridge for the explicit plan approval boundary. */
+export const PLAN_MODE_BRIDGE_VERSION = 1 as const;
+export const PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL = "pi-plan-mode:approved-plan-query-v1" as const;
+export const PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL = "pi-plan-mode:implementation-started-v1" as const;
+export type PlanModeApprovalAction = ApprovalAction;
+export type PlanModeExecutionStrategy = ParentRecommendation;
+export interface PlanModeBridgePlan {
+  planPath: string;
+  action: PlanModeApprovalAction;
+  strategy: PlanModeExecutionStrategy;
+  /** Present only when the selected action requires PREWALK reproduction. */
+  prewalk?: { required: true };
+}
+
 type PendingApproval = {
   action: ApprovalAction;
   /** In-memory generation; durable recovery gets a fresh generation. */
@@ -150,6 +165,7 @@ type State = {
   pendingApprovalArmed: boolean;
   transitionPromises: Map<string, Promise<void>>;
   transitionStarted: Set<string>;
+  implementationStarted: Set<string>;
   compactionCallbacks: Set<string>;
   allTools: string[];
   sandboxed: boolean;
@@ -580,6 +596,48 @@ function persistedPlanContextApproval(entry: SessionEntry): ApprovalPendingRecor
   };
 }
 
+function latestApprovalMarker(document: string): string | undefined {
+  const markers = [...document.matchAll(/<!--\s*approval-status:\s*([^;\s]+)\s*;/g)].map(match => match[1]);
+  return markers.at(-1);
+}
+
+function bridgePlanForAction(planPath: string, action: ApprovalAction): PlanModeBridgePlan {
+  const strategy = action.startsWith("orchestrator")
+    ? "ORCHESTRATOR"
+    : action === "prewalk"
+      ? "PREWALK"
+      : "YOLO";
+  return action === "prewalk"
+    ? { planPath, action, strategy, prewalk: { required: true } }
+    : { planPath, action, strategy };
+}
+
+/**
+ * Read only the active branch's latest approval record. This intentionally
+ * shares the canonical path validator and durable markers used by restore;
+ * recommendations, draft/revision status, and old approval records cannot
+ * become bridge results.
+ */
+async function approvedPlanForBridge(ctx: ExtensionContext): Promise<PlanModeBridgePlan | undefined> {
+  const latest = latestPlanContextEntry(ctx);
+  if (!latest) return undefined;
+  const record = persistedPlanContextApproval(latest);
+  if (!record || record === "invalid") return undefined;
+  try {
+    const canonical = await validateManagedPlanPath(record.planPath);
+    if (canonical !== record.planPath) return undefined;
+    const document = await readFile(canonical, "utf8");
+    const marker = latestApprovalMarker(document);
+    if (marker !== `approved-${record.approvalAction}-pending`
+      && marker !== `approved-${record.approvalAction}-started`) return undefined;
+    return bridgePlanForAction(canonical, record.approvalAction);
+  } catch {
+    // Stale, malformed, symlinked, or otherwise unreadable plans are not
+    // approval results. The bridge deliberately fails closed.
+    return undefined;
+  }
+}
+
 /**
  * Restore only the new, explicit approval record. Older state entries never
  * carried enough information to authorize an implementation and are ignored.
@@ -702,6 +760,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     pendingApprovalArmed: false,
     transitionPromises: new Map(),
     transitionStarted: new Set(),
+    implementationStarted: new Set(),
     compactionCallbacks: new Set(),
     allTools: [],
     sandboxed: false,
@@ -711,10 +770,30 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     planStatus: "none",
   };
 
+  let activeContext: ExtensionContext | undefined;
   const orchestratorUnsubscribers: Array<() => void> = [];
+  const bridgeUnsubscribers: Array<() => void> = [];
   const eventBus = (pi as unknown as {
-    events?: { on(channel: string, handler: (data: unknown) => void): unknown };
+    events?: {
+      on(channel: string, handler: (data: unknown) => void): unknown;
+      emit(channel: string, data: unknown): void;
+    };
   }).events;
+  if (!isChild && eventBus) {
+    const unsubscribe = eventBus.on(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL, async (raw) => {
+      if (!isRecord(raw)
+        || raw.version !== PLAN_MODE_BRIDGE_VERSION
+        || typeof raw.requestId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,128}$/u.test(raw.requestId)) return;
+      const result = activeContext ? await approvedPlanForBridge(activeContext) : undefined;
+      eventBus.emit(`${PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL}:reply:${raw.requestId}`, {
+        version: PLAN_MODE_BRIDGE_VERSION,
+        requestId: raw.requestId,
+        result: result ?? null,
+      });
+    });
+    if (typeof unsubscribe === "function") bridgeUnsubscribers.push(unsubscribe as () => void);
+  }
   if (!isChild && eventBus) {
     for (const channel of ["subagents:started", "subagents:completed", "subagents:failed"]) {
       const unsubscribe = eventBus.on(channel, (data) => {
@@ -881,11 +960,23 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     await requestMode(requested.toUpperCase() as Mode, ctx);
   };
 
+  const notifyImplementationStarted = (pending: PendingApproval) => {
+    const key = approvalTransitionKey(pending);
+    if (state.implementationStarted.has(key)) return;
+    state.implementationStarted.add(key);
+    eventBus?.emit(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, {
+      version: PLAN_MODE_BRIDGE_VERSION,
+      ...bridgePlanForAction(pending.planPath, pending.action),
+      ...(pending.transitionId ? { transitionId: pending.transitionId } : {}),
+    });
+  };
+
   const startImplementation = async (pending: PendingApproval, ctx: ExtensionContext, mode: Exclude<Mode, "PLAN">) => {
     await apply(mode, ctx);
     const history = pending.transcriptPath
       ? ` A snapshot of the full pre-compaction chat history is available at ${pending.transcriptPath} if details are needed.`
       : "";
+    notifyImplementationStarted(pending);
     pi.sendUserMessage(`Implement the approved plan saved at ${pending.planPath} in ${mode} mode.${history}`);
   };
 
@@ -896,6 +987,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       : "";
     const task = `Implement the approved plan below. The durable plan is at ${pending.planPath}.${history}\n\n${pending.plan}\n`;
     notify(ctx, "PREWALK started; this session will wait and report its result");
+    notifyImplementationStarted(pending);
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
       const child = spawn(launcher, ["--prompt-stdin"], { cwd: ctx.cwd, stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "";
@@ -1258,6 +1350,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    activeContext = ctx;
     try {
       await prunePlans(plansRoot());
       const restoredPlan = await restorePlanContext(ctx);
@@ -1357,6 +1450,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    activeContext = ctx;
     const restoredPlan = await restorePlanContext(ctx);
     const recoveredApproval = !isChild ? await restorePendingApproval(ctx) : undefined;
     state.planPath = restoredPlan.planPath;
@@ -1394,6 +1488,10 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async () => {
+    activeContext = undefined;
+    while (bridgeUnsubscribers.length > 0) {
+      try { bridgeUnsubscribers.pop()?.(); } catch {}
+    }
     while (orchestratorUnsubscribers.length > 0) {
       try { orchestratorUnsubscribers.pop()?.(); } catch {}
     }

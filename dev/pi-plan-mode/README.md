@@ -30,6 +30,10 @@ Plans may opt into a recommendation with a bounded directive such as `Parent rec
 
 A typical substantial task therefore flows from three parallel explorers, through correction of any wrong-ref finding, to a Plan-agent stress test, one rendered plan artifact, and path-only approval. Recommendation labels are advisory: the user remains the sole approval authority, and fresh or malformed sessions default to YOLO.
 
+## Goal-loop bridge
+
+The extension exposes a version-1 `pi.events` bridge for `pi-goal-local`: `pi-plan-mode:approved-plan-query-v1` replies on a request-scoped `:reply:<requestId>` channel with only the current canonical managed `planPath`, explicit approval `action`, selected `strategy`, and PREWALK-required metadata when applicable. A null result is returned for drafts, revisions, recommendations, failed/stale/cancelled approvals, symlinked paths, and malformed records. `pi-plan-mode:implementation-started-v1` is emitted once, after the durable `transition-started` entry and immediately before direct/compacted implementation or PREWALK kickoff. Consumers must use the typed goal-local bridge and dispose it on shutdown; PREWALK metadata is retained so corrective loops cannot silently switch strategy.
+
 ## Lifecycle and security model
 
 PLAN has two deliberately separate layers:

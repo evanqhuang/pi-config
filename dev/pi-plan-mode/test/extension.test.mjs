@@ -1,13 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
 const requirePi = createRequire("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/package.json");
 const { createJiti } = requirePi("jiti");
-const jiti = createJiti("/Users/evanhuang/.pi/agent/dev/pi-plan-mode/index.ts");
-const { default: registerPlanMode } = await jiti.import("/Users/evanhuang/.pi/agent/dev/pi-plan-mode/index.ts");
+const planModeRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const jiti = createJiti(join(planModeRoot, "index.ts"));
+const {
+  default: registerPlanMode,
+  PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL,
+  PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL,
+  PLAN_MODE_BRIDGE_VERSION,
+} = await jiti.import(join(planModeRoot, "index.ts"));
 
 function mockPi() {
   const tools = new Map([
@@ -72,6 +79,25 @@ function isolatedEnvironment(t) {
     rmSync(root, { recursive: true, force: true });
   });
   return root;
+}
+
+function queryBridge(pi, requestId) {
+  return new Promise((resolve) => {
+    const channel = `${PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL}:reply:${requestId}`;
+    let settled = false;
+    const finish = (reply) => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      resolve(reply);
+    };
+    const unsubscribe = pi.events.on(channel, finish);
+    pi.events.emit(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL, {
+      version: PLAN_MODE_BRIDGE_VERSION,
+      requestId,
+    });
+    setTimeout(() => finish({ result: null }), 100);
+  });
 }
 
 function mockContext(entries, sessionFile) {
@@ -1158,4 +1184,52 @@ test("child PLAN captures the global probe and cannot own plan approval", async 
     if (previous === undefined) delete registry[key];
     else registry[key] = previous;
   }
+});
+
+test("versioned bridge exposes only approved canonical plans and emits implementation-started once", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  isolatedEnvironment(t);
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext(pi.entries, undefined);
+  await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
+  const draftTool = pi.tools.get("manage_plan_draft");
+  const approvalTool = pi.tools.get("submit_plan_for_approval");
+  const draft = await draftTool.execute("bridge-draft", { action: "create", plan: "# Bridge plan\\n\\n1. Implement it." }, undefined, undefined, ctx);
+  assert.equal((await queryBridge(pi, "draft-query")).result, null);
+
+  const started = [];
+  const order = [];
+  const unsubscribeStarted = pi.events.on(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL, (event) => { started.push(event); order.push("started"); });
+  const sendUserMessage = pi.sendUserMessage;
+  pi.sendUserMessage = (message) => { order.push("kickoff"); sendUserMessage.call(pi, message); };
+  ctx.selections.push("Implement with YOLO");
+  await approvalTool.execute("bridge-approval", { planPath: draft.details.planPath }, undefined, undefined, ctx);
+
+  const pending = await queryBridge(pi, "pending-query");
+  assert.deepEqual(pending.result, { planPath: draft.details.planPath, action: "yolo-direct", strategy: "YOLO" });
+  assert.equal(Object.hasOwn(pending.result, "plan"), false, "bridge never exposes plan contents");
+  await pi.handlers.get("agent_settled")({}, ctx);
+  assert.deepEqual(order, ["started", "kickoff"]);
+  assert.equal(started.length, 1);
+  assert.equal(started[0].version, PLAN_MODE_BRIDGE_VERSION);
+  assert.equal(started[0].planPath, draft.details.planPath);
+  const transitionIndex = pi.entries.findIndex((entry) => entry.customType === "pi-plan-mode-plan-context" && entry.data.status === "transition-started");
+  assert.ok(transitionIndex >= 0);
+  await pi.handlers.get("agent_settled")({}, ctx);
+  assert.equal(started.length, 1, "duplicate settlement does not re-emit implementation-started");
+
+  await pi.commands.get("plan").handler(undefined, ctx);
+  const revised = await draftTool.execute("bridge-revised", { action: "create", plan: "# Revised only" }, undefined, undefined, ctx);
+  ctx.selections.push("Request revisions…");
+  await approvalTool.execute("bridge-revision", { planPath: revised.details.planPath }, undefined, undefined, ctx);
+  assert.equal((await queryBridge(pi, "revised-query")).result, null);
+  unsubscribeStarted();
+  await pi.handlers.get("session_shutdown")({}, ctx);
+  assert.equal(pi.eventListeners.get(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL)?.size ?? 0, 0);
+  assert.equal(pi.eventListeners.get(PLAN_MODE_IMPLEMENTATION_STARTED_CHANNEL)?.size ?? 0, 0);
 });
