@@ -5,19 +5,19 @@
       "name": "Qwen3.8 27B Main at 80%",
       "provider": "qwen38-main",
       "model": "qwen3.8-27b",
-      "thresholdTokens": 192000
+      "thresholdTokens": 144500
     },
     {
       "name": "Qwen3.8 27B Subagent at 80%",
       "provider": "qwen38-subagent",
       "model": "qwen3.8-27b",
-      "thresholdTokens": 76800
+      "thresholdTokens": 81600
     },
     {
       "name": "Qwopus3.5 9B MTP at 80%",
       "provider": "qwopus-subagent",
       "model": "qwopus3.5-9b-coder-mtp",
-      "thresholdTokens": 78643
+      "thresholdTokens": 83558
     }
   ]
 }

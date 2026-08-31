@@ -10,9 +10,12 @@ function createPiImporter() {
 	return createJiti(`${packageRoot}/dist/cli.js`, {
 		moduleCache: false,
 		alias: {
-			"@earendil-works/pi-coding-agent": `${packageRoot}/dist/index.js`,
+			"@earendil-works/pi-agent-core": `${packageRoot}/node_modules/@earendil-works/pi-agent-core/dist/index.js`,
+			"@earendil-works/pi-ai": `${packageRoot}/node_modules/@earendil-works/pi-ai/dist/index.js`,
 			"@earendil-works/pi-ai/compat": `${packageRoot}/node_modules/@earendil-works/pi-ai/dist/compat.js`,
+			"@earendil-works/pi-coding-agent": `${packageRoot}/dist/index.js`,
 			"@earendil-works/pi-tui": `${packageRoot}/node_modules/@earendil-works/pi-tui/dist/index.js`,
+			typebox: `${packageRoot}/node_modules/typebox/build/index.mjs`,
 		},
 	});
 }
@@ -68,8 +71,13 @@ function createRegisteredEditor(registerTabThinking) {
 
 test("the registered factory preserves custom editors and cycles thinking on empty Tab", async () => {
 	const jiti = createPiImporter();
-	const [{ default: registerTabThinking, normalizeTerminalInput }, { matchesKey, parseKey }] = await Promise.all([
+	const [
+		{ default: registerTabThinking, normalizeTerminalInput },
+		{ normalizeLocalModelCycleInput },
+		{ matchesKey, parseKey },
+	] = await Promise.all([
 		jiti.import("/Users/evanhuang/.pi/agent/extensions/tab-thinking.ts"),
+		jiti.import("/Users/evanhuang/.pi/agent/extensions/local-mode/index.ts"),
 		jiti.import("@earendil-works/pi-tui"),
 	]);
 	const setup = createRegisteredEditor(registerTabThinking);
@@ -93,6 +101,9 @@ test("the registered factory preserves custom editors and cycles thinking on emp
 	assert.equal(parseKey(legacyAltTab), "ctrl+alt+i", "documents the upstream legacy parsing bug");
 	assert.equal(parseKey(normalizedAltTab), "alt+tab");
 	assert.equal(matchesKey(normalizedAltTab, "alt+tab"), true);
+	assert.equal(normalizeLocalModelCycleInput(legacyAltTab), normalizedAltTab);
+	assert.equal(normalizeLocalModelCycleInput(normalizedAltTab), normalizedAltTab);
+	assert.equal(matchesKey(normalizeLocalModelCycleInput(legacyAltTab), "alt+tab"), true);
 	setup.setText("");
 	setup.editor.handleInput(legacyAltTab);
 

@@ -23,6 +23,7 @@ When enabled, the extension:
 - switches to the `local-green` theme, including green editor borders;
 - shows a green `LOCAL` status and working indicator;
 - shows the measured local output generation rate in the statusline after a response (`tok/s`) and keeps the latest rate visible across tool turns;
+- retries a local 27B provider turn up to five times when the final provider stop reason is `repetition`, preserving the conversation and discarding partial output from interrupted attempts;
 - requires the main local agent to create and update parent-session todos for multi-step work; Explore remains read-only and cannot update those todos;
 - adds concise local working-style, parent-session todo, and non-blocking delegation instructions to each turn;
 - remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp` and blocks other child launches while the 27B child-agent lane is disabled;
@@ -36,19 +37,18 @@ The global `~/.pi/agent/agents/LocalExplore.md` profile is always discoverable, 
 
 ## Adaptive Qwen budgets
 
-The 240K main provider uses these xhigh ceilings before applying a remaining-context clamp:
+Local model context windows come from the active model metadata in `~/.pi/agent/models.json`; local mode does not maintain a second provider catalog or hard-code those windows. The 27B subagent remains a separate 96K provider with its own output ceiling, while the read-only 9B provider is unaffected by the Qwen profile logic.
 
-| Existing context | Thinking budget | Total generation |
-|---:|---:|---:|
-| Below 100K | 64K | 96K |
-| 100K–140K | 48K | 64K |
-| 140K–175K | 32K | 48K |
-| 175K or more | Request compaction | Recompute afterward |
+Compaction thresholds come from the active `pi-auto-compact` policy through its `pi-auto-compact:policy-request:v1` / `pi-auto-compact:policy:v1` protocol. That policy resolves configured `auto-compact.json` rules or Pi's native fallback. If no policy responds, local mode does not invent a percentage threshold; it still requests compaction when too little generation headroom remains.
 
-The 96K 27B subagent has a separate schedule: 32K/48K below 32K context, 24K/32K from 32K, 16K/24K from 56K, and compaction pressure at 72K. Every request reserves 8K context safety headroom and at least 4K of the generation allowance for a final answer. At extreme pressure, the request builder retains a 1K emergency answer allowance while compaction is pending.
+Low and medium keep their fixed target budgets, while xhigh starts from the provider-specific schedule in `session-policy.ts`. Every request then clamps generation to the active model's remaining context, reserves 8K of context safety headroom, and reserves at least 4K of the generation allowance for a final answer. At extreme pressure, the request builder retains a 1K emergency answer allowance while compaction is pending.
 
 The extension sends Qwen's thinking-mode sampling defaults (`temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0`, zero presence penalty, and repetition penalty 1.0). It also sends `enable_thinking`, `preserve_thinking`, the routed `reasoning_effort`, and the dynamically computed `thinking_token_budget` and `max_tokens` on every local Qwen request.
 
 There is no fixed tool-turn cutoff. Compaction and checkpoints are driven by context pressure, repeated lack of progress, or real phase transitions instead of an arbitrary number of tool calls. Automatic compaction waits until the agent is settled—never between tool iterations—then queues a continuation from the compacted task summary.
+
+## Repetition recovery
+
+Local mode wraps the `qwen38-main` and `qwen38-subagent` agent callers. If an attempt ends with provider `rawStopReason: "repetition"`, local mode buffers and discards that attempt, then retries the same conversation up to five times. Retry attempts add a transient instruction to continue from the conversation state and set `skip_reading_prefix_cache: true`; other stop reasons are not retried by this policy. If all retries repeat, only the final sanitized error is exposed—interrupted partial text is not rendered or persisted.
 
 Local mode enforces a process-wide local-provider and 27B profile policy. While it is active, main-session model changes and child subagent sessions are forced onto the registered `qwen38-main`, `qwen38-subagent`, or `qwopus-subagent` providers before a turn starts. A final provider-request guard aborts any non-local request rather than allowing it to leave the process. Child sessions launched with an explicit local subagent provider preserve that selection without inheriting the parent's local-mode UI state.

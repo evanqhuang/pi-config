@@ -36,10 +36,6 @@ interface LocalQwenProfileLimits {
 	maxTokens: number;
 }
 
-const MAIN_CONTEXT_WINDOW = 240_000;
-const SUBAGENT_CONTEXT_WINDOW = 96_000;
-const MAIN_COMPACTION_THRESHOLD = 175_000;
-const SUBAGENT_COMPACTION_THRESHOLD = 72_000;
 const CONTEXT_SAFETY_RESERVE = 8_192;
 const MIN_FINAL_ANSWER_TOKENS = 4_096;
 const MIN_USEFUL_GENERATION_TOKENS = 8_192;
@@ -56,11 +52,12 @@ function normalizeLocalQwenThinkingLevel(level: string): LocalQwenThinkingLevel 
 function xhighProfileLimits(
 	provider: LocalQwenProvider,
 	contextTokens: number,
+	compactionThreshold?: number,
 ): LocalQwenProfileLimits {
 	if (provider === "qwen38-subagent") {
 		if (contextTokens < 32_000) return { thinkingBudget: 32_768, maxTokens: 49_152 };
 		if (contextTokens < 56_000) return { thinkingBudget: 24_576, maxTokens: 32_768 };
-		if (contextTokens < SUBAGENT_COMPACTION_THRESHOLD) {
+		if (compactionThreshold === undefined || contextTokens < compactionThreshold) {
 			return { thinkingBudget: 16_384, maxTokens: 24_576 };
 		}
 		return { thinkingBudget: 24_576, maxTokens: 32_768 };
@@ -68,7 +65,7 @@ function xhighProfileLimits(
 
 	if (contextTokens < 100_000) return { thinkingBudget: 65_536, maxTokens: 98_304 };
 	if (contextTokens < 140_000) return { thinkingBudget: 49_152, maxTokens: 65_536 };
-	if (contextTokens < MAIN_COMPACTION_THRESHOLD) {
+	if (compactionThreshold === undefined || contextTokens < compactionThreshold) {
 		return { thinkingBudget: 32_768, maxTokens: 49_152 };
 	}
 	return { thinkingBudget: 49_152, maxTokens: 65_536 };
@@ -107,7 +104,7 @@ interface SessionHeader {
 }
 
 export interface LocalSessionContext {
-	model?: { provider: string; id?: string };
+	model?: { api?: string; provider: string; id?: string; contextWindow?: number };
 	sessionManager: {
 		getHeader(): SessionHeader | undefined;
 		getSessionName?(): string | undefined;
@@ -173,6 +170,7 @@ export function localQwenProfile(
 	localOnly: boolean,
 	requestedLevel: string,
 	contextTokens = 0,
+	compactionThreshold?: number,
 ): LocalQwenProfile | undefined {
 	if (
 		!localOnly ||
@@ -184,17 +182,22 @@ export function localQwenProfile(
 	}
 
 	const provider = ctx.model.provider;
+	const contextWindow = Math.max(0, Math.floor(ctx.model.contextWindow ?? 0));
+	if (contextWindow === 0) return undefined;
+
 	const thinkingLevel = normalizeLocalQwenThinkingLevel(requestedLevel);
 	const normalizedContextTokens = Math.max(0, Math.floor(contextTokens));
-	const contextWindow =
-		provider === "qwen38-main" ? MAIN_CONTEXT_WINDOW : SUBAGENT_CONTEXT_WINDOW;
-	const compactionThreshold =
-		provider === "qwen38-main"
-			? MAIN_COMPACTION_THRESHOLD
-			: SUBAGENT_COMPACTION_THRESHOLD;
+	const normalizedCompactionThreshold =
+		compactionThreshold === undefined
+			? undefined
+			: Math.max(0, Math.floor(compactionThreshold));
 	const desired =
 		thinkingLevel === "xhigh"
-			? xhighProfileLimits(provider, normalizedContextTokens)
+			? xhighProfileLimits(
+					provider,
+					normalizedContextTokens,
+					normalizedCompactionThreshold,
+				)
 			: FIXED_LOCAL_QWEN_PROFILES[thinkingLevel];
 	const availableGenerationTokens = Math.max(
 		0,
@@ -212,7 +215,8 @@ export function localQwenProfile(
 		maxTokens,
 		contextWindow,
 		requiresCompaction:
-			normalizedContextTokens >= compactionThreshold ||
+			(normalizedCompactionThreshold !== undefined &&
+				normalizedContextTokens >= normalizedCompactionThreshold) ||
 			maxTokens < MIN_USEFUL_GENERATION_TOKENS,
 	};
 }

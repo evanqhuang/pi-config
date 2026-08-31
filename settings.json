@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.84.3",
+  "lastChangelogVersion": "0.84.4",
   "theme": "dark",
   "packages": [
     "dev/pi-goal-local",
@@ -7,13 +7,7 @@
     "dev/pi-plan-mode",
     "dev/pi-notes",
     "npm:pi-rtk-rewrite",
-    {
-      "source": "npm:pi-playwright",
-      "extensions": [],
-      "skills": [],
-      "prompts": [],
-      "themes": []
-    },
+    "npm:pi-playwright",
     "npm:@juicesharp/rpiv-todo",
     "npm:@petechu/pi-extension-toggle",
     "npm:@juicesharp/rpiv-ask-user-question",
@@ -52,8 +46,7 @@
     },
     "npm:@haemmid/pi-processes"
   ],
-  "defaultProvider": "qwen38-subagent",
-  "defaultModel": "qwen3.8-27b",
+  "defaultProvider": "qwen38-main",
   "enabledModels": [
     "openai-codex/gpt-5.6-sol",
     "openai-codex/gpt-5.6-luna",
@@ -231,5 +224,7 @@
   },
   "extensions": [
     "+extensions/pr-worktree-guard/index.ts"
-  ]
+  ],
+  "defaultThinkingLevel": "medium",
+  "defaultModel": "qwen3.8-27b"
 }

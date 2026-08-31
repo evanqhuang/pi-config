@@ -24,9 +24,16 @@ function context(
 	parentSession,
 	sessionName = "general-purpose#1234abcd",
 	modelId,
+	contextWindow = provider === "qwen38-main"
+		? 170000
+		: provider === "qwen38-subagent"
+			? 96000
+			: 98304,
 ) {
 	return {
-		model: provider ? { provider, id: modelId } : undefined,
+		model: provider
+			? { api: "openai-completions", provider, id: modelId, contextWindow }
+			: undefined,
 		sessionManager: {
 			getHeader: () => ({ parentSession }),
 			getSessionName: () => sessionName,
@@ -40,34 +47,32 @@ test("maps the bounded low and medium local Qwen profiles", () => {
 		thinkingLevel: "low",
 		thinkingBudget: 4096,
 		maxTokens: 12288,
-		contextWindow: 240000,
+		contextWindow: 170000,
 		requiresCompaction: false,
 	});
 	assert.deepEqual(localQwenProfile(ctx, true, "medium"), {
 		thinkingLevel: "medium",
 		thinkingBudget: 8192,
 		maxTokens: 20480,
-		contextWindow: 240000,
+		contextWindow: 170000,
 		requiresCompaction: false,
 	});
 });
 
-test("scales the main xhigh profile at every context boundary", () => {
+test("scales the main xhigh profile within the 170K window", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
 	for (const [contextTokens, thinkingBudget, maxTokens, requiresCompaction] of [
 		[0, 65536, 98304, false],
-		[99999, 65536, 98304, false],
-		[100000, 49152, 65536, false],
-		[139999, 49152, 65536, false],
-		[140000, 32768, 49152, false],
-		[174999, 32768, 49152, false],
-		[175000, 49152, 56808, true],
+		[99999, 57713, 61809, false],
+		[100000, 49152, 61808, false],
+		[144499, 13213, 17309, false],
+		[144500, 13212, 17308, true],
 	]) {
-		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens), {
+		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens, 144500), {
 			thinkingLevel: "xhigh",
 			thinkingBudget,
 			maxTokens,
-			contextWindow: 240000,
+			contextWindow: 170000,
 			requiresCompaction,
 		});
 	}
@@ -84,9 +89,10 @@ test("uses a smaller xhigh schedule for the 96K subagent", () => {
 		[0, 32768, 49152, false],
 		[32000, 24576, 32768, false],
 		[56000, 16384, 24576, false],
-		[72000, 11712, 15808, true],
+		[76800, 6912, 11008, false],
+		[81600, 2112, 6208, true],
 	]) {
-		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens), {
+		assert.deepEqual(localQwenProfile(ctx, true, "xhigh", contextTokens, 81600), {
 			thinkingLevel: "xhigh",
 			thinkingBudget,
 			maxTokens,
@@ -98,13 +104,42 @@ test("uses a smaller xhigh schedule for the 96K subagent", () => {
 
 test("clamps generation to remaining context while reserving answer space", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
-	assert.deepEqual(localQwenProfile(ctx, true, "xhigh", 230000), {
+	assert.deepEqual(localQwenProfile(ctx, true, "xhigh", 160000), {
 		thinkingLevel: "xhigh",
 		thinkingBudget: 0,
 		maxTokens: 1808,
-		contextWindow: 240000,
+		contextWindow: 170000,
 		requiresCompaction: true,
 	});
+});
+
+test("derives the context window from active model metadata", () => {
+	const ctx = context(
+		"qwen38-main",
+		undefined,
+		undefined,
+		"qwen3.8-27b",
+		50000,
+	);
+	assert.deepEqual(localQwenProfile(ctx, true, "medium"), {
+		thinkingLevel: "medium",
+		thinkingBudget: 8192,
+		maxTokens: 20480,
+		contextWindow: 50000,
+		requiresCompaction: false,
+	});
+});
+
+test("does not invent threshold compaction when policy is unavailable", () => {
+	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
+	assert.equal(
+		localQwenProfile(ctx, true, "medium", 140000)?.requiresCompaction,
+		false,
+	);
+	assert.equal(
+		localQwenProfile(ctx, true, "medium", 160000)?.requiresCompaction,
+		true,
+	);
 });
 
 test("allows only automatic local Qwen sessions to request deeper reasoning", () => {
@@ -120,18 +155,6 @@ test("allows only automatic local Qwen sessions to request deeper reasoning", ()
 		),
 		false,
 	);
-});
-
-test("keeps extension provider metadata synchronized with active Pi models", () => {
-	const sourceProviders = JSON.parse(
-		readFileSync(join(__dirname, "local-providers.json"), "utf8"),
-	);
-	const activeProviders = JSON.parse(
-		readFileSync(join(__dirname, "..", "..", "models.json"), "utf8"),
-	).providers;
-	for (const provider of ["qwen38-main", "qwen38-subagent", "qwopus-subagent"]) {
-		assert.deepEqual(activeProviders[provider], sourceProviders[provider]);
-	}
 });
 
 test("uses /local as an idempotent automatic-mode entrypoint", () => {
@@ -241,7 +264,7 @@ test("queues context compaction after settlement and resumes the task", () => {
 
 test("builds a preserved-thinking request from the dynamic profile", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
-	const profile = localQwenProfile(ctx, true, "xhigh", 120000);
+	const profile = localQwenProfile(ctx, true, "xhigh", 100000);
 	assert.ok(profile);
 	assert.deepEqual(
 		buildLocalQwenRequestPayload(
@@ -255,7 +278,7 @@ test("builds a preserved-thinking request from the dynamic profile", () => {
 			model: "qwen3.8-27b",
 			reasoning_effort: "xhigh",
 			thinking_token_budget: 49152,
-			max_tokens: 65536,
+			max_tokens: 61808,
 			chat_template_kwargs: {
 				custom_flag: true,
 				enable_thinking: true,
@@ -267,7 +290,7 @@ test("builds a preserved-thinking request from the dynamic profile", () => {
 
 test("keeps an emergency answer allowance when compaction is pending", () => {
 	const ctx = context("qwen38-main", undefined, undefined, "qwen3.8-27b");
-	const profile = localQwenProfile(ctx, true, "xhigh", 239000);
+	const profile = localQwenProfile(ctx, true, "xhigh", 169000);
 	assert.ok(profile);
 	const payload = buildLocalQwenRequestPayload({}, profile);
 	assert.equal(payload.max_tokens, 1024);
