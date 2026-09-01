@@ -288,19 +288,39 @@ describe("session lifecycle integration", () => {
     })).rejects.toThrow(/Rendered Notes exceed 8192 bytes/);
   });
 
-  it("does not dirty or pressure a clean checkpoint for ordinary read/search results", async () => {
+  it("does not dirty or pressure a clean checkpoint below the read/search result threshold", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
     await h.command.handler("on", h.ctx);
     await h.checkpointTool.execute("cp-1", payload);
 
-    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults; index += 1) {
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.readOnlyToolResults - 1; index += 1) {
       const toolName = index % 2 === 0 ? "read" : "web_search";
       h.handlers.get("tool_result")!({ toolName, input: { path: `src/${index}.ts` }, isError: false });
     }
 
     expect(await h.status()).toContain("dirty: false");
     expect(await h.status()).toContain("checkpoint due: false");
+  });
+
+  it("pressures a checkpoint after read/search results in one turn", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.readOnlyToolResults; index += 1) {
+      const toolName = index % 2 === 0 ? "read" : "web_search";
+      h.handlers.get("tool_result")!({ toolName, input: { path: `src/${index}.ts` }, isError: false });
+    }
+
+    expect(await h.status()).toContain("dirty: true");
+    expect(await h.status()).toContain("checkpoint due: true");
+
+    const firstContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+    expect(firstContext.messages.at(-1)?.content).toContain("[TASK NOTES CHECKPOINT DUE]");
+    const secondContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+    expect(secondContext.messages).toHaveLength(0);
   });
 
   it("marks a checkpoint dirty only after the read-only turn threshold", async () => {
@@ -383,6 +403,48 @@ describe("session lifecycle integration", () => {
     h.handlers.get("tool_result")!({ toolName: "read", input: { path: "src/after-threshold.ts" }, isError: false });
     h.handlers.get("turn_end")!({});
     expect(await h.status()).toContain("dirty: true");
+  });
+
+  it("resets read/search result pressure after checkpoint commit", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.readOnlyToolResults; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/before-${index}.ts` }, isError: false });
+    }
+    expect(await h.status()).toContain("checkpoint due: true");
+
+    await h.checkpointTool.execute("cp-2", payload);
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.readOnlyToolResults - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/after-${index}.ts` }, isError: false });
+    }
+
+    expect(await h.status()).toContain("dirty: false");
+    expect(await h.status()).toContain("checkpoint due: false");
+  });
+
+  it("resets read/search result pressure when restoring a branch", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+
+    const threshold = DEFAULT_CONFIG.checkpointing.readOnlyToolResults;
+    for (let index = 0; index < threshold - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/before-${index}.ts` }, isError: false });
+    }
+
+    const branch = h.branch.slice();
+    h.setBranch(branch);
+    await h.handlers.get("session_tree")!({}, h.ctx);
+    for (let index = 0; index < threshold - 1; index += 1) {
+      h.handlers.get("tool_result")!({ toolName: "read", input: { path: `src/after-${index}.ts` }, isError: false });
+    }
+
+    expect(await h.status()).toContain("dirty: false");
+    expect(await h.status()).toContain("checkpoint due: false");
   });
 
   it("publishes a compact checkpoint budget in the agent policy", async () => {

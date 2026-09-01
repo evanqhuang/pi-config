@@ -175,6 +175,7 @@ describe("runtime and rendering", () => {
     expect(DEFAULT_CONFIG.checkpointing).toEqual({
       dirtyTurns: 10,
       continuityRelevantToolResults: 32,
+      readOnlyToolResults: 16,
     });
   });
 

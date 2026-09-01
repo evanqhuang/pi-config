@@ -27,6 +27,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   checkpointing: {
     dirtyTurns: 10,
     continuityRelevantToolResults: 32,
+    readOnlyToolResults: 16,
   },
   integrations: {
     goal: true,
@@ -66,6 +67,7 @@ export interface NotesRuntime {
   checkpointReminderPending: boolean;
   turnsSinceCheckpoint: number;
   continuityRelevantToolResultsSinceCheckpoint: number;
+  readOnlyToolResultsSinceCheckpoint: number;
   activationTurns: number;
   activationToolCalls: number;
   readOnlyTurns: number;
@@ -304,6 +306,7 @@ export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMo
     checkpointReminderPending: false,
     turnsSinceCheckpoint: 0,
     continuityRelevantToolResultsSinceCheckpoint: 0,
+    readOnlyToolResultsSinceCheckpoint: 0,
     activationTurns: 0,
     activationToolCalls: 0,
     readOnlyTurns: 0,
@@ -533,6 +536,7 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
     runtime.checkpointReminderPending = false;
     runtime.turnsSinceCheckpoint = 0;
     runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
+    runtime.readOnlyToolResultsSinceCheckpoint = 0;
     runtime.readOnlyTurns = 0;
     runtime.reentryRequired = false;
     runtime.harnessFacts.recentFailedCommandCount = 0;
@@ -554,6 +558,7 @@ function resetIdentity(runtime: NotesRuntime): void {
   runtime.reentryRequired = false;
   runtime.turnsSinceCheckpoint = 0;
   runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
+  runtime.readOnlyToolResultsSinceCheckpoint = 0;
   runtime.activationTurns = 0;
   runtime.activationToolCalls = 0;
   runtime.readOnlyTurns = 0;
@@ -620,6 +625,7 @@ function restoreRuntimeState(runtime: NotesRuntime, state: StateRecord | undefin
   setCheckpointDue(runtime, runtime.dirty);
   runtime.turnsSinceCheckpoint = 0;
   runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
+  runtime.readOnlyToolResultsSinceCheckpoint = 0;
   runtime.reentryRequired = runtime.active;
 }
 
@@ -821,6 +827,15 @@ function recordActivity(
   }
   if (classified.continuityRelevant && isError) runtime.harnessFacts.recentFailedCommandCount += 1;
   const deferredReadOnly = isDeferredReadOnlyActivity(classified, isError, meaningfulSubagentCompletion);
+  const readOnlyInvestigation = deferredReadOnly
+    && (READ_TOOL_PATTERN.test(toolName) || RESEARCH_TOOL_PATTERN.test(toolName));
+  if (runtime.active && readOnlyInvestigation) {
+    runtime.readOnlyToolResultsSinceCheckpoint += 1;
+    if (runtime.readOnlyToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.readOnlyToolResults) {
+      markDirty(pi, runtime);
+      setCheckpointDue(runtime, true);
+    }
+  }
   if (runtime.active && !deferredReadOnly && (classified.continuityRelevant || classified.highSignal || isError || meaningfulSubagentCompletion)) {
     if (classified.continuityRelevant) {
       runtime.continuityRelevantToolResultsSinceCheckpoint += 1;
