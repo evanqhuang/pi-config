@@ -289,19 +289,23 @@ describe("transient reminders", () => {
     runtime.reentryRequired = true;
     runtime.dirty = true;
     runtime.checkpointDue = true;
+    runtime.checkpointReminderPending = true;
     const pi = { getActiveTools: () => ["checkpoint_notes"] };
 
     expect(selectReminder(pi, runtime)).toContain("[TASK NOTES RE-ENTRY]");
     expect(runtime.reentryRequired).toBe(false);
     expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(selectReminder(pi, runtime)).toBeUndefined();
   });
 
-  it("honors an explicit checkpoint request even when Notes are clean", () => {
+  it("honors one explicit checkpoint reminder even when Notes are clean", () => {
     const runtime = createRuntime("manual");
     runtime.dirty = false;
     runtime.checkpointDue = true;
+    runtime.checkpointReminderPending = true;
     const pi = { getActiveTools: () => ["checkpoint_notes"] };
 
     expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(selectReminder(pi, runtime)).toBeUndefined();
   });
 });

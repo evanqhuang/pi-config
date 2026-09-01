@@ -602,6 +602,31 @@ function safeSuffix(
   return hasCompleteToolTraffic(filtered) ? filtered : undefined;
 }
 
+function safeAutonomousSuffix(
+  messages: readonly GoalContextMessage[],
+  maxMessages: number,
+  maxBytes: number,
+): GoalContextMessage[] | undefined {
+  let boundary = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (isSummaryMessage(messages[index])) {
+      boundary = index;
+      break;
+    }
+  }
+  if (boundary < 0) return undefined;
+  const suffix = messages.slice(boundary + 1);
+  if (suffix.length === 0 || suffix.length > maxMessages) return undefined;
+  const allowed = suffix.every(message => isRecord(message)
+    && (message.role === "assistant" || message.role === "toolResult"));
+  if (!allowed || !hasCompleteToolTraffic(suffix)) return undefined;
+  try {
+    return Buffer.byteLength(canonicalJson(suffix), "utf8") <= maxBytes ? [...suffix] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeFilterOptions(options: ContextFilterArgument | undefined): ContextFilterOptions | undefined {
   if (options === undefined) return undefined;
   if (isRecord(options) && "originalPlan" in options) {
@@ -735,11 +760,8 @@ export function filterContextWithDisposition(
   });
   const parsedMarker = parseContextEpochMarker(marker, state, maxBootstrapBytes);
   const suffix = !markerIssue && !hasForeignOrStaleWithoutCurrent
-    ? safeSuffix(
-      messages,
-      maxFallbackMessages,
-      maxFallbackBytes,
-    )
+    ? safeSuffix(messages, maxFallbackMessages, maxFallbackBytes)
+      ?? safeAutonomousSuffix(messages, maxFallbackMessages, maxFallbackBytes)
     : undefined;
   if (suffix) {
     return {

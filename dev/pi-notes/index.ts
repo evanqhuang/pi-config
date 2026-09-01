@@ -62,6 +62,8 @@ export interface NotesRuntime {
   notesPath: string;
   dirty: boolean;
   checkpointDue: boolean;
+  /** Runtime-only latch: each due episode gets one ambient reminder. */
+  checkpointReminderPending: boolean;
   turnsSinceCheckpoint: number;
   continuityRelevantToolResultsSinceCheckpoint: number;
   activationTurns: number;
@@ -223,6 +225,7 @@ export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMo
     notesPath: notesPathFor(notesId),
     dirty: false,
     checkpointDue: false,
+    checkpointReminderPending: false,
     turnsSinceCheckpoint: 0,
     continuityRelevantToolResultsSinceCheckpoint: 0,
     activationTurns: 0,
@@ -451,6 +454,7 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
     runtime.lastCheckpointAt = checkpointedAt;
     runtime.dirty = false;
     runtime.checkpointDue = false;
+    runtime.checkpointReminderPending = false;
     runtime.turnsSinceCheckpoint = 0;
     runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
     runtime.readOnlyTurns = 0;
@@ -470,6 +474,7 @@ function resetIdentity(runtime: NotesRuntime): void {
   runtime.lastCheckpointAt = undefined;
   runtime.dirty = false;
   runtime.checkpointDue = false;
+  runtime.checkpointReminderPending = false;
   runtime.reentryRequired = false;
   runtime.turnsSinceCheckpoint = 0;
   runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
@@ -531,12 +536,12 @@ function restoreRuntimeState(runtime: NotesRuntime, state: StateRecord | undefin
     runtime.checkpointGeneration = checkpoint.generation;
   } else {
     runtime.dirty = false;
-    runtime.checkpointDue = false;
+    setCheckpointDue(runtime, false);
     runtime.checkpointGeneration = 0;
     runtime.lastCheckpointHash = undefined;
     runtime.lastCheckpointAt = undefined;
   }
-  runtime.checkpointDue = runtime.dirty;
+  setCheckpointDue(runtime, runtime.dirty);
   runtime.turnsSinceCheckpoint = 0;
   runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
   runtime.reentryRequired = runtime.active;
@@ -579,6 +584,13 @@ async function restoreFromBranch(pi: ExtensionAPI, runtime: NotesRuntime, ctx: E
   else await clearMaterializedNotes(runtime);
 }
 
+function setCheckpointDue(runtime: NotesRuntime, due: boolean, options: { remind?: boolean } = {}): void {
+  const changed = runtime.checkpointDue !== due;
+  runtime.checkpointDue = due;
+  if (!due) runtime.checkpointReminderPending = false;
+  else if (changed || options.remind === true) runtime.checkpointReminderPending = options.remind ?? true;
+}
+
 function activateIfNeeded(pi: ExtensionAPI, runtime: NotesRuntime): void {
   if (runtime.activationMode !== "auto" || runtime.active) return;
   const cfg = DEFAULT_CONFIG.autoActivation;
@@ -589,7 +601,7 @@ function activateIfNeeded(pi: ExtensionAPI, runtime: NotesRuntime): void {
   if (!threshold) return;
   runtime.active = true;
   runtime.dirty = runtime.activationTurns > 0 || runtime.activationToolCalls > 0;
-  runtime.checkpointDue = false;
+  setCheckpointDue(runtime, false);
   appendState(pi, runtime);
 }
 
@@ -737,7 +749,7 @@ function recordActivity(
     if (classified.continuityRelevant) {
       runtime.continuityRelevantToolResultsSinceCheckpoint += 1;
       if (runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
-        runtime.checkpointDue = true;
+        setCheckpointDue(runtime, true);
       }
     }
     markDirty(pi, runtime);
@@ -782,7 +794,8 @@ export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime
     runtime.reentryRequired = false;
     return "[TASK NOTES RE-ENTRY]\nReread the current NOTES.md compact durable continuation/task-state handoff and inspect live worktree/tool state before continuing. It is not general notes or proof.";
   }
-  if (runtime.checkpointDue) {
+  if (runtime.checkpointDue && runtime.checkpointReminderPending) {
+    runtime.checkpointReminderPending = false;
     return "[TASK NOTES CHECKPOINT DUE]\nExecution state changed materially since the last durable checkpoint or a checkpoint was explicitly requested. Before doing substantially more work, call checkpoint_notes once with only the current NOTES.md compact durable continuation/task-state handoff, not general notes, then continue.";
   }
   return undefined;
@@ -859,7 +872,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
       if (command === "off") {
         runtime.activationMode = "off";
         runtime.active = false;
-        runtime.checkpointDue = false;
+        setCheckpointDue(runtime, false);
         appendState(pi, runtime);
         return displayStatus(ctx, runtime, pi);
       }
@@ -878,7 +891,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
           ctx.ui.notify("checkpoint_notes is disabled by the current tool policy.", "warning");
           return;
         }
-        runtime.checkpointDue = true;
+        setCheckpointDue(runtime, true, { remind: false });
         pi.sendMessage({
           customType: NOTES_REMINDER_TYPE,
           content: "[TASK NOTES CHECKPOINT REQUESTED]\nCall checkpoint_notes now with the current NOTES.md compact durable continuation/task-state handoff, not general notes, then continue.",
@@ -899,7 +912,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
         }
         runtime.active = true;
         runtime.dirty = true;
-        runtime.checkpointDue = true;
+        setCheckpointDue(runtime, true);
         runtime.reentryRequired = true;
         runtime.harnessFacts.modifiedFiles = new Set(inherited.harnessFacts.modifiedFiles);
         runtime.harnessFacts.lastVerificationCommand = inherited.harnessFacts.lastVerificationCommand;
@@ -928,7 +941,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
   pi.on("session_compact", () => {
     if (!runtime.active) return;
     runtime.reentryRequired = true;
-    if (runtime.dirty) runtime.checkpointDue = true;
+    if (runtime.dirty) setCheckpointDue(runtime, true);
   });
   pi.on("session_compact_failed", () => {
     // Preserve state. A failed/aborted compaction is not a recovery boundary.
@@ -955,7 +968,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
       runtime.turnsSinceCheckpoint += 1;
       if (runtime.turnsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.dirtyTurns
         || runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
-        runtime.checkpointDue = true;
+        setCheckpointDue(runtime, true);
       }
     }
     activateIfNeeded(pi, runtime);

@@ -70,11 +70,15 @@ function integrationHarness() {
   let command: any;
   let baseCompletionApplications = 0;
   const sentMessages: any[] = [];
+  let leafId = "integration-leaf";
+  let idle = true;
+  let pendingMessages = false;
+  let aborts = 0;
   const sessionManager = {
     getBranch: () => branch,
     buildContextEntries: () => branch,
     getSessionId: () => "integration-session",
-    getLeafId: () => "integration-leaf",
+    getLeafId: () => leafId,
   };
   const baseProvider = {
     triggerCharacters: ["/"],
@@ -103,8 +107,9 @@ function integrationHarness() {
     mode: "tui",
     hasUI: true,
     ui,
-    isIdle: () => true,
-    hasPendingMessages: () => false,
+    isIdle: () => idle,
+    hasPendingMessages: () => pendingMessages,
+    abort: () => { aborts += 1; },
     sessionManager,
   } as any;
   const events = {
@@ -148,6 +153,10 @@ function integrationHarness() {
     get provider() { return provider; },
     get baseCompletionApplications() { return baseCompletionApplications; },
     sessionManager,
+    setLeaf(next: string) { leafId = next; },
+    setIdle(next: boolean) { idle = next; },
+    setPendingMessages(next: boolean) { pendingMessages = next; },
+    get aborts() { return aborts; },
   };
 }
 
@@ -246,6 +255,65 @@ describe("goal extension provider integration", () => {
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("reanchors after compaction when a queued continuation advances the leaf", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-integration-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const plan = "# Approved plan\nImplement the feature.\n";
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const expectedMarker = controllerEpochMarker(state);
+      state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      harness.setIdle(false);
+      await harness.handlers.get("session_compact")!({ type: "session_compact" }, harness.ctx);
+      expect(harness.sentMessages).toHaveLength(0);
+
+      harness.setLeaf("post-compaction-continuation");
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      await vi.waitFor(() => expect(
+        harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
+      ).toHaveLength(1));
+      expect(harness.sentMessages.filter(message => message.customType === "pi-goal-continue-v1")).toHaveLength(1);
+
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE)).toHaveLength(1);
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pauses and aborts instead of issuing a provider turn for unsafe context", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    const state = loopState();
+    harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+    const result = await harness.handlers.get("context")!({
+      type: "context",
+      messages: [
+        epochMarker(state),
+        { role: "assistant", content: [{ type: "toolCall", id: "orphan", name: "read", arguments: {} }] },
+      ],
+    }, harness.ctx) as { messages: Message[] };
+
+    expect(result.messages).toEqual([]);
+    expect(harness.aborts).toBe(1);
+    expect(harness.branch.at(-1)).toMatchObject({ customType: GOAL_STATE_V2_TYPE, data: { phase: "paused" } });
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
   });
 
   it("leaves a V1 goal context untouched", async () => {

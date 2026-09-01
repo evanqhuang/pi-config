@@ -229,6 +229,22 @@ describe("durable goal context epochs", () => {
     expect(JSON.stringify(result.messages)).toContain("latest-call");
   });
 
+  it("retains complete autonomous tool traffic after a compaction boundary when the marker is missing", () => {
+    const current = state();
+    const currentBootstrap = bootstrap(current);
+    const result = filterContextWithDisposition([
+      compaction("old compacted context"),
+      assistant("continue autonomously", "current-call"),
+      toolResult("current-call", "current result"),
+    ], current, { bootstrap: currentBootstrap });
+
+    expect(result.disposition).toBe("fallback-safe");
+    expect(result.safeSuffixIncluded).toBe(true);
+    expect(JSON.stringify(result.messages)).not.toContain("old compacted context");
+    expect(JSON.stringify(result.messages)).toContain("current-call");
+    expect(JSON.stringify(result.messages)).toContain("current result");
+  });
+
   it("returns bootstrap only when no safe complete user-led suffix exists", () => {
     const current = state();
     const currentBootstrap = bootstrap(current);

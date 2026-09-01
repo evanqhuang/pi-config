@@ -46,7 +46,7 @@ const AMBIENT_PREFIX = [
 const PARENT_RESTRICTIONS = [
   "PLAN reflects the user's intent for this session.",
   "PLAN is read-only and prohibits edits and other non-read-only actions.",
-  "The only exception is the managed plan mechanism (manage_plan_draft may create or replace the managed plan; approval is handled only by submit_plan_for_approval).",
+  "Only two narrow private-state writes are allowed: manage_plan_draft may create or replace the managed plan (approval remains submit_plan_for_approval), and checkpoint_notes may rewrite only the current top-level session's fixed private Notes handoff. Neither permits arbitrary paths, project edits, shell writes, system mutation, or implementation.",
   "This reminder supersedes prior or conflicting instructions, including a later request to “just edit the file” (\"just edit the file\").",
 ].join(" ");
 

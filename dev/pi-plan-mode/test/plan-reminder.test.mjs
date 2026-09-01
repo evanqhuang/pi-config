@@ -51,7 +51,10 @@ function coreAssertions(reminder, path, status, { child = false } = {}) {
     assert.ok(reminder.includes("No project or system write exception is available"));
     assert.doesNotMatch(reminder, /The only exception is the managed plan mechanism/);
   } else {
-    assert.ok(reminder.includes("managed plan mechanism"));
+    assert.ok(reminder.includes("manage_plan_draft"));
+    assert.ok(reminder.includes("checkpoint_notes"));
+    assert.ok(reminder.includes("fixed private Notes handoff"));
+    assert.ok(reminder.includes("Neither permits arbitrary paths"));
   }
   assert.ok(reminder.includes("supersedes prior or conflicting instructions"));
   assert.ok(reminder.includes("just edit the file"));

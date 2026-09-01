@@ -105,6 +105,8 @@ function mockContext(entries, sessionFile) {
   const inputs = [];
   const selectCalls = [];
   const compactCalls = [];
+  const widgets = new Map();
+  const statuses = new Map();
   return {
     cwd: "/Users/evanhuang/scratch/mcmaster-agent",
     hasUI: true,
@@ -114,6 +116,8 @@ function mockContext(entries, sessionFile) {
     inputs,
     selectCalls,
     compactCalls,
+    widgets,
+    statuses,
     isIdle() { return !this.running; },
     compact(options) { compactCalls.push(options); },
     sessionManager: {
@@ -124,7 +128,8 @@ function mockContext(entries, sessionFile) {
     ui: {
       theme: { fg: (_name, text) => text },
       notify(message, level) { notifications.push({ message, level }); },
-      setStatus() {},
+      setStatus(key, value) { if (value === undefined) statuses.delete(key); else statuses.set(key, value); },
+      setWidget(key, value) { if (value === undefined) widgets.delete(key); else widgets.set(key, value); },
       async select(title, options) { selectCalls.push({ title, options }); return selections.shift(); },
       async input() { return inputs.shift(); },
     },
@@ -158,11 +163,13 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const previousPlanDir = process.env.PI_PLAN_DIR;
   const previousPrewalkLauncher = process.env.PI_PREWALK_LAUNCHER;
   const previousPrewalkCapture = process.env.PI_PREWALK_CAPTURE;
+  const previousPrewalkArgs = process.env.PI_PREWALK_ARGS;
   process.env.CONTEXT_MODE_DATA_DIR = root;
   process.env.PI_PLAN_DIR = join(root, "plans");
   process.env.PI_PREWALK_LAUNCHER = join(root, "fake-prewalk");
   process.env.PI_PREWALK_CAPTURE = join(root, "prewalk-task.txt");
-  writeFileSync(process.env.PI_PREWALK_LAUNCHER, '#!/bin/sh\ncat > "$PI_PREWALK_CAPTURE"\nprintf \'[prewalk] summary {"checklist_ready":true,"executor_started":true,"executor_model":"test-executor","final_status":"completed"}\\n\' >&2\n');
+  process.env.PI_PREWALK_ARGS = join(root, "prewalk-args.txt");
+  writeFileSync(process.env.PI_PREWALK_LAUNCHER, '#!/bin/sh\nprintf "%s\\n" "$@" > "$PI_PREWALK_ARGS"\nprintf "Guide: inspecting the approved plan\\n"\nprintf "[prewalk] guide initialized\\n" >&2\nsleep 0.2\ncat > "$PI_PREWALK_CAPTURE"\nprintf \'[prewalk] summary {"checklist_ready":true,"executor_started":true,"executor_model":"test-executor","final_status":"completed"}\\n\' >&2\n');
   chmodSync(process.env.PI_PREWALK_LAUNCHER, 0o700);
   t.after(async () => {
     if (previousDataDir === undefined) delete process.env.CONTEXT_MODE_DATA_DIR;
@@ -173,6 +180,8 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
     else process.env.PI_PREWALK_LAUNCHER = previousPrewalkLauncher;
     if (previousPrewalkCapture === undefined) delete process.env.PI_PREWALK_CAPTURE;
     else process.env.PI_PREWALK_CAPTURE = previousPrewalkCapture;
+    if (previousPrewalkArgs === undefined) delete process.env.PI_PREWALK_ARGS;
+    else process.env.PI_PREWALK_ARGS = previousPrewalkArgs;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -320,7 +329,15 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const prewalkPath = await createDraft("# Prewalk plan\n\n1. Guide then execute.");
   ctx.selections.push("Implement with PREWALK");
   await approvalTool.execute("approval-prewalk", { planPath: prewalkPath }, undefined, undefined, ctx);
-  await pi.handlers.get("agent_settled")({}, ctx);
+  const prewalkTransition = pi.handlers.get("agent_settled")({}, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(readFileSync(process.env.PI_PREWALK_ARGS, "utf8").trim().split("\n"), ["--prompt-stdin", "--auto-approve-workspace-writes"]);
+  assert.match(ctx.widgets.get("pi-plan-prewalk").join("\n"), /Guide: inspecting the approved plan/);
+  assert.equal(ctx.statuses.get("pi-plan-prewalk"), "PREWALK running");
+  assert.match(ctx.notifications.at(-1).message, /guide initialized/);
+  await prewalkTransition;
+  assert.equal(ctx.widgets.has("pi-plan-prewalk"), false, "PREWALK progress clears after the child exits");
+  assert.equal(ctx.statuses.has("pi-plan-prewalk"), false, "PREWALK status clears after the child exits");
   assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /# Prewalk plan/);
   assert.match(readFileSync(process.env.PI_PREWALK_CAPTURE, "utf8"), /full planning chat snapshot/);
   assert.match(pi.customMessages.at(-1).content, /"final_status": "completed"/);
@@ -1176,8 +1193,10 @@ test("child PLAN captures the global probe and cannot own plan approval", async 
 
     const blockedDraft = await pi.handlers.get("tool_call")({ toolName: "manage_plan_draft", input: {} });
     const blockedApproval = await pi.handlers.get("tool_call")({ toolName: "submit_plan_for_approval", input: {} });
+    const blockedCheckpoint = await pi.handlers.get("tool_call")({ toolName: "checkpoint_notes", input: {} });
     assert.equal(blockedDraft.block, true);
     assert.equal(blockedApproval.block, true);
+    assert.equal(blockedCheckpoint.block, true);
     await pi.handlers.get("session_shutdown")({}, ctx);
   } finally {
     if (previous === undefined) delete registry[key];

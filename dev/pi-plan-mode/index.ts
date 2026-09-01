@@ -49,14 +49,14 @@ const PLAN_CONTEXT_VERSION = 1;
 const APPROVAL_RESUME_OPTIONS = ["Resume approved implementation", "Stay in PLAN"] as const;
 const RESTORE_PROMPT_REGISTRY = Symbol.for("pi-plan-mode:approval-restore-prompts:v1");
 const CHILD_CONTEXT_PROBE = Symbol.for("pi-subagents:child-context:v1");
-const CHILD_PLAN_TOOLS = new Set(["manage_plan_draft", "submit_plan_for_approval"]);
+const CHILD_PLAN_TOOLS = new Set(["manage_plan_draft", "submit_plan_for_approval", "checkpoint_notes"]);
 const ORCHESTRATOR_VERIFIERS = new Map([
   ["lunacompliance", "LunaCompliance"],
   ["lunatestverifier", "LunaTestVerifier"],
 ]);
 const PLAN_PROMPT = `PLAN MODE IS ACTIVE. You are a read-only planning agent.
 Investigate the repository before proposing changes. Use direct tools for simple, known-file questions. For a substantial task with 2-4 genuinely independent unknowns, launch focused Explore agents together in one parallel batch; do not delegate to satisfy a quota. Give each agent the exact checkout, branch, PR ref, or worktree, a non-overlapping question, relevant paths, and require a concise file:line handoff. Continue useful parent-session investigation while background agents run; never poll or sleep. Verify every handoff against the correct ref, redirect or relaunch an agent whose premise is wrong, and reconcile conflicting evidence. Once evidence is sufficient, use the read-only Plan agent to draft or stress-test a substantial implementation strategy. LunaCompliance and LunaTestVerifier are post-implementation verification agents and must not be used while creating the plan. The parent remains responsible for clarification, source verification, final synthesis, and approval.
-When requirements or implementation choices are ambiguous, use ask_user_question to present focused options and obtain the user's decision; do not rely on an unstructured prose question when that tool is available. Never implement, edit, write, patch, delete, install, commit, create worktrees, or otherwise mutate project or system state. The sole project-independent write exception is manage_plan_draft, which may create or replace a managed plan artifact. Context-mode may persist its own private index and session metadata. Do not switch modes yourself or ask the user to switch modes as a substitute for completing the planning task. If a tool call is rejected by PLAN policy, acknowledge the constraint internally, continue with allowed read-only investigation, and still complete the planning response.
+When requirements or implementation choices are ambiguous, use ask_user_question to present focused options and obtain the user's decision; do not rely on an unstructured prose question when that tool is available. Never implement, edit, write, patch, delete, install, commit, create worktrees, or otherwise mutate project or system state. The only narrow private-state write exceptions are manage_plan_draft, which may create or replace a managed plan artifact, and checkpoint_notes, which may rewrite only the current top-level session's fixed private Notes handoff. Neither exception permits arbitrary paths, project edits, shell writes, system mutation, or implementation. Context-mode may persist its own private index and session metadata. Do not switch modes yourself or ask the user to switch modes as a substitute for completing the planning task. If a tool call is rejected by PLAN policy, acknowledge the constraint internally, continue with allowed read-only investigation, and still complete the planning response.
 Finish with a concrete plan containing context, numbered changes, relevant files and symbols, tests, risks, and validation checks. Use only bounded explicit plan signals for its advisory recommendation: YOLO for localized/tightly coupled work, ORCHESTRATOR for independent slices or parallel work, and PREWALK only when guided exploration is specifically useful; recommend compaction only when the self-contained plan/context warrants it. Do not paste the complete plan into an ordinary assistant message. Plan-artifact rule: manage_plan_draft is the only tool permitted to create, replace, inspect, or probe a managed plan artifact. Never use Bash, edit, write, ctx_execute, ctx_execute_file, or ctx_batch_execute as a fallback for plan files. If manage_plan_draft is unavailable, report the runtime loading problem and stop rather than attempting a workaround. Call manage_plan_draft create so its renderer displays the plan from the durable file, then call submit_plan_for_approval with only that planPath and stop. If revisions are requested, assess the bounded feedback against the current plan and repository evidence. For genuinely ambiguous feedback, require one focused ask_user_question clarification first and do not write. For actionable feedback, the parent must use exactly one ask_user_question with a concise proposed-change preview, exactly these two authored options—'Apply these updates (Recommended)' and 'Keep the current plan'—and the questionnaire's standard free-text row for further revisions. This confirms revision scope, not implementation approval. If Apply is selected, call manage_plan_draft replace on the same planPath and immediately call submit_plan_for_approval; do not add a redundant summary. If Keep is selected, resubmit the current planPath. Further free-text feedback records and reassesses without writing the plan. The approval tool owns explicit approval, optional compaction, mode switching, and implementation continuation. Never implement without approval. Use only the tools exposed in PLAN mode, and treat any unavailable or unknown tool as forbidden. Bash and context execution are native-sandboxed; do not attempt to bypass that boundary.`;
 
 const CHILD_PLAN_PROMPT = `PLAN MODE IS ACTIVE. You are a read-only child planning agent working on a delegated research or design task.
@@ -188,6 +188,10 @@ const REVISION_APPLY_OPTION = "Apply these updates (Recommended)";
 const REVISION_KEEP_OPTION = "Keep the current plan";
 const PLAN_SIGNAL_SCAN_LIMIT = 16_000;
 const MAX_RECOMMENDATION_SIGNALS = 4;
+const PREWALK_PROGRESS_WIDGET = "pi-plan-prewalk";
+const PREWALK_PROGRESS_MAX_CHARS = 8_000;
+const PREWALK_PROGRESS_MAX_LINES = 10;
+const PREWALK_PROGRESS_MAX_LINE_CHARS = 600;
 
 const ACTION_LABELS = Object.keys(APPROVAL_OPTIONS) as Array<keyof typeof APPROVAL_OPTIONS>;
 
@@ -442,6 +446,17 @@ async function prunePlans(root: string, now = Date.now()) {
 function shortenHome(path: string) {
   const home = homedir();
   return path === home ? "~" : path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+}
+
+function prewalkProgressLines(stdout: string, stderr: string) {
+  const combined = `${stdout}\n${stderr}`.replace(/\r/g, "").trim();
+  if (!combined) return ["PREWALK is starting…"];
+  const lines = combined.split("\n").filter(Boolean);
+  const tail = lines.slice(-PREWALK_PROGRESS_MAX_LINES).map((line) => (
+    line.length > PREWALK_PROGRESS_MAX_LINE_CHARS ? `…${line.slice(-PREWALK_PROGRESS_MAX_LINE_CHARS)}` : line
+  ));
+  if (tail.length < lines.length) tail.unshift("…");
+  return ["PREWALK running", ...tail];
 }
 
 function planDocument(plan: string, metadata: Record<string, unknown>) {
@@ -971,23 +986,39 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       ? `\nThe full planning chat snapshot is at ${pending.transcriptPath}; consult it if needed.`
       : "";
     const task = `Implement the approved plan below. The durable plan is at ${pending.planPath}.${history}\n\n${pending.plan}\n`;
-    notify(ctx, "PREWALK started; this session will wait and report its result");
-    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-      const child = spawn(launcher, ["--prompt-stdin"], { cwd: ctx.cwd, stdio: ["pipe", "pipe", "pipe"] });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => { stdout = (stdout + String(chunk)).slice(-1_000_000); });
-      child.stderr.on("data", (chunk) => {
-        const text = String(chunk);
-        stderr = (stderr + text).slice(-1_000_000);
-        for (const line of text.split("\n").filter((item) => item.startsWith("[prewalk]") && !item.startsWith("[prewalk] summary"))) {
-          notify(ctx, line);
-        }
+    const renderProgress = (stdout: string, stderr: string) => {
+      if (ctx.hasUI) ctx.ui.setWidget(PREWALK_PROGRESS_WIDGET, prewalkProgressLines(stdout, stderr));
+    };
+    notify(ctx, "PREWALK started; streaming progress below while it runs");
+    if (ctx.hasUI) ctx.ui.setStatus(PREWALK_PROGRESS_WIDGET, "PREWALK running");
+    let result: { code: number | null; stdout: string; stderr: string };
+    try {
+      result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        const child = spawn(launcher, ["--prompt-stdin", "--auto-approve-workspace-writes"], { cwd: ctx.cwd, stdio: ["pipe", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => {
+          stdout = (stdout + String(chunk)).slice(-PREWALK_PROGRESS_MAX_CHARS);
+          renderProgress(stdout, stderr);
+        });
+        child.stderr.on("data", (chunk) => {
+          const text = String(chunk);
+          stderr = (stderr + text).slice(-PREWALK_PROGRESS_MAX_CHARS);
+          renderProgress(stdout, stderr);
+          for (const line of text.split("\n").filter((item) => item.startsWith("[prewalk]") && !item.startsWith("[prewalk] summary"))) {
+            notify(ctx, line);
+          }
+        });
+        child.once("error", reject);
+        child.once("close", (code) => resolve({ code, stdout, stderr }));
+        child.stdin.end(task);
       });
-      child.once("error", reject);
-      child.once("close", (code) => resolve({ code, stdout, stderr }));
-      child.stdin.end(task);
-    });
+    } finally {
+      if (ctx.hasUI) {
+        ctx.ui.setWidget(PREWALK_PROGRESS_WIDGET, undefined);
+        ctx.ui.setStatus(PREWALK_PROGRESS_WIDGET, undefined);
+      }
+    }
     const summaryLine = [...result.stderr.split("\n")].reverse().find((line: string) => line.startsWith("[prewalk] summary "));
     const summaryText = summaryLine?.slice("[prewalk] summary ".length);
     let summary: unknown;

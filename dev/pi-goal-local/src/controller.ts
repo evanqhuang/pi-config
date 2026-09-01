@@ -58,6 +58,8 @@ type PendingWake = {
 
 type LoopContinuationToken = {
   selectionIdentity: string;
+  /** Stable across ordinary post-compaction leaf advancement; navigation invalidates the token. */
+  sessionId: string;
   epoch: number;
   loopId: string;
   generation: number;
@@ -167,8 +169,11 @@ export class GoalController {
 
   private syncBranch(ctx: ExtensionContext): void {
     const identity = this.selectionIdentity(ctx);
-    if ((this.pendingWake && this.pendingWake.selectionIdentity !== identity)
-      || (this.loopContinuationToken && this.loopContinuationToken.selectionIdentity !== identity)) {
+    if (this.pendingWake && this.pendingWake.selectionIdentity !== identity) {
+      this.invalidatePendingWake();
+    } else if (this.loopContinuationToken
+      && this.loopContinuationToken.selectionIdentity !== identity
+      && this.loopContinuationToken.sessionId !== ctx.sessionManager.getSessionId()) {
       this.invalidatePendingWake();
     }
     this.ctx = ctx;
@@ -370,10 +375,13 @@ export class GoalController {
   retryPendingWake(ctx?: ExtensionContext): boolean {
     if (this.loopContinuationToken) {
       const activeCtx = ctx ?? this.ctx;
-      if (!activeCtx || this.selectionIdentity(activeCtx) !== this.loopContinuationToken.selectionIdentity) {
+      if (!activeCtx || this.loopContinuationToken.sessionId !== activeCtx.sessionManager.getSessionId()) {
         this.invalidatePendingWake();
         return false;
       }
+      // A queued continuation advances the leaf after compaction. This is not
+      // navigation; retain the stable loop token and bind it to the new leaf.
+      this.loopContinuationToken.selectionIdentity = this.selectionIdentity(activeCtx);
       this.ctx = activeCtx;
       void this.attemptLoopBootstrap(activeCtx, this.loopContinuationToken);
       return true;
@@ -735,10 +743,14 @@ export class GoalController {
       this.loopState = current;
       if (token.epoch !== this.sessionEpoch
         || this.ctx !== ctx
-        || this.selectionIdentity(ctx) !== token.selectionIdentity) {
+        || token.sessionId !== ctx.sessionManager.getSessionId()) {
         this.loopContinuationToken = undefined;
         return;
       }
+      // A follow-up queued by compaction legitimately advances the leaf before
+      // the parent settles. Tree/session navigation has already invalidated
+      // the token, so rebind only within the same session epoch.
+      token.selectionIdentity = this.selectionIdentity(ctx);
       if (!current
         || current.loopId !== token.loopId
         || current.generation !== token.generation
@@ -830,6 +842,7 @@ export class GoalController {
     if (epoch !== this.sessionEpoch || this.ctx !== ctx || !LOOP_PHASE_ACTIVE.includes(state.phase)) return;
     const token: LoopContinuationToken = {
       selectionIdentity: this.selectionIdentity(ctx),
+      sessionId: ctx.sessionManager.getSessionId(),
       epoch,
       loopId: state.loopId,
       generation: state.generation,
@@ -849,16 +862,16 @@ export class GoalController {
     void this.attemptLoopBootstrap(ctx, token, agentDir);
   }
 
-  pause(ctx: ExtensionContext): GoalStateV1 | GoalStateV2 | undefined {
+  pause(ctx: ExtensionContext, reason = "Paused by user."): GoalStateV1 | GoalStateV2 | undefined {
     this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
       this.evaluatorAbort?.abort();
-      return this.transition("paused", "Paused by user.");
+      return this.transition("paused", reason);
     }
     if (this.loopState && LOOP_PHASE_ACTIVE.includes(this.loopState.phase)) {
       this.evaluatorAbort?.abort();
-      const paused = this.loopTerminal(this.loopState, "paused", "Paused by user.");
+      const paused = this.loopTerminal(this.loopState, "paused", reason);
       this.persistLoop(paused);
       return paused;
     }

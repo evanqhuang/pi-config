@@ -59,7 +59,7 @@ PLAN uses `@anthropic-ai/sandbox-runtime` for OS-level filesystem enforcement on
 
 `ctx_batch_execute` is accepted only when every nested command has a recognized single-command read-only shape. The native sandbox remains the final boundary for Bash, language runtimes, and child processes.
 
-Context-mode receives write access only to its private state and execution-temp paths. `manage_plan_draft` is the sole additional writer: it is restricted to fixed `plan.md` artifacts beneath the private plans root and rejects paths or symlinks that escape it. Ordinary PLAN Bash does not receive those exceptions. Switching to YOLO clears the wrapper for clients that start afterward; existing clients keep their startup policy so concurrent subagents are not interrupted mid-request.
+Context-mode receives write access only to its private state and execution-temp paths. PLAN has two additional narrow private-state writers: `manage_plan_draft`, restricted to fixed `plan.md` artifacts beneath the private plans root, and `checkpoint_notes`, restricted to the current top-level session's fixed private Notes handoff. Both reject escape paths or symlinks where applicable and neither permits project edits, arbitrary shell writes, system mutation, or implementation. Ordinary PLAN Bash receives neither exception. Switching to YOLO clears the wrapper for clients that start afterward; existing clients keep their startup policy so concurrent subagents are not interrupted mid-request.
 
 ## Verification
 

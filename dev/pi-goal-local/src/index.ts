@@ -454,7 +454,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
     if (!loopStateIsActive(loop)) return;
     try {
       const anchored = filterContextWithDisposition(event.messages, loop);
-      if (anchored.marker) return { messages: anchored.messages };
+      if (anchored.disposition === "matched") return { messages: anchored.messages };
+      if (anchored.disposition === "rejected") {
+        controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${anchored.reason ?? "incomplete current epoch traffic."}`);
+        activeCtx.abort();
+        return { messages: [] };
+      }
 
       // startLoop publishes its durable state before its asynchronous artifact
       // read can publish the first marker. Build a verified fallback here so a
@@ -462,12 +467,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
       // complete user-led turn during that small publication window.
       const bootstrap = await contextBootstrap(activeCtx, loop);
       const settings = loadGoalLoopSettings(activeCtx.cwd);
-      return {
-        messages: filterContextWithDisposition(event.messages, loop, {
-          bootstrap,
-          maxBootstrapBytes: settings.maxBootstrapBytes,
-        }).messages,
-      };
+      const fallback = filterContextWithDisposition(event.messages, loop, {
+        bootstrap,
+        maxBootstrapBytes: settings.maxBootstrapBytes,
+      });
+      if (fallback.disposition === "fallback-safe") return { messages: fallback.messages };
+      controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${fallback.reason ?? "no complete current suffix."}`);
+      activeCtx.abort();
+      return { messages: [] };
     } catch (error) {
       // A valid state with an invalid epoch payload or unavailable artifact
       // must not leak prior-cycle context to the provider. Fail closed with no
