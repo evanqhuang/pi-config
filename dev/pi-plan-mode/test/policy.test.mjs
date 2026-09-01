@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  CHILD_PLAN_BLOCKED_TOOLS,
+  PLAN_DELEGATION_LIMITS,
   PLAN_TOOLS,
   applyMode,
   delegationProfile,
@@ -52,19 +54,53 @@ test("applyMode stores modes and gives ORCHESTRATOR and YOLO the complete set", 
   assert.deepEqual(state.active, ["read", "write", "Agent", "late_tool"]);
 });
 
-test("PLAN delegation is limited to the built-in read-only profiles", () => {
+test("PLAN delegation is limited to bounded one-shot read-only profiles", () => {
+  assert.deepEqual(PLAN_DELEGATION_LIMITS, { Explore: 24, Plan: 16 });
   assert.deepEqual(delegationProfile({ subagent_type: "Explore" }), {
     allowed: true,
     profile: "plan-readonly",
     subagentType: "Explore",
     inheritPlan: true,
+    maxTurns: 24,
   });
-  assert.deepEqual(delegationProfile({ subagent_type: "plan" }).subagentType, "Plan");
+  assert.equal(delegationProfile({ subagent_type: "plan" }).subagentType, "Plan");
+  assert.equal(delegationProfile({ subagent_type: "plan" }).maxTurns, 16);
+  assert.equal(delegationProfile({ subagent_type: "Explore", max_turns: 7 }).maxTurns, 7);
+  assert.equal(delegationProfile({ subagent_type: "Explore", max_turns: 24 }).maxTurns, 24);
+  assert.equal(delegationProfile({ subagent_type: "Explore", max_turns: 99 }).maxTurns, 24);
+  assert.equal(delegationProfile({ subagent_type: "Plan", max_turns: 4 }).maxTurns, 4);
+  assert.equal(delegationProfile({ subagent_type: "Plan", max_turns: 16 }).maxTurns, 16);
+  assert.equal(delegationProfile({ subagent_type: "Plan", max_turns: 99 }).maxTurns, 16);
+  for (const max_turns of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const result = delegationProfile({ subagent_type: "Explore", max_turns });
+    assert.equal(result.allowed, false, String(max_turns));
+    assert.match(result.reason, /finite positive integer/);
+  }
+  for (const request of [
+    { subagent_type: "Explore", resume: "prior-agent" },
+    { subagent_type: "Plan", schedule: "+10m" },
+  ]) {
+    const result = delegationProfile(request);
+    assert.equal(result.allowed, false);
+    assert.match(result.reason, /one-shot|cannot be scheduled/);
+  }
   assert.equal(delegationProfile({ subagent_type: "LunaCompliance" }).allowed, false);
   assert.equal(delegationProfile({ subagent_type: "LunaTestVerifier" }).allowed, false);
   assert.equal(delegationProfile({ mode: "plan", agent: "explorer" }).allowed, false);
   assert.equal(delegationProfile({ subagent_type: "worker" }).allowed, false);
+  assert.equal(delegationProfile([]).allowed, false);
   assert.equal(delegationProfile({}).allowed, false);
+});
+
+test("child PLAN explicitly blocks orchestration and parent-owned plan tools", () => {
+  assert.deepEqual(CHILD_PLAN_BLOCKED_TOOLS, [
+    "Agent",
+    "get_subagent_result",
+    "steer_subagent",
+    "manage_plan_draft",
+    "submit_plan_for_approval",
+    "checkpoint_notes",
+  ]);
 });
 
 test("batch execution is automatically allowed only for read-only command shapes", () => {

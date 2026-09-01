@@ -3,6 +3,20 @@ const SAFE_DELEGATION_TYPES = Object.freeze(new Map([
   ["plan", "Plan"],
 ]));
 
+export const PLAN_DELEGATION_LIMITS = Object.freeze({
+  Explore: 24,
+  Plan: 16,
+});
+
+export const CHILD_PLAN_BLOCKED_TOOLS = Object.freeze([
+  "Agent",
+  "get_subagent_result",
+  "steer_subagent",
+  "manage_plan_draft",
+  "submit_plan_for_approval",
+  "checkpoint_notes",
+]);
+
 // This is deliberately explicit. New tools are unavailable in PLAN until their
 // behavior has been reviewed and added here.
 export const PLAN_TOOLS = Object.freeze([
@@ -54,7 +68,7 @@ export function isDelegationTool(name) {
 }
 
 export function delegationProfile(input) {
-  if (!input || typeof input !== "object") {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
     return { allowed: false, reason: "invalid delegation input" };
   }
 
@@ -67,11 +81,35 @@ export function delegationProfile(input) {
     };
   }
 
+  if (input.resume !== undefined) {
+    return {
+      allowed: false,
+      reason: "PLAN workers are one-shot and cannot be resumed; launch a fresh, narrower worker instead",
+    };
+  }
+  if (input.schedule !== undefined) {
+    return {
+      allowed: false,
+      reason: "PLAN workers are bounded advisory runs and cannot be scheduled",
+    };
+  }
+
+  const ceiling = PLAN_DELEGATION_LIMITS[canonical];
+  const suppliedMaxTurns = input.max_turns;
+  if (suppliedMaxTurns !== undefined
+    && (!Number.isFinite(suppliedMaxTurns) || !Number.isInteger(suppliedMaxTurns) || suppliedMaxTurns <= 0)) {
+    return {
+      allowed: false,
+      reason: "PLAN max_turns must be a finite positive integer",
+    };
+  }
+
   return {
     allowed: true,
     profile: "plan-readonly",
     subagentType: canonical,
     inheritPlan: true,
+    maxTurns: Math.min(suppliedMaxTurns ?? ceiling, ceiling),
   };
 }
 

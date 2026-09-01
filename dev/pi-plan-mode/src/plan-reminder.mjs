@@ -60,6 +60,8 @@ const CHILD_RESTRICTIONS = [
 const PARENT_FULL_WORKFLOW = [
   "Parent planning workflow:",
   "Investigate the repository before proposing changes and keep the managed plan authoritative.",
+  "Use the classic two-phase flow: direct inspection or at most three independent, non-overlapping Explore workers; then verify and aggregate their evidence before normally launching one fresh, one-shot Plan worker.",
+  "Give Explore a self-contained objective, search focus, known paths or symbols, and thoroughness. Give Plan user intent, requirements, constraints, verified file or symbol findings, non-goals, and open questions; Plan must not repeat broad discovery.",
   "Use ask_user_question during initial understanding or review whenever requirements, scope, risk, or a critical implementation choice is ambiguous.",
   "Ask focused questions only after enough repository investigation to present meaningful options and a recommendation.",
   "Do not make large assumptions merely to finish the plan.",
@@ -71,12 +73,14 @@ const PARENT_FULL_WORKFLOW = [
 
 const PARENT_SPARSE_WORKFLOW = [
   "Parent clarification reminder: when requirements, scope, risk, or a critical implementation choice remains unresolved, investigate enough to offer meaningful options and use ask_user_question.",
+  "Keep delegation phased and bounded: up to three non-overlapping Explore responsibilities, parent verification and aggregation, then normally one fresh Plan worker that designs from the supplied evidence without broad rediscovery.",
   "Do not make large assumptions; fold resolved answers into the managed plan before submission.",
   "ask_user_question is for clarification or approach selection only, never plan approval; approval is submit-only via submit_plan_for_approval.",
 ].join("\n");
 
 const PARENT_REENTRY_WORKFLOW = [
   "Parent PLAN re-entry: re-establish repository context before acting on the plan.",
+  "Resume the bounded two-phase flow: use direct inspection or up to three non-overlapping Explore responsibilities, verify and aggregate evidence, then normally use one fresh Plan worker without broad rediscovery.",
   "If requirements, scope, risk, or a critical implementation choice is unresolved, investigate enough to offer meaningful options, then use ask_user_question; Do not make large assumptions.",
   "Fold resolved answers into the managed plan. ask_user_question is never approval; implementation approval is submit-only via submit_plan_for_approval.",
 ].join("\n");
@@ -92,13 +96,16 @@ const PARENT_REVISION_WORKFLOW = [
 const CHILD_FULL_WORKFLOW = [
   "Child PLAN workflow:",
   "Complete only the delegated read-only research or design task.",
-  "Return a concise read-only handoff to the parent with findings, relevant file:line evidence, assumptions, and any unresolved questions.",
+  "Use progressive disclosure, stay within the named paths and question, and stop as soon as the requested evidence is sufficient; do not repeat broad repository discovery.",
+  "If the assignment combines investigations or is too broad for the delegated boundary, return a concise decomposition or blocker instead of widening scope.",
+  "Return a concise read-only handoff to the parent with findings, relevant file:line evidence, assumptions, and any unresolved questions; do not dump raw files.",
   "If ambiguity remains, return the exact unresolved question and viable options to the parent; do not call ask_user_question or impersonate the parent.",
   "Never create, replace, or submit a managed plan. Do not call manage_plan_draft or submit_plan_for_approval; the parent owns the user-facing approval flow.",
 ].join("\n");
 
 const CHILD_SPARSE_WORKFLOW = [
-  "Child reminder: stay on the delegated read-only research or design task and return a concise handoff to the parent.",
+  "Child reminder: stay on the delegated read-only research or design task, use progressive disclosure, and stop when the requested evidence is sufficient; do not repeat broad repository discovery.",
+  "If the task exceeds the delegated boundary, return a concise decomposition or blocker instead of widening scope. Return concise file:line evidence and never dump raw files.",
   "Report the exact unresolved question and viable options to the parent; do not call ask_user_question or impersonate the parent.",
   "Never create, replace, or submit a managed plan; do not call manage_plan_draft or submit_plan_for_approval.",
 ].join("\n");

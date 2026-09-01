@@ -216,13 +216,22 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const approvalTool = pi.tools.get("submit_plan_for_approval");
   assert.ok(draftTool);
   assert.ok(approvalTool);
-  assert.match(planStart.systemPrompt, /2-4 genuinely independent unknowns/);
-  assert.match(planStart.systemPrompt, /focused Explore agents/);
+  assert.match(planStart.systemPrompt, /classic two-phase planning flow/);
+  assert.match(planStart.systemPrompt, /Phase 1 — Explore/);
+  assert.match(planStart.systemPrompt, /no more than three Explore workers/);
+  assert.match(planStart.systemPrompt, /objective, searchFocus, knownPaths and knownSymbols when available, and thoroughness/);
+  assert.match(planStart.systemPrompt, /quick, medium, or very_thorough/);
+  assert.match(planStart.systemPrompt, /Phase 2 — Aggregate and Plan/);
+  assert.match(planStart.systemPrompt, /normally one read-only Plan worker/);
+  assert.match(planStart.systemPrompt, /requirements, constraints, explorationFindings/);
+  assert.match(planStart.systemPrompt, /perspective, nonGoals, and openQuestions/);
+  assert.match(planStart.systemPrompt, /must not repeat broad repository discovery/);
+  assert.match(planStart.systemPrompt, /inherit_context=true only when essential subtle context cannot be summarized safely/);
+  assert.match(planStart.systemPrompt, /Never resume or schedule PLAN workers/);
   assert.match(planStart.systemPrompt, /LunaCompliance and LunaTestVerifier are post-implementation verification agents/);
   assert.match(planStart.systemPrompt, /must not be used while creating the plan/);
   assert.match(planStart.systemPrompt, /exact checkout, branch, PR ref, or worktree/);
   assert.match(planStart.systemPrompt, /never poll or sleep/);
-  assert.match(planStart.systemPrompt, /read-only Plan agent/);
   assert.match(planStart.systemPrompt, /Do not paste the complete plan into an ordinary assistant message/);
   assert.match(planStart.systemPrompt, /manage_plan_draft is the only tool permitted to create, replace, inspect, or probe a managed plan artifact/);
   assert.match(planStart.systemPrompt, /Never use Bash, edit, write, ctx_execute, ctx_execute_file, or ctx_batch_execute as a fallback for plan files/);
@@ -373,10 +382,30 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.equal(explorerInput.subagent_type, "Explore");
   assert.equal(explorerInput.mode, "PLAN");
   assert.equal(explorerInput.readOnly, true);
+  assert.equal(explorerInput.max_turns, 24);
+  assert.equal(explorerInput.inherit_context, false);
+  const lowerExplore = { subagent_type: "Explore", max_turns: 7 };
+  assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: lowerExplore }), undefined);
+  assert.equal(lowerExplore.max_turns, 7);
   const planAgent = { subagent_type: "Plan" };
   assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: planAgent }), undefined);
   assert.equal(planAgent.mode, "PLAN");
   assert.equal(planAgent.readOnly, true);
+  assert.equal(planAgent.max_turns, 16);
+  assert.equal(planAgent.inherit_context, false);
+  const inheritedPlan = { subagent_type: "Plan", max_turns: 99, inherit_context: true };
+  assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: inheritedPlan }), undefined);
+  assert.equal(inheritedPlan.max_turns, 16, "inherited context does not bypass the PLAN ceiling");
+  assert.equal(inheritedPlan.inherit_context, true);
+  for (const input of [
+    { subagent_type: "Explore", resume: "prior-agent" },
+    { subagent_type: "Plan", schedule: "+10m" },
+    { subagent_type: "Explore", max_turns: 1.5 },
+  ]) {
+    const blocked = await pi.handlers.get("tool_call")({ toolName: "Agent", input });
+    assert.equal(blocked.block, true);
+    assert.equal(input.mode, undefined, "blocked PLAN delegation is not partially normalized");
+  }
   for (const subagent_type of ["LunaCompliance", "LunaTestVerifier"]) {
     const input = { subagent_type };
     const blocked = await pi.handlers.get("tool_call")({ toolName: "Agent", input });
@@ -1174,29 +1203,35 @@ test("child PLAN captures the global probe and cannot own plan approval", async 
   registry[key] = () => true;
   try {
     const pi = mockPi();
+    for (const name of ["Agent", "get_subagent_result", "steer_subagent", "manage_plan_draft", "submit_plan_for_approval"]) {
+      pi.tools.set(name, { name });
+    }
     await registerPlanMode(pi);
     const ctx = mockContext([], undefined);
     await pi.handlers.get("session_start")({}, ctx);
-    assert.equal(pi.active.includes("manage_plan_draft"), false);
-    assert.equal(pi.active.includes("submit_plan_for_approval"), false);
+    for (const name of ["Agent", "get_subagent_result", "steer_subagent", "manage_plan_draft", "submit_plan_for_approval"]) {
+      assert.equal(pi.active.includes(name), false, `child PLAN excludes ${name}`);
+    }
     assert.equal(pi.eventListeners.get("subagents:started"), undefined);
     assert.equal(pi.eventListeners.get("subagents:completed"), undefined);
     assert.equal(pi.eventListeners.get("subagents:failed"), undefined);
 
     const baseline = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
     assert.match(baseline.systemPrompt, /child planning agent/);
+    assert.match(baseline.systemPrompt, /Use progressive disclosure/);
+    assert.match(baseline.systemPrompt, /Do not repeat broad repository discovery/);
+    assert.match(baseline.systemPrompt, /return a concise decomposition or blocker/);
+    assert.match(baseline.systemPrompt, /never dump raw files/);
     assert.doesNotMatch(baseline.systemPrompt, /submit_plan_for_approval|manage_plan_draft/);
     const childContext = await pi.handlers.get("context")({ messages: [] });
     assert.match(childContext.messages.at(-1).content, /return a concise .*handoff to the parent/i);
     assert.match(childContext.messages.at(-1).content, /No project or system write exception is available/);
     assert.doesNotMatch(childContext.messages.at(-1).content, /The only exception is the managed plan mechanism/);
 
-    const blockedDraft = await pi.handlers.get("tool_call")({ toolName: "manage_plan_draft", input: {} });
-    const blockedApproval = await pi.handlers.get("tool_call")({ toolName: "submit_plan_for_approval", input: {} });
-    const blockedCheckpoint = await pi.handlers.get("tool_call")({ toolName: "checkpoint_notes", input: {} });
-    assert.equal(blockedDraft.block, true);
-    assert.equal(blockedApproval.block, true);
-    assert.equal(blockedCheckpoint.block, true);
+    for (const toolName of ["Agent", "get_subagent_result", "steer_subagent", "manage_plan_draft", "submit_plan_for_approval", "checkpoint_notes"]) {
+      const blocked = await pi.handlers.get("tool_call")({ toolName, input: {} });
+      assert.equal(blocked.block, true, `child PLAN blocks direct ${toolName} attempts`);
+    }
     await pi.handlers.get("session_shutdown")({}, ctx);
   } finally {
     if (previous === undefined) delete registry[key];

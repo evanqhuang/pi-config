@@ -147,6 +147,13 @@ test("every parent and child renderer carries ambient restrictions and live plan
 test("full parent reminder preserves clarification and submit-only approval contract", () => {
   const reminder = renderFullParentReminder({ planPath: "/plans/plan.md", planStatus: "draft" });
   for (const required of [
+    "classic two-phase flow",
+    "at most three independent, non-overlapping Explore workers",
+    "verify and aggregate their evidence",
+    "one fresh, one-shot Plan worker",
+    "objective, search focus, known paths or symbols, and thoroughness",
+    "requirements, constraints, verified file or symbol findings, non-goals, and open questions",
+    "Plan must not repeat broad discovery",
     "initial understanding or review",
     "requirements, scope, risk, or a critical implementation choice",
     "enough repository investigation",
@@ -169,6 +176,10 @@ test("sparse and re-entry parent reminders keep ambiguity active without replaci
     renderReentryParentReminder(),
   ]) {
     assert.match(reminder, /use ask_user_question/);
+    assert.match(reminder, /up to three non-overlapping Explore responsibilities/);
+    assert.match(reminder, /verify and aggregate evidence|parent verification and aggregation/);
+    assert.match(reminder, /one fresh Plan worker/);
+    assert.match(reminder, /without broad rediscovery/);
     assert.match(reminder, /Do not make large assumptions/);
     assert.match(reminder, /fold resolved answers into the managed plan/i);
     assert.match(reminder, /ask_user_question.*never.*approval/i);
@@ -211,7 +222,13 @@ test("child reminders return research and unresolved questions to the parent wit
     renderSparseChildReminder({ planPath: "/plans/plan.md", planStatus: "draft" }),
   ]) {
     assert.match(reminder, /delegated read-only research or design task/);
-    assert.match(reminder, /concise .*handoff to the parent/i);
+    assert.match(reminder, /progressive disclosure/);
+    assert.match(reminder, /stop .* requested evidence is sufficient/);
+    assert.match(reminder, /do not repeat broad repository discovery/);
+    assert.match(reminder, /concise decomposition or blocker/);
+    assert.match(reminder, /instead of widening scope/);
+    assert.match(reminder, /concise .*handoff to the parent|concise file:line evidence/i);
+    assert.match(reminder, /do not dump raw files|never dump raw files/);
     assert.match(reminder, /exact unresolved question and viable options to the parent/);
     assert.match(reminder, /do not call ask_user_question/);
     assert.match(reminder, /Never create, replace, or submit a managed plan/);
