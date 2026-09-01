@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+skill_dir = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(skill_dir))
+
+from prewalk import main
+
+raise SystemExit(main())

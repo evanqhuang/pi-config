@@ -1,0 +1,7 @@
+interface:
+  display_name: "Prewalk"
+  short_description: "Explore with one model, then hand off after the first accepted edit"
+  default_prompt: "Run this task through the prewalk handoff workflow."
+
+policy:
+  allow_implicit_invocation: false

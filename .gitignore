@@ -21,4 +21,9 @@
 /git/
 /npm/
 /skills/
+!/skills/
+!/skills/prewalk/
+!/skills/prewalk/**
+/skills/prewalk/__pycache__/
+/skills/prewalk/tests/__pycache__/
 /.worktrees/

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { createBashTool, getMarkdownTheme, type BashOperations } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, createBashTool, getMarkdownTheme, type BashOperations } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmod, copyFile, lstat, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -986,7 +986,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   };
 
   const runPrewalk = async (pending: PendingApproval, ctx: ExtensionContext) => {
-    const launcher = process.env.PI_PREWALK_LAUNCHER ?? join(homedir(), ".agents", "skills", "prewalk", "scripts", "run-prewalk");
+    const launcher = process.env.PI_PREWALK_LAUNCHER ?? join(homedir(), CONFIG_DIR_NAME, "agent", "skills", "prewalk", "scripts", "run-prewalk");
     const history = pending.transcriptPath
       ? `\nThe full planning chat snapshot is at ${pending.transcriptPath}; consult it if needed.`
       : "";
