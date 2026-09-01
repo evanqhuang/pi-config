@@ -643,6 +643,28 @@ export default function (pi: ExtensionAPI) {
     if (reportUsage) pendingUsage.add(usage);
   });
 
+  // Ctrl+B is global rather than editor-local: it is reserved for detaching the
+  // newest inline foreground agent, so the key remains available while a tool
+  // call is blocking on spawnAndWait.
+  pi.registerShortcut(Key.ctrl("b"), {
+    description: "Detach the newest foreground agent into the background",
+    handler: (shortcutCtx) => {
+      const record = manager.detachForeground();
+      const remaining = manager.listAgents().filter(agent =>
+        agent.parentAgentId === undefined
+        && agent.blocking === true
+        && agent.isBackground === false
+        && (agent.status === "running" || agent.status === "queued")
+      ).length;
+      shortcutCtx.ui.notify(
+        record
+          ? `Detached ${record.handle ?? record.id} (${record.id}); ${remaining} foreground agent${remaining === 1 ? "" : "s"} still blocking`
+          : "No foreground agent to detach",
+        record ? "info" : "warning",
+      );
+    },
+  });
+
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
   //
@@ -1472,7 +1494,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
-- Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
+- Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Ctrl+B detaches a running foreground agent without aborting it; its ID remains available to get_subagent_result and steer_subagent. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
@@ -1497,6 +1519,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting the work as done.
 - Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
+- **Ctrl+B**: while a foreground agent is running, detach it without aborting; its ID remains available to get_subagent_result and steer_subagent, and its normal completion notification still arrives.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
@@ -1578,7 +1601,7 @@ Terse command-style prompts produce shallow, generic work.
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
-      "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
+      "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead. Ctrl+B detaches a foreground agent without stopping it; use its ID with get_subagent_result or steer_subagent afterward.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -2113,12 +2136,14 @@ Terse command-style prompts produce shallow, generic work.
       let spinnerFrame = 0;
       const startedAt = Date.now();
       let fgId: string | undefined;
+      let detached = false;
       // Set only while the spawn is parked on a foreground concurrency slot
       // (maxConcurrentForeground); undefined the rest of the time, including
       // always when the limit is unset.
       let queuedAhead: number | undefined;
 
       const streamUpdate = () => {
+        if (detached) return;
         // Spend from the record, everything else from the live tracker. `fgId`
         // is set in onSessionCreated below, which fires before the first
         // assistant message — so nothing is spent while this reads zero.
@@ -2219,16 +2244,52 @@ Terse command-style prompts produce shallow, generic work.
           attachTranscript(fgRec, fgAgentId);
         });
         record = fgResult.record;
+        detached = fgResult.detached;
+        if (detached) {
+          // A queued record has no session callback yet, but it still needs the
+          // same background surfaces and activity state as a running detachment.
+          // The migrated run can also finish before this await resumes; do not
+          // resurrect activity that the completion callback already removed.
+          fgId ??= fgResult.id;
+          if (fgResult.record.status === "running" || fgResult.record.status === "queued") {
+            agentActivity.set(fgResult.id, fgState);
+            widget.ensureTimer();
+            fleet.ensureTimer();
+            widget.update();
+            fleet.update();
+          }
+        }
       } finally {
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
         clearInterval(spinnerInterval);
-        if (fgId) {
+        if (!detached && fgId) {
           agentActivity.delete(fgId);
           widget.markFinished(fgId);
           fleet.onAgentFinished(fgId);
         }
+      }
+
+      if (detached) {
+        const detachedDetails = buildDetails(detailBaseFor(record), record, fgState, {
+          tokens: formatLifetimeTokens(record),
+          durationMs: 0,
+          status: "background" as const,
+          agentId: record.id,
+        });
+        return textResult(
+          `${fallbackNote}Agent detached to background.\n` +
+          `Agent ID: ${record.id}\n` +
+          `Type: ${displayName}\n` +
+          `Description: ${params.description}\n` +
+          (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+          (record.status === "queued" ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+          `\nYou will be notified when this agent completes.\n` +
+          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `Do not duplicate this agent's work.`,
+          detachedDetails,
+        );
       }
 
       // Get final token count — from the record, like the cost below it, so the

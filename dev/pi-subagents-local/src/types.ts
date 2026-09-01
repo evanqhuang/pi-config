@@ -247,6 +247,10 @@ export interface AgentRecord {
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
+  /** Set when Ctrl+B detached an inline foreground run into background execution. */
+  detached?: boolean;
+  /** Resolves when this foreground waiter is detached, without settling the run. */
+  detachedGate?: Promise<void>;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Full worktree creation metadata while the record is live. */
@@ -291,6 +295,8 @@ export interface AgentRecord {
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
+  /** Internal cleanup for the parent signal listener; removed when detached. */
+  parentAbortCleanup?: () => void;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
   /**

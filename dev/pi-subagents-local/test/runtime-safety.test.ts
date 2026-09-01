@@ -12,6 +12,7 @@ interface Handler {
 function fakePi() {
   const handlers = new Map<string, Handler[]>();
   const tools: any[] = [];
+  const shortcuts = new Map<string, { handler: Handler }>();
   const events = {
     on(event: string, handler: Handler) {
       const list = handlers.get(event) ?? [];
@@ -31,11 +32,12 @@ function fakePi() {
     registerMessageRenderer: () => {},
     registerTool: (tool: any) => tools.push(tool),
     registerCommand: () => {},
+    registerShortcut: (name: string, shortcut: { handler: Handler }) => shortcuts.set(name, shortcut),
     on: (event: string, handler: Handler) => events.on(event, handler),
     sendMessage: () => {},
     appendEntry: () => {},
   };
-  return { pi, tools, handlers };
+  return { pi, tools, handlers, shortcuts };
 }
 
 const contexts: Array<{ dir: string; previous: string | undefined }> = [];
@@ -64,8 +66,13 @@ describe("runtime verifier safety", () => {
       "",
     ].join("\n"));
 
-    const { pi, tools, handlers } = fakePi();
+    const { pi, tools, handlers, shortcuts } = fakePi();
     extension(pi as any);
+    const shortcut = shortcuts.get("ctrl+b");
+    expect(shortcut).toBeDefined();
+    const notify = [] as string[];
+    await shortcut!.handler({ ui: { notify: (message: string) => notify.push(message) } });
+    expect(notify).toEqual(["No foreground agent to detach"]);
     setWorktreeIsolationEnabled(false);
     const agent = tools.find(tool => tool.name === "Agent");
     expect(agent).toBeDefined();

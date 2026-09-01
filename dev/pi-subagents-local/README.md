@@ -15,6 +15,20 @@ read dynamically from the async-local context, so concurrent parent and child
 session loading remains isolated. The versioned global is a local divergence
 from upstream and is intentionally limited to this compatibility contract.
 
+## Foreground detachment
+
+Foreground `Agent` calls can be released without stopping their child: press the
+reserved global **Ctrl+B** shortcut while one is running (or queued). The newest
+eligible top-level foreground agent is detached into background execution, its
+ID and transcript remain available to `get_subagent_result` and
+`steer_subagent`, and the normal completion notification still arrives. A
+running child continues without taking a background slot; a queued child enters
+ordinary background scheduling.
+
+Use `run_in_background: false` only when the next action truly needs the
+agent's answer. Otherwise prefer the default background mode; Ctrl+B is an
+escape hatch when a foreground call turns out not to block the session.
+
 ## Local-model tool-loop safety
 
 Child sessions using `qwopus-subagent`, `qwen38-main`, or
