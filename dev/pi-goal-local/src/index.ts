@@ -324,17 +324,31 @@ async function startResolvedLoop(
   return controller.startLoop(ctx, objective, criteria, options);
 }
 
+class ContextBootstrapSupersededError extends Error {
+  constructor() {
+    super("Goal loop context bootstrap was superseded by a lifecycle transition.");
+    this.name = "ContextBootstrapSupersededError";
+  }
+}
+
+function requireCurrentContextBootstrap(guard: () => boolean): void {
+  if (!guard()) throw new ContextBootstrapSupersededError();
+}
+
 /** Rebuild the self-contained fallback used before an async marker arrives. */
 async function contextBootstrap(
   ctx: ExtensionContext,
   state: GoalStateV2,
+  guard: () => boolean,
 ): Promise<ContextEpochBootstrap> {
+  requireCurrentContextBootstrap(guard);
   const settings = loadGoalLoopSettings(ctx.cwd);
   const original = await loadVerifiedOriginalPlan({
     loopId: state.loopId,
     provenance: state.plan,
     maxBytes: settings.maxPlanBytes,
   });
+  requireCurrentContextBootstrap(guard);
   let correction;
   if (state.verifier?.correctionPath && state.verifier.correctionHash) {
     const artifact = await loadVerifiedCorrectionPlan({
@@ -345,9 +359,11 @@ async function contextBootstrap(
       maxCycles: state.maxCycles,
       maxBytes: settings.maxCorrectionBytes,
     });
+    requireCurrentContextBootstrap(guard);
     correction = { path: artifact.path, hash: artifact.hash, content: artifact.content };
   }
-  return createContextEpochBootstrap({
+  requireCurrentContextBootstrap(guard);
+  const bootstrap = createContextEpochBootstrap({
     state,
     originalPlan: { path: original.path, hash: original.hash, content: original.content },
     correction,
@@ -365,6 +381,8 @@ async function contextBootstrap(
       : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
     maxBootstrapBytes: settings.maxBootstrapBytes,
   });
+  requireCurrentContextBootstrap(guard);
+  return bootstrap;
 }
 
 export default function goalExtension(pi: ExtensionAPI): void {
@@ -432,10 +450,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
   pi.on("session_compact", (_event, compactCtx) => {
     if (shutDown) return;
     ctx = compactCtx;
-    // Compaction is a valid context boundary. The controller reanchors the
-    // current active loop with a fresh immutable epoch marker; failed/aborted
-    // compaction has no corresponding hook and is intentionally untouched.
-    controller.restoreSelectedBranch(compactCtx);
+    // Compaction is a valid context boundary, but it is not tree navigation.
+    // Keep its existing active-loop rebootstrap behavior without granting the
+    // tree-selection-only resume reanchor eligibility.
+    controller.restoreAfterCompaction(compactCtx);
   });
 
   pi.on("context", async (event, contextCtx) => {
@@ -446,16 +464,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
     if (ctx && contextCtx !== ctx) {
       const selected = selectionOf(ctx);
       const incoming = selectionOf(contextCtx);
-      if (selected && incoming && (selected.sessionId !== incoming.sessionId || selected.leafId !== incoming.leafId)) return;
+      if (selected && incoming && (selected.sessionId !== incoming.sessionId || selected.leafId !== incoming.leafId)) return { messages: [] };
     }
     const activeCtx = ctx ?? contextCtx;
     if (!ctx) ctx = contextCtx;
     const loop = controller.refreshLoop(activeCtx);
     if (!loopStateIsActive(loop)) return;
+    const lifecycleGuard = controller.createLoopContextGuard(activeCtx, loop);
+    // Navigation may have selected this loop between refreshLoop and guard
+    // capture. Do not filter or return a fallback without a bounded proof.
+    if (!lifecycleGuard) return { messages: [] };
     try {
       const anchored = filterContextWithDisposition(event.messages, loop);
       if (anchored.disposition === "matched") return { messages: anchored.messages };
       if (anchored.disposition === "rejected") {
+        // Integrity failures are not evidence that an explicit tree branch may
+        // safely adopt a fresh epoch. Keep this path fail-closed.
+        controller.invalidateLoopReanchorEligibility();
         controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${anchored.reason ?? "incomplete current epoch traffic."}`);
         activeCtx.abort();
         return { messages: [] };
@@ -465,20 +490,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
       // read can publish the first marker. Build a verified fallback here so a
       // kickoff provider request cannot see stale context or lose its latest
       // complete user-led turn during that small publication window.
-      const bootstrap = await contextBootstrap(activeCtx, loop);
+      const bootstrap = await contextBootstrap(activeCtx, loop, lifecycleGuard);
+      requireCurrentContextBootstrap(lifecycleGuard);
       const settings = loadGoalLoopSettings(activeCtx.cwd);
       const fallback = filterContextWithDisposition(event.messages, loop, {
         bootstrap,
         maxBootstrapBytes: settings.maxBootstrapBytes,
       });
       if (fallback.disposition === "fallback-safe") return { messages: fallback.messages };
-      controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${fallback.reason ?? "no complete current suffix."}`);
+      if (fallback.disposition === "fallback-unsafe"
+        && fallback.reason === "No safe complete user-led turn suffix was established; automatic continuation must pause.") {
+        // This is the one expected gap after explicit tree navigation: the
+        // branch has no current marker and no complete user-led suffix yet.
+        // pause() retains eligibility only when its tree carry proof matches.
+        controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${fallback.reason}`);
+      } else {
+        // A second-pass rejection means stale, malformed, conflicting, or
+        // otherwise invalid marker/bootstrap integrity—not a safe tree gap.
+        controller.invalidateLoopReanchorEligibility();
+        controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${fallback.reason ?? "no complete current suffix."}`);
+      }
       activeCtx.abort();
       return { messages: [] };
     } catch (error) {
+      // A lifecycle transition superseding an artifact read must not mutate the
+      // newly selected state or abort its run. It also must not return the
+      // stale fallback that the read was preparing.
+      if (error instanceof ContextBootstrapSupersededError || !lifecycleGuard()) return { messages: [] };
       // A valid state with an invalid epoch payload or unavailable artifact
       // must not leak prior-cycle context to the provider. Fail closed with no
-      // messages.
+      // messages and terminate the active run.
+      controller.invalidateLoopReanchorEligibility();
+      controller.pause(activeCtx, `Paused because goal-loop context continuity was unsafe: ${error instanceof Error ? error.message : String(error)}`);
+      activeCtx.abort();
       if (activeCtx.hasUI) {
         activeCtx.ui.notify(`Goal loop context was rejected: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
@@ -575,8 +619,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "resume": {
-          const next = controller.resume(activeCtx);
-          commandCtx.ui.notify(next ? "Goal resumed." : "There is no paused goal to resume.", next ? "info" : "warning");
+          try {
+            const next = await Promise.resolve(controller.resume(activeCtx));
+            const adoptedBranch = controller.consumeResumeAdoptedBranch();
+            commandCtx.ui.notify(
+              next
+                ? adoptedBranch
+                  ? "Goal resumed on the selected branch with a fresh context epoch."
+                  : "Goal resumed."
+                : "There is no paused goal to resume.",
+              next ? "info" : "warning",
+            );
+          } catch (error) {
+            commandCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
           return;
         }
         case "stop": {

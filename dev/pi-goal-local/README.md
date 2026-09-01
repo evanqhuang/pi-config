@@ -33,7 +33,7 @@ Loop-owned files are private, append-once artifacts under:
 
 The original plan is copied and hashed before V2 state is published. Corrective plans are similarly bounded, immutable, and hash-recorded. Durable V2 state and hidden context-epoch markers are reconstructed from the selected session branch; mutable source plans are never used for later evaluation.
 
-A reopened active loop is paused and requires `/goal resume`. Compaction and tree selection re-anchor an active loop at a fresh epoch; an ordinary queued post-compaction continuation may advance the leaf without invalidating that reanchor, while navigation still invalidates stale wakes and in-flight evaluations. Failed or aborted compaction is not treated as a recovery boundary. Session shutdown cancels pending work and removes bridge listeners.
+A reopened active loop is paused and requires `/goal resume`. Explicit tree selection carries an active loop onto an empty branch as paused; only an ordinary `/goal resume` with verified selected-branch continuity adopts that branch at a fresh epoch. Manual same-branch pause/resume retains its current epoch. Compaction remains its own context boundary, and an ordinary queued post-compaction continuation may advance the leaf without invalidating its rebootstrap; navigation still invalidates stale wakes and in-flight evaluations. Failed or aborted compaction is not treated as a recovery boundary. Session shutdown cancels pending work and removes bridge listeners.
 
 ## Safety
 

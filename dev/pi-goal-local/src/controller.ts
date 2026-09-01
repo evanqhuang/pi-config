@@ -67,10 +67,47 @@ type LoopContinuationToken = {
   contextEpoch: number;
 };
 
+type LoopContextGuardToken = {
+  ctx: ExtensionContext;
+  sessionId: string;
+  selectionIdentity: string;
+  branchIdentity: string;
+  sessionEpoch: number;
+  navigationGeneration: number;
+  loopId: string;
+  generation: number;
+  contextEpoch: number;
+  cycle: number;
+  stateIdentity: string;
+};
+
 type TreeGoalCarry = {
   sessionId: string;
   goal: GoalMarker;
 };
+
+/**
+ * Runtime-only proof that a V2 loop was carried onto an explicitly selected
+ * tree branch. It is deliberately not durable: a session reopen, compaction,
+ * or non-tree navigation must not turn an arbitrary paused loop into an
+ * eligible reanchor.
+ */
+type LoopReanchorEligibility = {
+  sessionId: string;
+  selectionIdentity: string;
+  branchIdentity: string;
+  loopId: string;
+  generation: number;
+  contextEpoch: number;
+  cycle: number;
+  planIdentity: string;
+  verifierIdentity: string | undefined;
+};
+
+const TREE_REWIND_PAUSE_REASON = "Paused after rewinding the conversation.";
+const MISSING_SAFE_SUFFIX_REASON = "No safe complete user-led turn suffix was established; automatic continuation must pause.";
+const CONTINUITY_PAUSE_PREFIX = "Paused because goal-loop context continuity was unsafe:";
+const TREE_CONTINUITY_PAUSE_REASON = `${CONTINUITY_PAUSE_PREFIX} ${MISSING_SAFE_SUFFIX_REASON}`;
 
 export interface GoalLoopStartOptions {
   loop?: boolean;
@@ -133,6 +170,8 @@ export class GoalController {
   private loopContinuationToken: LoopContinuationToken | undefined;
   private loopContinuationInFlight = false;
   private treeGoalCarry: TreeGoalCarry | undefined;
+  private loopReanchorEligibility: LoopReanchorEligibility | undefined;
+  private lastResumeAdoptedBranch = false;
   private navigationPending = false;
   private navigationGeneration = 0;
   private evaluatorAbort: AbortController | undefined;
@@ -280,6 +319,114 @@ export class GoalController {
     this.evaluationQueued = false;
   }
 
+  private clearLoopReanchorEligibility(): void {
+    this.loopReanchorEligibility = undefined;
+  }
+
+  /** Clear a tree-derived reanchor proof after an unknown/invalid failure. */
+  invalidateLoopReanchorEligibility(): void {
+    this.clearLoopReanchorEligibility();
+  }
+
+  /** Consume the one-shot UI signal for a successful branch adoption. */
+  consumeResumeAdoptedBranch(): boolean {
+    const adopted = this.lastResumeAdoptedBranch;
+    this.lastResumeAdoptedBranch = false;
+    return adopted;
+  }
+
+  private loopReanchorIdentity(state: GoalStateV2): Pick<LoopReanchorEligibility, "planIdentity" | "verifierIdentity"> {
+    return {
+      planIdentity: JSON.stringify(state.plan),
+      verifierIdentity: state.verifier === undefined ? undefined : JSON.stringify(state.verifier),
+    };
+  }
+
+  private rememberLoopReanchorEligibility(ctx: ExtensionContext, state: GoalStateV2): void {
+    const identity = this.loopReanchorIdentity(state);
+    this.loopReanchorEligibility = {
+      sessionId: ctx.sessionManager.getSessionId(),
+      selectionIdentity: this.selectionIdentity(ctx),
+      branchIdentity: this.branchIdentity(ctx),
+      loopId: state.loopId,
+      generation: state.generation,
+      contextEpoch: state.contextEpoch,
+      cycle: state.cycle,
+      ...identity,
+    };
+  }
+
+  private loopReanchorIsEligible(ctx: ExtensionContext, state: GoalStateV2): boolean {
+    const eligibility = this.loopReanchorEligibility;
+    if (!eligibility) return false;
+    const identity = this.loopReanchorIdentity(state);
+    return eligibility.sessionId === ctx.sessionManager.getSessionId()
+      && eligibility.selectionIdentity === this.selectionIdentity(ctx)
+      && eligibility.branchIdentity === this.branchIdentity(ctx)
+      && eligibility.loopId === state.loopId
+      && eligibility.generation === state.generation
+      && eligibility.contextEpoch === state.contextEpoch
+      && eligibility.cycle === state.cycle
+      && eligibility.planIdentity === identity.planIdentity
+      && eligibility.verifierIdentity === identity.verifierIdentity;
+  }
+
+  private loopReanchorStatesMatch(left: GoalStateV2, right: GoalStateV2): boolean {
+    const leftIdentity = this.loopReanchorIdentity(left);
+    const rightIdentity = this.loopReanchorIdentity(right);
+    return left.loopId === right.loopId
+      && left.generation === right.generation
+      && left.contextEpoch === right.contextEpoch
+      && left.cycle === right.cycle
+      && leftIdentity.planIdentity === rightIdentity.planIdentity
+      && leftIdentity.verifierIdentity === rightIdentity.verifierIdentity;
+  }
+
+  private loopContextStateIdentity(state: GoalStateV2): string {
+    return createHash("sha256").update(JSON.stringify(state)).digest("hex");
+  }
+
+  private loopContextGuardIsCurrent(token: LoopContextGuardToken): boolean {
+    if (this.ctx !== token.ctx
+      || this.sessionEpoch !== token.sessionEpoch
+      || this.navigationGeneration !== token.navigationGeneration
+      || this.navigationPending) return false;
+    if (token.sessionId !== token.ctx.sessionManager.getSessionId()
+      || this.selectionIdentity(token.ctx) !== token.selectionIdentity
+      || this.branchIdentity(token.ctx) !== token.branchIdentity) return false;
+    const current = this.branchLoopState(token.ctx);
+    return current !== undefined
+      && LOOP_PHASE_ACTIVE.includes(current.phase)
+      && current.loopId === token.loopId
+      && current.generation === token.generation
+      && current.contextEpoch === token.contextEpoch
+      && current.cycle === token.cycle
+      && this.loopContextStateIdentity(current) === token.stateIdentity;
+  }
+
+  /**
+   * Capture a bounded, read-only lifecycle proof for asynchronous context
+   * bootstrap work. The closure exposes only validity; all mutable controller
+   * state remains private and is re-read when the proof is checked.
+   */
+  createLoopContextGuard(ctx: ExtensionContext, state: GoalStateV2): (() => boolean) | undefined {
+    if (this.ctx !== ctx || this.navigationPending || !LOOP_PHASE_ACTIVE.includes(state.phase)) return undefined;
+    const token: LoopContextGuardToken = {
+      ctx,
+      sessionId: ctx.sessionManager.getSessionId(),
+      selectionIdentity: this.selectionIdentity(ctx),
+      branchIdentity: this.branchIdentity(ctx),
+      sessionEpoch: this.sessionEpoch,
+      navigationGeneration: this.navigationGeneration,
+      loopId: state.loopId,
+      generation: state.generation,
+      contextEpoch: state.contextEpoch,
+      cycle: state.cycle,
+      stateIdentity: this.loopContextStateIdentity(state),
+    };
+    return () => this.loopContextGuardIsCurrent(token);
+  }
+
   private clearNavigationPending(): void {
     this.navigationGeneration += 1;
     this.navigationPending = false;
@@ -404,6 +551,7 @@ export class GoalController {
   restore(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
+    this.clearLoopReanchorEligibility();
     this.clearNavigationPending();
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
@@ -420,6 +568,10 @@ export class GoalController {
     }
   }
 
+  /**
+   * Restore after explicit tree selection. Only this path can establish the
+   * runtime proof used by ordinary `/goal resume` to adopt a selected branch.
+   */
   restoreSelectedBranch(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
     const carry = this.treeGoalCarry;
@@ -432,25 +584,62 @@ export class GoalController {
         && (entry.customType === GOAL_STATE_TYPE || entry.customType === GOAL_STATE_V2_TYPE),
     );
     if (!branchHasGoalMarker && carry?.sessionId === ctx.sessionManager.getSessionId()) {
-      const reason = "Paused after rewinding the conversation.";
       if (carry.goal.schemaVersion === 2) {
-        this.persistLoop({
+        const paused: GoalStateV2 = {
           ...carry.goal,
           phase: "paused",
           updatedAt: Date.now(),
-          reasons: { ...carry.goal.reasons, pause: reason },
-        });
+          reasons: { ...carry.goal.reasons, pause: TREE_REWIND_PAUSE_REASON },
+        };
+        this.persistLoop(paused);
+        // persistLoop appends the target-branch marker, so capture the exact
+        // selected branch only after that append has become authoritative.
+        this.rememberLoopReanchorEligibility(ctx, paused);
       } else {
         this.persist({
           ...carry.goal,
           status: "paused",
           updatedAt: Date.now(),
-          lastReason: reason,
-          terminalReason: reason,
+          lastReason: TREE_REWIND_PAUSE_REASON,
+          terminalReason: TREE_REWIND_PAUSE_REASON,
         });
       }
       return;
     }
+
+    const goal = this.state;
+    if (goal?.status === "active") {
+      this.scheduleResume(ctx, goal, this.sessionEpoch);
+      return;
+    }
+    const loop = this.loopState;
+    if (loop && LOOP_PHASE_ACTIVE.includes(loop.phase)) {
+      // A selected branch may already contain this loop's active marker. Keep
+      // a tree-only proof ready so a subsequent *known* continuity pause can
+      // safely reanchor it; ordinary/manual pauses clear this proof.
+      const carriedLoop = carry?.goal.schemaVersion === 2 ? carry.goal : undefined;
+      if (carriedLoop && this.loopReanchorStatesMatch(carriedLoop, loop)) {
+        this.rememberLoopReanchorEligibility(ctx, loop);
+      }
+      this.scheduleLoopBootstrap(ctx, loop, this.sessionEpoch);
+    } else if (loop?.phase === "paused") {
+      const carriedLoop = carry?.goal.schemaVersion === 2 ? carry.goal : undefined;
+      if (carriedLoop && this.loopReanchorStatesMatch(carriedLoop, loop)) {
+        this.rememberLoopReanchorEligibility(ctx, loop);
+      }
+    }
+  }
+
+  /**
+   * Compaction is a context boundary, not tree navigation. In particular it
+   * must never inherit or create the tree-derived reanchor eligibility.
+   */
+  restoreAfterCompaction(ctx: ExtensionContext): void {
+    this.invalidatePendingEvaluation();
+    this.treeGoalCarry = undefined;
+    this.clearLoopReanchorEligibility();
+    this.clearNavigationPending();
+    this.syncBranch(ctx);
 
     const goal = this.state;
     if (goal?.status === "active") {
@@ -485,12 +674,14 @@ export class GoalController {
   prepareForNavigation(): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
+    this.clearLoopReanchorEligibility();
     this.navigationPending = true;
     this.deferNavigationFallback();
   }
 
   prepareForTreeNavigation(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
+    this.clearLoopReanchorEligibility();
     this.navigationPending = true;
     this.deferNavigationFallback();
     const goal = this.branchState(ctx);
@@ -505,6 +696,7 @@ export class GoalController {
   shutdown(): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
+    this.clearLoopReanchorEligibility();
     this.navigationGeneration += 1;
     this.navigationPending = true;
     this.evaluatorAbort = undefined;
@@ -523,6 +715,7 @@ export class GoalController {
   start(ctx: ExtensionContext, objective: string, criteria: string[], options?: GoalLoopStartOptions): GoalStateV1 | Promise<GoalStateV2> {
     if (options?.loop) return this.startLoop(ctx, objective, criteria, options);
     this.invalidatePendingEvaluation();
+    this.clearLoopReanchorEligibility();
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
       this.evaluatorAbort?.abort();
@@ -570,6 +763,7 @@ export class GoalController {
     options: GoalLoopStartOptions = {},
   ): Promise<GoalStateV2> {
     this.invalidatePendingEvaluation();
+    this.clearLoopReanchorEligibility();
     this.syncBranch(ctx);
     if (this.state?.status === "active") {
       this.persist(terminalState(this.state, "stopped", "Replaced by a newer /goal loop."));
@@ -865,20 +1059,71 @@ export class GoalController {
   pause(ctx: ExtensionContext, reason = "Paused by user."): GoalStateV1 | GoalStateV2 | undefined {
     this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
+    if (this.loopState?.phase === "paused"
+      && this.loopReanchorEligibility
+      && reason !== TREE_CONTINUITY_PAUSE_REASON) {
+      this.clearLoopReanchorEligibility();
+    }
     if (this.state?.status === "active") {
+      this.clearLoopReanchorEligibility();
       this.evaluatorAbort?.abort();
       return this.transition("paused", reason);
     }
     if (this.loopState && LOOP_PHASE_ACTIVE.includes(this.loopState.phase)) {
+      // Only the known continuity failure following an explicit tree carry may
+      // retain the proof. Unknown failures and manual pauses are fail-closed.
+      const preserveEligibility = reason === TREE_CONTINUITY_PAUSE_REASON
+        && this.loopReanchorIsEligible(ctx, this.loopState);
+      if (!preserveEligibility) this.clearLoopReanchorEligibility();
       this.evaluatorAbort?.abort();
       const paused = this.loopTerminal(this.loopState, "paused", reason);
       this.persistLoop(paused);
+      if (preserveEligibility) this.rememberLoopReanchorEligibility(ctx, paused);
       return paused;
     }
     return undefined;
   }
 
-  resume(ctx: ExtensionContext): GoalStateV1 | GoalStateV2 | undefined {
+  private async reanchorAndResumeLoop(
+    ctx: ExtensionContext,
+    current: GoalStateV2,
+    epoch: number,
+  ): Promise<GoalStateV2> {
+    const nextCandidate: GoalStateV2 = {
+      ...current,
+      phase: "implementing",
+      contextEpoch: current.contextEpoch + 1,
+      updatedAt: Date.now(),
+      // The old marker belongs to the previous context epoch. markLoopEpoch
+      // mints a new identity after rebuilding the immutable bootstrap.
+      epochMarker: undefined,
+      reasons: { ...current.reasons, pause: undefined },
+    };
+    if (nextCandidate.reasons && !nextCandidate.reasons.block && !nextCandidate.reasons.stagnation) {
+      nextCandidate.reasons = undefined;
+    }
+
+    const settings = loadGoalLoopSettings(ctx.cwd);
+    const marked = await this.markLoopEpoch(
+      ctx,
+      nextCandidate,
+      settings.maxBootstrapBytes,
+      this.loopStorageAgentDir(current),
+    );
+    // Navigation, stop, clear, or another lifecycle transition supersedes an
+    // in-flight artifact read. Never publish a marker for that stale selection.
+    if (epoch !== this.sessionEpoch || this.ctx !== ctx || !this.loopReanchorIsEligible(ctx, current)) {
+      throw new Error("Goal loop branch adoption was superseded before its context epoch was installed.");
+    }
+    this.persistLoop(marked.state);
+    this.clearLoopReanchorEligibility();
+    this.lastResumeAdoptedBranch = true;
+    this.scheduleLoopBootstrap(ctx, marked.state, this.sessionEpoch, this.loopStorageAgentDir(current));
+    return marked.state;
+  }
+
+  resume(ctx: ExtensionContext): GoalStateV1 | GoalStateV2 | undefined | Promise<GoalStateV2> {
+    this.lastResumeAdoptedBranch = false;
     this.invalidatePendingEvaluation();
     this.syncBranch(ctx);
     if (this.state?.status === "paused") {
@@ -889,24 +1134,34 @@ export class GoalController {
     }
     if (this.loopState?.phase === "paused") {
       if (this.loopState.strategy === "PREWALK" && !this.prewalkReadyLoops.has(this.loopState.loopId)) {
+        this.clearLoopReanchorEligibility();
         return this.blockLoop(this.loopState, "PREWALK continuation is unsafe without a fresh approved PREWALK execution.");
       }
+      const current = this.loopState;
+      if (this.loopReanchorIsEligible(ctx, current)) {
+        return this.reanchorAndResumeLoop(ctx, current, this.sessionEpoch);
+      }
+      // A proof for another selection is never reusable. Ordinary same-branch
+      // pause/resume retains its current epoch and existing marker behavior.
+      this.clearLoopReanchorEligibility();
       const next: GoalStateV2 = {
-        ...this.loopState,
+        ...current,
         phase: "implementing",
         updatedAt: Date.now(),
-        reasons: { ...this.loopState.reasons, pause: undefined },
+        reasons: { ...current.reasons, pause: undefined },
       };
       if (next.reasons && !next.reasons.block && !next.reasons.stagnation) next.reasons = undefined;
       this.persistLoop(next);
       this.scheduleLoopBootstrap(ctx, next, this.sessionEpoch);
       return next;
     }
+    this.clearLoopReanchorEligibility();
     return undefined;
   }
 
   stop(ctx: ExtensionContext, reason = "Stopped by user."): GoalStateV1 | GoalStateV2 | undefined {
     this.invalidatePendingEvaluation();
+    this.clearLoopReanchorEligibility();
     this.syncBranch(ctx);
     if (this.state && this.state.status !== "stopped") {
       this.evaluatorAbort?.abort();
@@ -923,6 +1178,7 @@ export class GoalController {
 
   clear(ctx: ExtensionContext): GoalStateV1 | GoalStateV2 | undefined {
     this.invalidatePendingEvaluation();
+    this.clearLoopReanchorEligibility();
     this.syncBranch(ctx);
     if (this.state) {
       this.evaluatorAbort?.abort();

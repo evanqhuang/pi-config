@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 import goalExtension from "../src/index.js";
+import * as planArtifacts from "../src/plan-artifacts.js";
 import {
   buildContextEpochBootstrap,
   createContextEpochMarker,
@@ -148,7 +149,7 @@ function integrationHarness() {
     ctx,
     branch,
     handlers,
-    command,
+    get command() { return command; },
     sentMessages,
     get provider() { return provider; },
     get baseCompletionApplications() { return baseCompletionApplications; },
@@ -161,6 +162,12 @@ function integrationHarness() {
 }
 
 type Message = ContextEvent["messages"][number];
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(next => { resolve = next; });
+  return { promise, resolve };
+}
 
 describe("goal extension provider integration", () => {
   it("does not activate a goal from plan or mode transition events", async () => {
@@ -203,6 +210,34 @@ describe("goal extension provider integration", () => {
     expect(first.messages).toEqual(second.messages);
     expect(harness.sessionManager.getSessionId()).toBe("integration-session");
     expect(harness.sessionManager.getLeafId()).toBe("integration-leaf");
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+  });
+
+  it.each([
+    ["sessionId", "getSessionId", (): string => "stale-session"],
+    ["leafId", "getLeafId", (): string => "stale-leaf"],
+  ] as const)("fails closed for a stale context wrapper with a different %s without aborting or mutating state", async (_selectionName, selectionField, staleValue) => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    const state = loopState();
+    harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+    const branchBefore = structuredClone(harness.branch);
+    const staleContext = {
+      ...harness.ctx,
+      sessionManager: {
+        ...harness.sessionManager,
+        [selectionField]: staleValue,
+      },
+    };
+
+    const result = await harness.handlers.get("context")!({
+      type: "context",
+      messages: [{ role: "user", content: "stale context" }],
+    }, staleContext) as { messages: Message[] };
+
+    expect(result).toEqual({ messages: [] });
+    expect(harness.aborts).toBe(0);
+    expect(harness.branch).toEqual(branchBefore);
     await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
   });
 
@@ -293,6 +328,178 @@ describe("goal extension provider integration", () => {
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("adopts an explicitly selected branch on ordinary resume and accepts its fresh epoch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-tree-resume-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const plan = "# Approved plan\nImplement the feature.\n";
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const marker = controllerEpochMarker(state);
+      state.epochMarker = { id: marker.details.id, hash: marker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
+      harness.setIdle(false);
+      harness.branch.splice(0, harness.branch.length, {
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: state,
+      });
+      harness.setLeaf("tree-target");
+      harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "implementing", loopId: state.loopId, contextEpoch: 0 },
+      });
+
+      const unsafe = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "branchSummary", content: "selected tree branch" }],
+      }, harness.ctx) as { messages: Message[] };
+      expect(unsafe.messages).toEqual([]);
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", loopId: state.loopId, contextEpoch: 0 },
+      });
+
+      harness.setIdle(true);
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      await vi.waitFor(() => expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "implementing", loopId: state.loopId, contextEpoch: 1 },
+      }));
+      await vi.waitFor(() => expect(
+        harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
+      ).toHaveLength(1));
+
+      const freshMarker = harness.sentMessages.find(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE);
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [freshMarker],
+      }, harness.ctx) as { messages: Message[] };
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]).toMatchObject({ customType: GOAL_CONTEXT_EPOCH_TYPE });
+      // The initial unsafe tree-continuity attempt aborted once; accepting the
+      // fresh epoch must not trigger a repeated abort.
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { contextEpoch: 1, phase: "implementing" } });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["malformed", "stale"] as const)("invalidates selected-branch eligibility for %s marker rejection", async kind => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-malformed-marker-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const plan = "# Approved plan\nImplement the feature.\n";
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const marker = controllerEpochMarker(state);
+      state.epochMarker = { id: marker.details.id, hash: marker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
+      harness.setIdle(false);
+      harness.setLeaf("tree-target");
+      harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
+      const invalidMarker = kind === "malformed"
+        ? { ...marker, content: `${marker.content} ` }
+        : controllerEpochMarker({ ...state, contextEpoch: state.contextEpoch + 1, epochMarker: undefined });
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [invalidMarker],
+      }, harness.ctx) as { messages: Message[] };
+
+      expect(result.messages).toEqual([]);
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused", contextEpoch: 0 } });
+
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "implementing", contextEpoch: 0 } });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pauses and aborts when fallback artifact verification throws", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    const state = loopState(join(tmpdir(), "missing-goal-artifact"));
+    harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+    const result = await harness.handlers.get("context")!({
+      type: "context",
+      messages: [{ role: "user", content: "current request" }],
+    }, harness.ctx) as { messages: Message[] };
+
+    expect(result.messages).toEqual([]);
+    expect(harness.aborts).toBe(1);
+    expect(harness.branch.at(-1)).toMatchObject({ customType: GOAL_STATE_V2_TYPE, data: { phase: "paused" } });
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+  });
+
+  it("drops an async fallback after navigation supersedes its lifecycle token", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-async-context-"));
+    const release = deferred<void>();
+    const originalLoader = vi.spyOn(planArtifacts, "loadVerifiedOriginalPlan").mockImplementation(async options => {
+      await release.promise;
+      return {
+        path: options.provenance.snapshotPath!,
+        hash: options.provenance.snapshotHash!,
+        content: "# Approved plan\nImplement the feature.\n",
+        sizeBytes: Buffer.byteLength("# Approved plan\nImplement the feature.\n", "utf8"),
+        sourcePath: options.provenance.sourcePath ?? options.provenance.snapshotPath!,
+        sourceKind: options.provenance.sourceKind === "approved" ? "approved" : "explicit",
+        provenance: options.provenance,
+      };
+    });
+
+    try {
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+      const pending = harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "user", content: "current request" }],
+      }, harness.ctx) as Promise<{ messages: Message[] }>;
+      await vi.waitFor(() => expect(originalLoader).toHaveBeenCalledTimes(1));
+
+      harness.handlers.get("session_before_switch")!({ type: "session_before_switch" }, harness.ctx);
+      harness.branch.splice(0, harness.branch.length);
+      harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
+      release.resolve();
+
+      const result = await pending;
+      expect(result.messages).toEqual([]);
+      expect(harness.aborts).toBe(0);
+      expect(harness.branch).toHaveLength(0);
+    } finally {
+      originalLoader.mockRestore();
       await rm(root, { recursive: true, force: true });
     }
   });

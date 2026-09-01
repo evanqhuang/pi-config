@@ -12,6 +12,7 @@ import {
   GOAL_STATE_V2_TYPE,
   GOAL_SUBAGENT_UPDATE_MESSAGE,
   type GoalStateV1,
+  type GoalStateV2,
 } from "../src/types.js";
 
 const subagents = vi.hoisted(() => ({
@@ -290,6 +291,103 @@ describe("goal controller lifecycle guards", () => {
     cancelled.setBranch([], "target-leaf");
     cancelled.controller.restoreSelectedBranch(cancelled.ctx);
     expect(goalEntries(cancelled.branch())).toHaveLength(0);
+  });
+
+  it("reanchors a V2 loop once after explicit tree navigation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-tree-reanchor-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      const original = await runtime.controller.startLoop(runtime.ctx, "ship feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+      });
+      const originalPlan = original.plan;
+      runtime.controller.prepareForTreeNavigation(runtime.ctx);
+      runtime.setBranch([], "tree-target");
+      runtime.controller.restoreSelectedBranch(runtime.ctx);
+
+      expect(runtime.controller.currentLoop).toMatchObject({
+        phase: "paused",
+        loopId: original.loopId,
+        generation: original.generation,
+        contextEpoch: 0,
+        cycle: original.cycle,
+      });
+      const resumed = await runtime.controller.resume(runtime.ctx) as GoalStateV2;
+      expect(resumed).toMatchObject({
+        phase: "implementing",
+        loopId: original.loopId,
+        generation: original.generation,
+        contextEpoch: 1,
+        cycle: original.cycle,
+        plan: originalPlan,
+      });
+      expect(resumed.epochMarker?.id).not.toBe(original.epochMarker?.id);
+
+      runtime.setIdle(true);
+      runtime.controller.retryPendingWake(runtime.ctx);
+      await vi.waitFor(() => expect(epochMessages(runtime.pi)).toHaveLength(1));
+      expect(continueMessages(runtime.pi)).toHaveLength(1);
+      expect(runtime.controller.currentLoop?.contextEpoch).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps manual same-branch V2 pause/resume on its current epoch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-manual-resume-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      const original = await runtime.controller.startLoop(runtime.ctx, "ship feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+      });
+      const paused = runtime.controller.pause(runtime.ctx) as GoalStateV2;
+      const resumed = runtime.controller.resume(runtime.ctx) as GoalStateV2;
+      expect(paused.phase).toBe("paused");
+      expect(resumed).toMatchObject({
+        phase: "implementing",
+        loopId: original.loopId,
+        generation: original.generation,
+        contextEpoch: original.contextEpoch,
+        epochMarker: original.epochMarker,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reanchor after an unknown continuity failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-unknown-resume-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      const original = await runtime.controller.startLoop(runtime.ctx, "ship feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+      });
+      runtime.controller.prepareForTreeNavigation(runtime.ctx);
+      runtime.setBranch([], "tree-target");
+      runtime.controller.restoreSelectedBranch(runtime.ctx);
+      runtime.controller.pause(runtime.ctx, "Paused because an unknown continuity failure occurred.");
+
+      const resumed = runtime.controller.resume(runtime.ctx) as GoalStateV2;
+      expect(resumed.contextEpoch).toBe(original.contextEpoch);
+      expect(resumed.epochMarker).toEqual(original.epochMarker);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("resumes a ready selected active branch exactly once", () => {
