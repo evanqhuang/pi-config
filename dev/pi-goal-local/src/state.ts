@@ -8,6 +8,7 @@ import {
   type GoalPlanProvenance,
   type GoalPlanSourceKind,
   type GoalReasonMetadata,
+  type GoalReanchorProof,
   type GoalStateMarker,
   type GoalStateV1,
   type GoalStateV2,
@@ -198,12 +199,39 @@ function parseReasons(value: unknown): GoalReasonMetadata | undefined {
   return result;
 }
 
+function parseReanchorProof(value: unknown): GoalReanchorProof | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    "kind", "sessionId", "targetLeafId", "loopId", "generation", "contextEpoch", "cycle", "planSnapshotHash",
+  ])) return undefined;
+  if (value.kind !== "tree-selection") return undefined;
+
+  const sessionId = boundedString(value.sessionId, MAX_ID_LENGTH);
+  const targetLeafId = boundedString(value.targetLeafId, MAX_ID_LENGTH);
+  const loopId = boundedString(value.loopId, MAX_ID_LENGTH);
+  const planSnapshotHash = sha256(value.planSnapshotHash);
+  if (!sessionId || !targetLeafId || !loopId || !planSnapshotHash
+    || !integerAtLeast(value.generation, 1)
+    || !integerAtLeast(value.contextEpoch, 0)
+    || !integerAtLeast(value.cycle, 0)) return undefined;
+
+  return {
+    kind: "tree-selection",
+    sessionId,
+    targetLeafId,
+    loopId,
+    generation: value.generation,
+    contextEpoch: value.contextEpoch,
+    cycle: value.cycle,
+    planSnapshotHash,
+  };
+}
+
 /** Strictly validate and normalize a version-2 loop state marker. */
 export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
   if (!isRecord(value) || value.schemaVersion !== 2) return undefined;
   if (!hasOnlyKeys(value, [
     "schemaVersion", "loopId", "generation", "contextEpoch", "phase", "cycle", "maxCycles",
-    "objective", "criteria", "plan", "strategy", "verifier", "epochMarker", "reasons", "createdAt", "updatedAt",
+    "objective", "criteria", "plan", "strategy", "verifier", "epochMarker", "reasons", "reanchor", "createdAt", "updatedAt",
   ])) return undefined;
 
   const loopId = boundedString(value.loopId, MAX_ID_LENGTH);
@@ -222,6 +250,14 @@ export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
   if (value.epochMarker !== undefined && !epochMarker) return undefined;
   const reasons = value.reasons === undefined ? undefined : parseReasons(value.reasons);
   if (value.reasons !== undefined && !reasons) return undefined;
+  const reanchor = value.reanchor === undefined ? undefined : parseReanchorProof(value.reanchor);
+  if (value.reanchor !== undefined && !reanchor) return undefined;
+  if (reanchor && (value.phase !== "paused"
+    || reanchor.loopId !== loopId
+    || reanchor.generation !== value.generation
+    || reanchor.contextEpoch !== value.contextEpoch
+    || reanchor.cycle !== value.cycle
+    || reanchor.planSnapshotHash !== plan.snapshotHash)) return undefined;
   const createdAt = value.createdAt === undefined ? undefined : value.createdAt;
   const updatedAt = value.updatedAt === undefined ? undefined : value.updatedAt;
   if ((createdAt !== undefined && !finiteNumber(createdAt)) || (updatedAt !== undefined && !finiteNumber(updatedAt))) return undefined;
@@ -242,6 +278,7 @@ export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
   if (verifier !== undefined) result.verifier = verifier;
   if (epochMarker !== undefined) result.epochMarker = epochMarker;
   if (reasons !== undefined) result.reasons = reasons;
+  if (reanchor !== undefined) result.reanchor = reanchor;
   if (createdAt !== undefined) result.createdAt = createdAt;
   if (updatedAt !== undefined) result.updatedAt = updatedAt;
   return result;

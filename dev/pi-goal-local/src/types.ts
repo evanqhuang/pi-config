@@ -63,6 +63,18 @@ export interface GoalReasonMetadata {
   stagnation?: string;
 }
 
+/** Durable metadata describing a pending tree-selection reanchor proof. */
+export interface GoalReanchorProof {
+  kind: "tree-selection";
+  sessionId: string;
+  targetLeafId: string;
+  loopId: string;
+  generation: number;
+  contextEpoch: number;
+  cycle: number;
+  planSnapshotHash: string;
+}
+
 /**
  * Version-2 loop state. Unlike GoalStateV1 this records the loop identity and
  * context epochs needed by later lifecycle/context integration. The nested
@@ -84,6 +96,7 @@ export interface GoalStateV2 {
   verifier?: GoalVerifierState;
   epochMarker?: GoalEpochMarker;
   reasons?: GoalReasonMetadata;
+  reanchor?: GoalReanchorProof;
   createdAt?: number;
   updatedAt?: number;
 }

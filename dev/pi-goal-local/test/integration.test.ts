@@ -353,6 +353,7 @@ describe("goal extension provider integration", () => {
       harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
       harness.setIdle(false);
       harness.branch.splice(0, harness.branch.length, {
+        id: "tree-target",
         type: "custom",
         customType: GOAL_STATE_V2_TYPE,
         data: state,

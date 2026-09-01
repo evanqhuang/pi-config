@@ -295,6 +295,8 @@ describe("goal controller lifecycle guards", () => {
 
   it("reanchors a V2 loop once after explicit tree navigation", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-tree-reanchor-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
     const planPath = join(root, "approved-plan.md");
     await writeFile(planPath, "# Approved plan\nImplement the feature.\n", "utf8");
     const runtime = harness();
@@ -307,7 +309,9 @@ describe("goal controller lifecycle guards", () => {
       });
       const originalPlan = original.plan;
       runtime.controller.prepareForTreeNavigation(runtime.ctx);
-      runtime.setBranch([], "tree-target");
+      runtime.setBranch([
+        { id: "tree-target", type: "message", message: { role: "user", content: "selected branch" } },
+      ], "tree-target");
       runtime.controller.restoreSelectedBranch(runtime.ctx);
 
       expect(runtime.controller.currentLoop).toMatchObject({
@@ -317,7 +321,15 @@ describe("goal controller lifecycle guards", () => {
         contextEpoch: 0,
         cycle: original.cycle,
       });
-      const resumed = await runtime.controller.resume(runtime.ctx) as GoalStateV2;
+      expect(runtime.controller.currentLoop?.reanchor).toMatchObject({
+        kind: "tree-selection",
+        sessionId: "session-1",
+        targetLeafId: "tree-target",
+      });
+
+      const reopened = new GoalController(runtime.pi);
+      reopened.restore(runtime.ctx);
+      const resumed = await reopened.resume(runtime.ctx) as GoalStateV2;
       expect(resumed).toMatchObject({
         phase: "implementing",
         loopId: original.loopId,
@@ -329,11 +341,61 @@ describe("goal controller lifecycle guards", () => {
       expect(resumed.epochMarker?.id).not.toBe(original.epochMarker?.id);
 
       runtime.setIdle(true);
-      runtime.controller.retryPendingWake(runtime.ctx);
+      reopened.retryPendingWake(runtime.ctx);
       await vi.waitFor(() => expect(epochMessages(runtime.pi)).toHaveLength(1));
       expect(continueMessages(runtime.pi)).toHaveLength(1);
-      expect(runtime.controller.currentLoop?.contextEpoch).toBe(1);
+      expect(reopened.currentLoop?.contextEpoch).toBe(1);
     } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates the exact legacy tree-gap pause once after reopening", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-legacy-reanchor-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      const original = await runtime.controller.startLoop(runtime.ctx, "ship feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+      });
+      const legacyPaused: GoalStateV2 = {
+        ...original,
+        phase: "paused",
+        reasons: {
+          pause: "Paused because goal-loop context continuity was unsafe: No safe complete user-led turn suffix was established; automatic continuation must pause.",
+        },
+      };
+      runtime.setBranch([
+        { id: "legacy-target", type: "message", message: { role: "user", content: "selected branch" } },
+        { id: "legacy-paused", type: "custom", customType: GOAL_STATE_V2_TYPE, data: legacyPaused },
+      ], "legacy-paused");
+
+      const ordinarySession = new GoalController(runtime.pi);
+      ordinarySession.restore(runtime.ctx);
+      expect(ordinarySession.currentLoop?.reanchor).toBeUndefined();
+
+      runtime.setSessionId("01a05a4b-d7fe-7b2c-8458-965d0a199975");
+      const reopened = new GoalController(runtime.pi);
+      reopened.restore(runtime.ctx);
+      expect(reopened.currentLoop?.reanchor).toMatchObject({
+        kind: "tree-selection",
+        sessionId: "01a05a4b-d7fe-7b2c-8458-965d0a199975",
+        targetLeafId: "legacy-paused",
+      });
+      const resumed = await reopened.resume(runtime.ctx) as GoalStateV2;
+      expect(resumed.contextEpoch).toBe(original.contextEpoch + 1);
+      expect(resumed.reanchor).toBeUndefined();
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(root, { recursive: true, force: true });
     }
   });

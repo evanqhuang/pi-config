@@ -194,6 +194,36 @@ describe("goal state", () => {
     ])).toBeUndefined();
   });
 
+  it("strictly validates durable tree reanchor proofs", () => {
+    const proof = {
+      kind: "tree-selection" as const,
+      sessionId: "session-1",
+      targetLeafId: "selected-leaf",
+      loopId: "loop-1",
+      generation: 1,
+      contextEpoch: 0,
+      cycle: 0,
+      planSnapshotHash: hash,
+    };
+    const valid = loopState({ phase: "paused", reanchor: proof });
+    expect(parseGoalStateV2(valid)).toEqual(valid);
+    expect(parseGoalStateV2(loopState())).toEqual(loopState());
+
+    for (const reanchor of [
+      { ...proof, extra: true },
+      { ...proof, kind: "manual-pause" },
+      { ...proof, targetLeafId: "" },
+      { ...proof, planSnapshotHash: "not-a-hash" },
+      { ...proof, loopId: "other-loop" },
+      { ...proof, generation: 2 },
+      { ...proof, contextEpoch: 1 },
+      { ...proof, cycle: 1 },
+    ]) {
+      expect(parseGoalStateV2(loopState({ phase: "paused", reanchor } as Partial<GoalStateV2>))).toBeUndefined();
+    }
+    expect(parseGoalStateV2(loopState({ reanchor: proof }))).toBeUndefined();
+  });
+
   it("keeps conservative loop settings bounded", () => {
     expect(DEFAULT_GOAL_LOOP_SETTINGS.maxCycles).toBeGreaterThan(0);
     expect(DEFAULT_GOAL_LOOP_SETTINGS.maxCycles).toBeLessThanOrEqual(GOAL_LOOP_SETTING_BOUNDS.maxCycles.max);

@@ -33,6 +33,7 @@ import {
   GOAL_SUBAGENT_UPDATE_MESSAGE,
   type GoalLoopPhase,
   type GoalLoopStrategy,
+  type GoalReanchorProof,
   type GoalStateV1,
   type GoalStateV2,
   type GoalStatus,
@@ -87,20 +88,11 @@ type TreeGoalCarry = {
 };
 
 /**
- * Runtime-only proof that a V2 loop was carried onto an explicitly selected
- * tree branch. It is deliberately not durable: a session reopen, compaction,
- * or non-tree navigation must not turn an arbitrary paused loop into an
- * eligible reanchor.
+ * Runtime authorization reconstructed from a strictly parsed durable proof.
+ * The target leaf must remain an ancestor of the selected branch, and mutable
+ * loop identity is rechecked before the proof can be consumed.
  */
-type LoopReanchorEligibility = {
-  sessionId: string;
-  selectionIdentity: string;
-  branchIdentity: string;
-  loopId: string;
-  generation: number;
-  contextEpoch: number;
-  cycle: number;
-  planIdentity: string;
+type LoopReanchorEligibility = GoalReanchorProof & {
   verifierIdentity: string | undefined;
 };
 
@@ -108,6 +100,9 @@ const TREE_REWIND_PAUSE_REASON = "Paused after rewinding the conversation.";
 const MISSING_SAFE_SUFFIX_REASON = "No safe complete user-led turn suffix was established; automatic continuation must pause.";
 const CONTINUITY_PAUSE_PREFIX = "Paused because goal-loop context continuity was unsafe:";
 const TREE_CONTINUITY_PAUSE_REASON = `${CONTINUITY_PAUSE_PREFIX} ${MISSING_SAFE_SUFFIX_REASON}`;
+const LEGACY_TREE_REANCHOR_SESSION_IDS = new Set([
+  "01a05a4b-d7fe-7b2c-8458-965d0a199975",
+]);
 
 export interface GoalLoopStartOptions {
   loop?: boolean;
@@ -248,13 +243,14 @@ export class GoalController {
     if (phase === "paused") reasons.pause = reason;
     else if (phase === "blocked") reasons.block = reason;
     else if (phase === "stopped") reasons.block = reason;
-    return { ...state, phase, updatedAt: Date.now(), reasons };
+    return { ...state, phase, reanchor: undefined, updatedAt: Date.now(), reasons };
   }
 
   private blockLoop(state: GoalStateV2, reason: string, verifier?: GoalStateV2["verifier"]): GoalStateV2 {
     const next: GoalStateV2 = {
       ...state,
       phase: "blocked",
+      reanchor: undefined,
       verifier: verifier ? { ...state.verifier, ...verifier } : state.verifier,
       updatedAt: Date.now(),
       reasons: { ...state.reasons, block: reason },
@@ -335,51 +331,99 @@ export class GoalController {
     return adopted;
   }
 
-  private loopReanchorIdentity(state: GoalStateV2): Pick<LoopReanchorEligibility, "planIdentity" | "verifierIdentity"> {
-    return {
-      planIdentity: JSON.stringify(state.plan),
-      verifierIdentity: state.verifier === undefined ? undefined : JSON.stringify(state.verifier),
-    };
+  private loopReanchorVerifierIdentity(state: GoalStateV2): string | undefined {
+    return state.verifier === undefined ? undefined : JSON.stringify(state.verifier);
   }
 
-  private rememberLoopReanchorEligibility(ctx: ExtensionContext, state: GoalStateV2): void {
-    const identity = this.loopReanchorIdentity(state);
-    this.loopReanchorEligibility = {
-      sessionId: ctx.sessionManager.getSessionId(),
-      selectionIdentity: this.selectionIdentity(ctx),
-      branchIdentity: this.branchIdentity(ctx),
+  private createLoopReanchorProof(
+    ctx: ExtensionContext,
+    state: GoalStateV2,
+    targetLeafId = ctx.sessionManager.getLeafId(),
+  ): GoalReanchorProof | undefined {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const planSnapshotHash = state.plan.snapshotHash;
+    if (!sessionId || !targetLeafId || !planSnapshotHash) return undefined;
+    return {
+      kind: "tree-selection",
+      sessionId,
+      targetLeafId,
       loopId: state.loopId,
       generation: state.generation,
       contextEpoch: state.contextEpoch,
       cycle: state.cycle,
-      ...identity,
+      planSnapshotHash,
+    };
+  }
+
+  private branchContainsLeaf(ctx: ExtensionContext, leafId: string): boolean {
+    return ctx.sessionManager.getBranch().some(entry => entry.id === leafId);
+  }
+
+  private rememberLoopReanchorEligibility(
+    ctx: ExtensionContext,
+    state: GoalStateV2,
+    proof = state.reanchor ?? this.createLoopReanchorProof(ctx, state),
+  ): void {
+    if (!proof) {
+      this.clearLoopReanchorEligibility();
+      return;
+    }
+    this.loopReanchorEligibility = {
+      ...proof,
+      verifierIdentity: this.loopReanchorVerifierIdentity(state),
     };
   }
 
   private loopReanchorIsEligible(ctx: ExtensionContext, state: GoalStateV2): boolean {
     const eligibility = this.loopReanchorEligibility;
     if (!eligibility) return false;
-    const identity = this.loopReanchorIdentity(state);
     return eligibility.sessionId === ctx.sessionManager.getSessionId()
-      && eligibility.selectionIdentity === this.selectionIdentity(ctx)
-      && eligibility.branchIdentity === this.branchIdentity(ctx)
+      && this.branchContainsLeaf(ctx, eligibility.targetLeafId)
       && eligibility.loopId === state.loopId
       && eligibility.generation === state.generation
       && eligibility.contextEpoch === state.contextEpoch
       && eligibility.cycle === state.cycle
-      && eligibility.planIdentity === identity.planIdentity
-      && eligibility.verifierIdentity === identity.verifierIdentity;
+      && eligibility.planSnapshotHash === state.plan.snapshotHash
+      && eligibility.verifierIdentity === this.loopReanchorVerifierIdentity(state);
   }
 
   private loopReanchorStatesMatch(left: GoalStateV2, right: GoalStateV2): boolean {
-    const leftIdentity = this.loopReanchorIdentity(left);
-    const rightIdentity = this.loopReanchorIdentity(right);
     return left.loopId === right.loopId
       && left.generation === right.generation
       && left.contextEpoch === right.contextEpoch
       && left.cycle === right.cycle
-      && leftIdentity.planIdentity === rightIdentity.planIdentity
-      && leftIdentity.verifierIdentity === rightIdentity.verifierIdentity;
+      && JSON.stringify(left.plan) === JSON.stringify(right.plan)
+      && this.loopReanchorVerifierIdentity(left) === this.loopReanchorVerifierIdentity(right);
+  }
+
+  private durableLoopReanchorProof(): GoalReanchorProof | undefined {
+    if (!this.loopReanchorEligibility) return undefined;
+    const { verifierIdentity: _verifierIdentity, ...proof } = this.loopReanchorEligibility;
+    return proof;
+  }
+
+  private restoreLoopReanchorEligibility(ctx: ExtensionContext, state: GoalStateV2): void {
+    if (state.phase !== "paused") return;
+    const pauseReason = state.reasons?.pause;
+    const proofReasonIsValid = pauseReason === TREE_REWIND_PAUSE_REASON
+      || pauseReason === TREE_CONTINUITY_PAUSE_REASON;
+    if (state.reanchor) {
+      this.rememberLoopReanchorEligibility(ctx, state, state.reanchor);
+      if (proofReasonIsValid && this.loopReanchorIsEligible(ctx, state)) return;
+      this.clearLoopReanchorEligibility();
+      this.persistLoop({ ...state, reanchor: undefined });
+      return;
+    }
+    if (pauseReason !== TREE_CONTINUITY_PAUSE_REASON
+      || !LEGACY_TREE_REANCHOR_SESSION_IDS.has(ctx.sessionManager.getSessionId() ?? "")) return;
+
+    // Compatibility for the known session paused by the pre-proof
+    // implementation. No other proof-less session is granted eligibility.
+    const proof = this.createLoopReanchorProof(ctx, state);
+    if (!proof) return;
+    const migrated = { ...state, reanchor: proof };
+    this.persistLoop(migrated);
+    this.rememberLoopReanchorEligibility(ctx, migrated, proof);
   }
 
   private loopContextStateIdentity(state: GoalStateV2): string {
@@ -562,10 +606,13 @@ export class GoalController {
       this.persistLoop({
         ...this.loopState,
         phase: "paused",
+        reanchor: undefined,
         updatedAt: Date.now(),
         reasons: { ...this.loopState.reasons, pause: "Paused when the session was reopened." },
       });
+      return;
     }
+    if (this.loopState) this.restoreLoopReanchorEligibility(ctx, this.loopState);
   }
 
   /**
@@ -585,16 +632,16 @@ export class GoalController {
     );
     if (!branchHasGoalMarker && carry?.sessionId === ctx.sessionManager.getSessionId()) {
       if (carry.goal.schemaVersion === 2) {
+        const proof = this.createLoopReanchorProof(ctx, carry.goal);
         const paused: GoalStateV2 = {
           ...carry.goal,
           phase: "paused",
+          reanchor: proof,
           updatedAt: Date.now(),
           reasons: { ...carry.goal.reasons, pause: TREE_REWIND_PAUSE_REASON },
         };
         this.persistLoop(paused);
-        // persistLoop appends the target-branch marker, so capture the exact
-        // selected branch only after that append has become authoritative.
-        this.rememberLoopReanchorEligibility(ctx, paused);
+        this.rememberLoopReanchorEligibility(ctx, paused, proof);
       } else {
         this.persist({
           ...carry.goal,
@@ -646,7 +693,11 @@ export class GoalController {
       this.scheduleResume(ctx, goal, this.sessionEpoch);
       return;
     }
-    const loop = this.loopState;
+    let loop = this.loopState;
+    if (loop?.reanchor) {
+      loop = { ...loop, reanchor: undefined };
+      this.persistLoop(loop);
+    }
     if (loop && LOOP_PHASE_ACTIVE.includes(loop.phase)) {
       this.scheduleLoopBootstrap(ctx, loop, this.sessionEpoch);
     }
@@ -1076,9 +1127,12 @@ export class GoalController {
         && this.loopReanchorIsEligible(ctx, this.loopState);
       if (!preserveEligibility) this.clearLoopReanchorEligibility();
       this.evaluatorAbort?.abort();
-      const paused = this.loopTerminal(this.loopState, "paused", reason);
+      const paused = {
+        ...this.loopTerminal(this.loopState, "paused", reason),
+        reanchor: preserveEligibility ? this.durableLoopReanchorProof() : undefined,
+      };
       this.persistLoop(paused);
-      if (preserveEligibility) this.rememberLoopReanchorEligibility(ctx, paused);
+      if (preserveEligibility) this.rememberLoopReanchorEligibility(ctx, paused, paused.reanchor);
       return paused;
     }
     return undefined;
@@ -1097,6 +1151,7 @@ export class GoalController {
       // The old marker belongs to the previous context epoch. markLoopEpoch
       // mints a new identity after rebuilding the immutable bootstrap.
       epochMarker: undefined,
+      reanchor: undefined,
       reasons: { ...current.reasons, pause: undefined },
     };
     if (nextCandidate.reasons && !nextCandidate.reasons.block && !nextCandidate.reasons.stagnation) {
@@ -1147,6 +1202,7 @@ export class GoalController {
       const next: GoalStateV2 = {
         ...current,
         phase: "implementing",
+        reanchor: undefined,
         updatedAt: Date.now(),
         reasons: { ...current.reasons, pause: undefined },
       };
@@ -1192,6 +1248,7 @@ export class GoalController {
       const cleared: GoalStateV2 = {
         ...this.loopState,
         phase: "stopped",
+        reanchor: undefined,
         updatedAt: Date.now(),
         reasons: { ...this.loopState.reasons, block: CLEARED_REASON },
       };
