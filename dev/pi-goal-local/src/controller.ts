@@ -688,13 +688,18 @@ export class GoalController {
   /**
    * Compaction is a context boundary, not tree navigation. In particular it
    * must never inherit or create the tree-derived reanchor eligibility.
+   *
+   * Native overflow recovery retries the interrupted turn immediately after
+   * this hook. Defer only the goal-owned bootstrap in that case so its marker
+   * and continuation cannot race the retry's context transformation.
    */
-  restoreAfterCompaction(ctx: ExtensionContext): void {
+  restoreAfterCompaction(ctx: ExtensionContext, deferBootstrap = false): void {
     this.invalidatePendingEvaluation();
     this.treeGoalCarry = undefined;
     this.clearLoopReanchorEligibility();
     this.clearNavigationPending();
     this.syncBranch(ctx);
+    if (deferBootstrap) return;
 
     const goal = this.state;
     if (goal?.status === "active") {

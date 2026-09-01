@@ -294,6 +294,61 @@ describe("goal extension provider integration", () => {
     }
   });
 
+  it("defers native overflow rebootstrap until the retry settles", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-overflow-"));
+    const loader = vi.spyOn(planArtifacts, "loadVerifiedOriginalPlan").mockImplementation(async options => {
+      const content = "# Approved plan\nImplement the feature.\n";
+      return {
+        path: options.provenance.snapshotPath!,
+        hash: options.provenance.snapshotHash!,
+        content,
+        sizeBytes: Buffer.byteLength(content, "utf8"),
+        sourcePath: options.provenance.sourcePath ?? options.provenance.snapshotPath!,
+        sourceKind: options.provenance.sourceKind === "approved" ? "approved" : "explicit",
+        provenance: options.provenance,
+      };
+    });
+
+    try {
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      await mkdir(join(root, "goal-loops", state.loopId), { recursive: true });
+      await writeFile(state.plan.snapshotPath!, "# Approved plan\nImplement the feature.\n", "utf8");
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      await harness.handlers.get("session_compact")!({
+        type: "session_compact",
+        reason: "overflow",
+        willRetry: true,
+      }, harness.ctx);
+      expect(loader).not.toHaveBeenCalled();
+      expect(harness.sentMessages).toEqual([]);
+
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [
+          { role: "compactionSummary", content: "recovered summary" },
+          { role: "assistant", content: [{ type: "text", text: "ready to continue" }] },
+        ],
+      }, harness.ctx) as { messages: Message[] };
+      expect(result.messages.filter(message => (message as { role?: string }).role === "custom")).toHaveLength(1);
+      expect(harness.aborts).toBe(0);
+
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(
+        harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
+      ).toHaveLength(1));
+      expect(harness.sentMessages.filter(message => message.customType === "pi-goal-continue-v1")).toHaveLength(1);
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      loader.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reanchors after compaction when a queued continuation advances the leaf", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-integration-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

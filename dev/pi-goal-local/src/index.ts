@@ -403,10 +403,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let shutDown = false;
   let selectionGeneration = 0;
   let deferredResume: { sessionId: string; selectionGeneration: number } | undefined;
+  let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
 
   const invalidateDeferredResume = (): void => {
     selectionGeneration += 1;
     deferredResume = undefined;
+    deferredCompactionRestore = undefined;
   };
   const eventUnsubscribers: Array<() => void> = [];
 
@@ -468,10 +470,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.restoreSelectedBranch(treeCtx);
   });
 
-  pi.on("session_compact", (_event, compactCtx) => {
+  pi.on("session_compact", (event, compactCtx) => {
     if (shutDown) return;
     invalidateDeferredResume();
     ctx = compactCtx;
+    // Native overflow recovery retries immediately after this event. Defer
+    // goal-owned marker/continuation delivery until that retry settles so the
+    // context handler cannot observe a half-published epoch.
+    if (event.willRetry) {
+      const selection = selectionOf(compactCtx);
+      if (selection) {
+        deferredCompactionRestore = {
+          sessionId: selection.sessionId,
+          selectionGeneration,
+        };
+      }
+      controller.restoreAfterCompaction(compactCtx, true);
+      return;
+    }
     // Compaction is a valid context boundary, but it is not tree navigation.
     // Keep its existing active-loop rebootstrap behavior without granting the
     // tree-selection-only resume reanchor eligibility.
@@ -716,6 +732,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
       } else {
         if (!settledCtx.isIdle() || settledCtx.hasPendingMessages()) return;
         deferredResume = undefined;
+        deferredCompactionRestore = undefined;
         try {
           const next = await Promise.resolve(controller.resume(settledCtx));
           const adoptedBranch = controller.consumeResumeAdoptedBranch();
@@ -730,6 +747,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
             settledCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
           }
         }
+        return;
+      }
+    }
+
+    const pendingCompaction = deferredCompactionRestore;
+    if (pendingCompaction) {
+      const selection = selectionOf(settledCtx);
+      const stillSelected = selection?.sessionId === pendingCompaction.sessionId
+        && selectionGeneration === pendingCompaction.selectionGeneration;
+      if (!stillSelected || aborted) {
+        deferredCompactionRestore = undefined;
+      } else {
+        // The native retry is settled, but a queued user message may still own
+        // the next turn. Keep the restoration pending until the runtime is
+        // idle, rather than publishing another follow-up into that turn.
+        if (!settledCtx.isIdle() || settledCtx.hasPendingMessages()) return;
+        deferredCompactionRestore = undefined;
+        controller.restoreAfterCompaction(settledCtx);
         return;
       }
     }
