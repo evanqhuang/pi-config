@@ -885,7 +885,9 @@ export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime
   if (!runtime.active || !pi.getActiveTools().includes("checkpoint_notes")) return undefined;
   if (runtime.reentryRequired) {
     runtime.reentryRequired = false;
-    return "[TASK NOTES RE-ENTRY]\nReread the current NOTES.md compact durable continuation/task-state handoff and inspect live worktree/tool state before continuing. It is not general notes or proof.";
+    if (runtime.lastCheckpointHash) {
+      return `[TASK NOTES RE-ENTRY]\nReread the compact durable continuation/task-state handoff at ${runtime.notesPath} and inspect live worktree/tool state before continuing. It is not general notes or proof.`;
+    }
   }
   if (runtime.checkpointDue && runtime.checkpointReminderPending) {
     runtime.checkpointReminderPending = false;

@@ -503,16 +503,37 @@ describe("session lifecycle integration", () => {
     expect(blocked.reason).toMatch(/dirty durable Notes/i);
   });
 
-  it("preserves dirty checkpoint pressure across compaction boundaries", async () => {
+  it("skips re-entry after compaction when no checkpoint has been materialized", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
     await h.command.handler("on", h.ctx);
-    await h.checkpointTool.execute("cp-1", payload);
+    const state = latestCustom(h.branch, NOTES_STATE_TYPE).data;
+    const notesPath = join(h.root, "notes", state.notesId, "NOTES.md");
+
+    h.handlers.get("session_compact")!({});
+    const context = h.handlers.get("context")!({ messages: [] }, h.ctx);
+
+    expect(context.messages).toEqual([]);
+    await expect(readFile(notesPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves path-specific re-entry and dirty checkpoint pressure across compaction", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    const committed = await h.checkpointTool.execute("cp-1", payload);
+    const notesPath = committed.details.notesPath as string;
     h.handlers.get("tool_result")!({ toolName: "write", input: { path: "src/a.ts" }, isError: false });
 
     h.handlers.get("session_compact")!({});
     expect(await h.status()).toContain("dirty: true");
     expect(await h.status()).toContain("checkpoint due: true");
+
+    const reentryContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+    expect(reentryContext.messages.at(-1)?.content).toContain("[TASK NOTES RE-ENTRY]");
+    expect(reentryContext.messages.at(-1)?.content).toContain(notesPath);
+    const checkpointContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+    expect(checkpointContext.messages.at(-1)?.content).toContain("[TASK NOTES CHECKPOINT DUE]");
 
     h.handlers.get("session_compact_failed")!({});
     expect(await h.status()).toContain("dirty: true");

@@ -309,7 +309,24 @@ describe("transient reminders", () => {
     expect(stripNotesReminders([normal, reminder])).toEqual([normal]);
   });
 
-  it("emits re-entry once, then exposes an already-due checkpoint reminder", () => {
+  it("emits path-specific re-entry once, then exposes an already-due checkpoint reminder", () => {
+    const runtime = createRuntime("manual");
+    runtime.reentryRequired = true;
+    runtime.lastCheckpointHash = "committed-hash";
+    runtime.dirty = true;
+    runtime.checkpointDue = true;
+    runtime.checkpointReminderPending = true;
+    const pi = { getActiveTools: () => ["checkpoint_notes"] };
+
+    const reentry = selectReminder(pi, runtime);
+    expect(reentry).toContain("[TASK NOTES RE-ENTRY]");
+    expect(reentry).toContain(runtime.notesPath);
+    expect(runtime.reentryRequired).toBe(false);
+    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(selectReminder(pi, runtime)).toBeUndefined();
+  });
+
+  it("skips re-entry without a checkpoint while preserving checkpoint pressure", () => {
     const runtime = createRuntime("manual");
     runtime.reentryRequired = true;
     runtime.dirty = true;
@@ -317,9 +334,8 @@ describe("transient reminders", () => {
     runtime.checkpointReminderPending = true;
     const pi = { getActiveTools: () => ["checkpoint_notes"] };
 
-    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES RE-ENTRY]");
-    expect(runtime.reentryRequired).toBe(false);
     expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(runtime.reentryRequired).toBe(false);
     expect(selectReminder(pi, runtime)).toBeUndefined();
   });
 
