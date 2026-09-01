@@ -672,7 +672,15 @@ export class GoalController {
     } else if (loop?.phase === "paused") {
       const carriedLoop = carry?.goal.schemaVersion === 2 ? carry.goal : undefined;
       if (carriedLoop && this.loopReanchorStatesMatch(carriedLoop, loop)) {
-        this.rememberLoopReanchorEligibility(ctx, loop);
+        const proof = this.createLoopReanchorProof(ctx, loop);
+        const paused: GoalStateV2 = {
+          ...loop,
+          reanchor: proof,
+          updatedAt: Date.now(),
+          reasons: { ...loop.reasons, pause: TREE_REWIND_PAUSE_REASON },
+        };
+        this.persistLoop(paused);
+        this.rememberLoopReanchorEligibility(ctx, paused, proof);
       }
     }
   }
@@ -732,16 +740,21 @@ export class GoalController {
 
   prepareForTreeNavigation(ctx: ExtensionContext): void {
     this.invalidatePendingEvaluation();
-    this.clearLoopReanchorEligibility();
     this.navigationPending = true;
     this.deferNavigationFallback();
     const goal = this.branchState(ctx);
     const loop = this.branchLoopState(ctx);
+    const eligiblePausedLoop = loop?.phase === "paused" && this.loopReanchorIsEligible(ctx, loop)
+      ? loop
+      : undefined;
+    this.clearLoopReanchorEligibility();
     this.treeGoalCarry = goal?.status === "active"
       ? { sessionId: ctx.sessionManager.getSessionId(), goal: { ...goal } }
       : loop && LOOP_PHASE_ACTIVE.includes(loop.phase)
         ? { sessionId: ctx.sessionManager.getSessionId(), goal: { ...loop } }
-        : undefined;
+        : eligiblePausedLoop
+          ? { sessionId: ctx.sessionManager.getSessionId(), goal: { ...eligiblePausedLoop } }
+          : undefined;
   }
 
   shutdown(): void {

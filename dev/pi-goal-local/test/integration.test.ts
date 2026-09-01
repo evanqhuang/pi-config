@@ -72,13 +72,14 @@ function integrationHarness() {
   let baseCompletionApplications = 0;
   const sentMessages: any[] = [];
   let leafId = "integration-leaf";
+  let sessionId = "integration-session";
   let idle = true;
   let pendingMessages = false;
   let aborts = 0;
   const sessionManager = {
     getBranch: () => branch,
     buildContextEntries: () => branch,
-    getSessionId: () => "integration-session",
+    getSessionId: () => sessionId,
     getLeafId: () => leafId,
   };
   const baseProvider = {
@@ -155,6 +156,7 @@ function integrationHarness() {
     get baseCompletionApplications() { return baseCompletionApplications; },
     sessionManager,
     setLeaf(next: string) { leafId = next; },
+    setSessionId(next: string) { sessionId = next; },
     setIdle(next: boolean) { idle = next; },
     setPendingMessages(next: boolean) { pendingMessages = next; },
     get aborts() { return aborts; },
@@ -324,6 +326,81 @@ describe("goal extension provider integration", () => {
 
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
       expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE)).toHaveLength(1);
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("carries a reopened proof across startup sibling selection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-startup-tree-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const plan = "# Approved plan\nImplement the feature.\n";
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+      const harness = integrationHarness();
+      harness.setSessionId("01a05a4b-d7fe-7b2c-8458-965d0a199975");
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const sourcePaused: GoalStateV2 = {
+        ...state,
+        phase: "paused",
+        reasons: {
+          pause: "Paused because goal-loop context continuity was unsafe: No safe complete user-led turn suffix was established; automatic continuation must pause.",
+        },
+      };
+      harness.branch.push({
+        id: "source-proof",
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: sourcePaused,
+      });
+      harness.setLeaf("source-proof");
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
+
+      const rememberedPaused: GoalStateV2 = {
+        ...state,
+        phase: "paused",
+        reasons: { pause: "Paused by user." },
+      };
+      harness.branch.splice(
+        0,
+        harness.branch.length,
+        {
+          id: "remembered-goal",
+          type: "custom",
+          customType: GOAL_STATE_V2_TYPE,
+          data: rememberedPaused,
+        },
+        {
+          id: "remembered-leaf",
+          type: "custom",
+          customType: "pi-plan-mode-state",
+          data: { mode: "implement" },
+        },
+      );
+      harness.setLeaf("remembered-leaf");
+      harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: {
+          phase: "paused",
+          reanchor: { targetLeafId: "remembered-leaf" },
+        },
+      });
+
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "implementing", contextEpoch: 1, reanchor: undefined },
+      });
       await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

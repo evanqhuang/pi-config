@@ -293,7 +293,7 @@ describe("goal controller lifecycle guards", () => {
     expect(goalEntries(cancelled.branch())).toHaveLength(0);
   });
 
-  it("reanchors a V2 loop once after explicit tree navigation", async () => {
+  it("reanchors once after reopen selects a matching sibling branch", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-tree-reanchor-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = root;
@@ -329,6 +329,27 @@ describe("goal controller lifecycle guards", () => {
 
       const reopened = new GoalController(runtime.pi);
       reopened.restore(runtime.ctx);
+
+      // A reopened session may select a remembered sibling after restoring a
+      // paused proof on the newest leaf. The paused proof must survive the
+      // explicit session_before_tree event.
+      reopened.prepareForTreeNavigation(runtime.ctx);
+      const rememberedPaused: GoalStateV2 = {
+        ...original,
+        phase: "paused",
+        reasons: { pause: "Paused by user." },
+      };
+      runtime.setBranch([
+        { id: "startup-goal", type: "custom", customType: GOAL_STATE_V2_TYPE, data: rememberedPaused },
+        { id: "startup-target", type: "custom", customType: "pi-plan-mode-state", data: { mode: "implement" } },
+      ], "startup-target");
+      reopened.restoreSelectedBranch(runtime.ctx);
+      expect(reopened.currentLoop?.reanchor).toMatchObject({
+        kind: "tree-selection",
+        sessionId: "session-1",
+        targetLeafId: "startup-target",
+      });
+
       const resumed = await reopened.resume(runtime.ctx) as GoalStateV2;
       expect(resumed).toMatchObject({
         phase: "implementing",
@@ -413,6 +434,13 @@ describe("goal controller lifecycle guards", () => {
         agentDir: root,
       });
       const paused = runtime.controller.pause(runtime.ctx) as GoalStateV2;
+      runtime.controller.prepareForTreeNavigation(runtime.ctx);
+      runtime.setBranch([
+        { id: "manual-target", type: "custom", customType: GOAL_STATE_V2_TYPE, data: paused },
+      ], "manual-target");
+      runtime.controller.restoreSelectedBranch(runtime.ctx);
+      expect(runtime.controller.currentLoop?.reanchor).toBeUndefined();
+
       const resumed = runtime.controller.resume(runtime.ctx) as GoalStateV2;
       expect(paused.phase).toBe("paused");
       expect(resumed).toMatchObject({
