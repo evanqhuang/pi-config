@@ -54,6 +54,12 @@ function loopStateIsActive(state: GoalStateV2 | undefined): state is GoalStateV2
   return state !== undefined && LOOP_PHASES.includes(state.phase);
 }
 
+function resumedGoalMessage(adoptedBranch: boolean): string {
+  return adoptedBranch
+    ? "Goal resumed on the selected branch with a fresh context epoch."
+    : "Goal resumed.";
+}
+
 /** Display all durable V2 identity fields; V1 status keeps its old format. */
 export function formatGoalLoopStatus(state: GoalStateV2): string {
   const reason = state.reasons?.block ?? state.reasons?.pause ?? state.reasons?.stagnation;
@@ -395,10 +401,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let autocompleteInstalled = false;
   let cliDispatchStarted = false;
   let shutDown = false;
+  let selectionGeneration = 0;
+  let deferredResume: { sessionId: string; selectionGeneration: number } | undefined;
+
+  const invalidateDeferredResume = (): void => {
+    selectionGeneration += 1;
+    deferredResume = undefined;
+  };
   const eventUnsubscribers: Array<() => void> = [];
 
   pi.on("session_start", (_event, nextCtx) => {
     if (shutDown) return;
+    invalidateDeferredResume();
     ctx = nextCtx;
     controller.restore(nextCtx);
     if (!autocompleteInstalled && typeof nextCtx.ui?.addAutocompleteProvider === "function") {
@@ -431,15 +445,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_switch", () => {
+    invalidateDeferredResume();
     controller.prepareForNavigation();
   });
 
   pi.on("session_before_fork", () => {
+    invalidateDeferredResume();
     controller.prepareForNavigation();
   });
 
   pi.on("session_before_tree", (_event, treeCtx) => {
+    invalidateDeferredResume();
     controller.prepareForTreeNavigation(treeCtx);
+  });
+
+  pi.on("session_before_compact", () => {
+    invalidateDeferredResume();
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -449,6 +470,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (_event, compactCtx) => {
     if (shutDown) return;
+    invalidateDeferredResume();
     ctx = compactCtx;
     // Compaction is a valid context boundary, but it is not tree navigation.
     // Keep its existing active-loop rebootstrap behavior without granting the
@@ -537,6 +559,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
       try { eventUnsubscribers.pop()?.(); } catch {}
     }
     controller.shutdown();
+    invalidateDeferredResume();
     ctx = undefined;
     currentRunAborted = false;
   });
@@ -571,6 +594,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "start": {
+          deferredResume = undefined;
           const wantsLoop = command.loop === true
             || command.planPath !== undefined
             || command.maxCycles !== undefined;
@@ -599,6 +623,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "fresh": {
+          deferredResume = undefined;
           try {
             const selection = selectionOf(activeCtx);
             const plan = await bridge.resolvePlan();
@@ -614,20 +639,36 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "pause": {
+          deferredResume = undefined;
           const next = controller.pause(activeCtx);
           commandCtx.ui.notify(next ? "Goal paused." : "There is no active goal to pause.", next ? "info" : "warning");
           return;
         }
         case "resume": {
           try {
+            if (!activeCtx.isIdle() || activeCtx.hasPendingMessages()) {
+              const marker = controller.refreshMarker(activeCtx);
+              const resumable = marker?.schemaVersion === 2
+                ? marker.phase === "paused"
+                : marker?.status === "paused";
+              const selection = selectionOf(activeCtx);
+              if (!resumable || !selection) {
+                deferredResume = undefined;
+                commandCtx.ui.notify("There is no paused goal to resume.", "warning");
+                return;
+              }
+              deferredResume = {
+                sessionId: selection.sessionId,
+                selectionGeneration,
+              };
+              commandCtx.ui.notify("Goal resume queued until the current agent turn settles.", "info");
+              return;
+            }
+            deferredResume = undefined;
             const next = await Promise.resolve(controller.resume(activeCtx));
             const adoptedBranch = controller.consumeResumeAdoptedBranch();
             commandCtx.ui.notify(
-              next
-                ? adoptedBranch
-                  ? "Goal resumed on the selected branch with a fresh context epoch."
-                  : "Goal resumed."
-                : "There is no paused goal to resume.",
+              next ? resumedGoalMessage(adoptedBranch) : "There is no paused goal to resume.",
               next ? "info" : "warning",
             );
           } catch (error) {
@@ -636,11 +677,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "stop": {
+          deferredResume = undefined;
           const next = controller.stop(activeCtx);
           commandCtx.ui.notify(next ? "Goal stopped." : "There is no goal to stop.", next ? "info" : "warning");
           return;
         }
         case "clear": {
+          deferredResume = undefined;
           const next = controller.clear(activeCtx);
           commandCtx.ui.notify(next ? "Goal cleared." : "There is no goal to clear.", next ? "info" : "warning");
           return;
@@ -657,11 +700,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
     currentRunAborted ||= agentRunWasAborted(event.messages);
   });
 
-  pi.on("agent_settled", (_event, settledCtx) => {
+  pi.on("agent_settled", async (_event, settledCtx) => {
     if (shutDown) return;
     ctx = settledCtx;
     const aborted = currentRunAborted;
     currentRunAborted = false;
+
+    const pendingResume = deferredResume;
+    if (pendingResume) {
+      const selection = selectionOf(settledCtx);
+      const stillSelected = selection?.sessionId === pendingResume.sessionId
+        && selectionGeneration === pendingResume.selectionGeneration;
+      if (!stillSelected) {
+        deferredResume = undefined;
+      } else {
+        if (!settledCtx.isIdle() || settledCtx.hasPendingMessages()) return;
+        deferredResume = undefined;
+        try {
+          const next = await Promise.resolve(controller.resume(settledCtx));
+          const adoptedBranch = controller.consumeResumeAdoptedBranch();
+          if (settledCtx.hasUI) {
+            settledCtx.ui.notify(
+              next ? resumedGoalMessage(adoptedBranch) : "The queued goal resume was no longer applicable.",
+              next ? "info" : "warning",
+            );
+          }
+        } catch (error) {
+          if (settledCtx.hasUI) {
+            settledCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
+        }
+        return;
+      }
+    }
+
     if (aborted) {
       const paused = controller.pause(settledCtx);
       if (paused && settledCtx.hasUI) {

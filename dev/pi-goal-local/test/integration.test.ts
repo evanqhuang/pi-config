@@ -396,12 +396,100 @@ describe("goal extension provider integration", () => {
         },
       });
 
+      const notify = vi.fn();
+      harness.setIdle(false);
+      await harness.command.handler("resume", { ui: { notify } });
+      expect(notify).toHaveBeenCalledWith(
+        "Goal resume queued until the current agent turn settles.",
+        "info",
+      );
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 0 },
+      });
+
+      const duringTurn = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [
+          { role: "user", content: "continue" },
+          {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "active-call", name: "read", arguments: {} }],
+          },
+          { role: "toolResult", toolCallId: "active-call", content: [{ type: "text", text: "done" }] },
+        ],
+      }, harness.ctx);
+      expect(duringTurn).toBeUndefined();
+      expect(harness.aborts).toBe(0);
+
+      harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
+      harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 0 },
+      });
+
+      harness.setIdle(false);
       await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      harness.handlers.get("session_before_compact")!({ type: "session_before_compact" }, harness.ctx);
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 0 },
+      });
+
+      harness.setIdle(false);
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      harness.branch.push({
+        id: "active-turn-descendant",
+        parentId: "remembered-leaf",
+        type: "custom",
+        customType: "active-turn-progress",
+        data: {},
+      });
+      harness.setLeaf("active-turn-descendant");
+      harness.setIdle(true);
+      harness.setPendingMessages(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 0 },
+      });
+
+      harness.setPendingMessages(false);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
       expect(harness.branch.at(-1)).toMatchObject({
         customType: GOAL_STATE_V2_TYPE,
         data: { phase: "implementing", contextEpoch: 1, reanchor: undefined },
       });
+      await vi.waitFor(() => expect(
+        harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
+      ).toHaveLength(1));
+      expect(harness.sentMessages.filter(message => message.customType === "pi-goal-continue-v1")).toHaveLength(1);
+
+      await harness.command.handler("pause", { ui: { notify: vi.fn() } });
+      harness.setIdle(false);
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      await harness.command.handler("pause", { ui: { notify: vi.fn() } });
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 1 },
+      });
+
+      harness.setIdle(false);
+      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
       await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      harness.setIdle(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      expect(harness.branch.at(-1)).toMatchObject({
+        customType: GOAL_STATE_V2_TYPE,
+        data: { phase: "paused", contextEpoch: 1 },
+      });
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -515,6 +603,7 @@ describe("goal extension provider integration", () => {
       expect(harness.aborts).toBe(1);
       expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused", contextEpoch: 0 } });
 
+      harness.setIdle(true);
       await harness.command.handler("resume", { ui: { notify: vi.fn() } });
       expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "implementing", contextEpoch: 0 } });
     } finally {
