@@ -385,6 +385,16 @@ describe("session lifecycle integration", () => {
     expect(await h.status()).toContain("dirty: true");
   });
 
+  it("publishes a compact checkpoint budget in the agent policy", async () => {
+    const h = await makeHarness();
+    await h.command.handler("on", h.ctx);
+    const policy = h.handlers.get("before_agent_start")!({ systemPrompt: "base" }, h.ctx);
+
+    expect(policy.systemPrompt).toContain("current <=400 characters");
+    expect(policy.systemPrompt).toContain("next_action <=250 characters");
+    expect(policy.systemPrompt).toContain("Never paste plans, logs, raw test output, or file lists.");
+  });
+
   it("applies checkpoint pressure after high-signal results or dirty turns", async () => {
     const byResults = await makeHarness();
     await byResults.handlers.get("session_start")!({ reason: "new" }, byResults.ctx);
@@ -405,7 +415,7 @@ describe("session lifecycle integration", () => {
     await byTurns.command.handler("on", byTurns.ctx);
     await byTurns.checkpointTool.execute("cp-1", payload);
     byTurns.handlers.get("tool_result")!({ toolName: "write", input: { path: "src/a.ts" }, isError: false });
-    for (let index = 0; index < 5; index += 1) byTurns.handlers.get("turn_end")!({});
+    for (let index = 0; index < DEFAULT_CONFIG.checkpointing.dirtyTurns - 1; index += 1) byTurns.handlers.get("turn_end")!({});
     expect(await byTurns.status()).toContain("checkpoint due: false");
     byTurns.handlers.get("turn_end")!({});
     expect(await byTurns.status()).toContain("checkpoint due: true");

@@ -130,12 +130,36 @@ describe("checkpoint argument compatibility", () => {
     };
     expect(prepareCheckpointArguments(boundary)).toBe(boundary);
 
-    for (const invalid of [
-      { ...payload, current: "c".repeat(2049) },
-      { ...payload, findings: ["f".repeat(1025)] },
-      { ...payload, blockers: Array.from({ length: 31 }, () => "blocked") },
-    ]) {
-      expect(() => prepareCheckpointArguments(invalid)).toThrow(/Invalid checkpoint payload.*Summarize/s);
+    const invalidCases = [
+      {
+        input: { ...payload, current: "c".repeat(2049) },
+        detail: /current is 2049 characters \(maximum 2048\)/,
+      },
+      {
+        input: { ...payload, next_action: "n".repeat(2049) },
+        detail: /next_action is 2049 characters \(maximum 2048\)/,
+      },
+      {
+        input: { ...payload, findings: ["f".repeat(1025)] },
+        detail: /findings\[0\] is 1025 characters \(maximum 1024\)/,
+      },
+      {
+        input: { ...payload, blockers: Array.from({ length: 31 }, () => "blocked") },
+        detail: /blockers has 31 items \(maximum 30\)/,
+      },
+    ];
+    for (const { input, detail } of invalidCases) {
+      let failure: Error | undefined;
+      try {
+        prepareCheckpointArguments(input);
+      } catch (error) {
+        failure = error as Error;
+      }
+      expect(failure?.message).toMatch(detail);
+      expect(failure?.message).toMatch(/Summarize/);
+      expect(failure?.message).not.toContain("c".repeat(80));
+      expect(failure?.message).not.toContain("n".repeat(80));
+      expect(failure?.message).not.toContain("f".repeat(80));
     }
   });
 });
@@ -149,8 +173,8 @@ describe("runtime and rendering", () => {
       requireHighSignalActivity: true,
     });
     expect(DEFAULT_CONFIG.checkpointing).toEqual({
-      dirtyTurns: 6,
-      continuityRelevantToolResults: 20,
+      dirtyTurns: 10,
+      continuityRelevantToolResults: 32,
     });
   });
 

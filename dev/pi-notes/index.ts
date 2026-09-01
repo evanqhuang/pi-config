@@ -25,8 +25,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     requireHighSignalActivity: true,
   },
   checkpointing: {
-    dirtyTurns: 6,
-    continuityRelevantToolResults: 20,
+    dirtyTurns: 10,
+    continuityRelevantToolResults: 32,
   },
   integrations: {
     goal: true,
@@ -107,17 +107,8 @@ type CheckpointRecord = {
   };
 };
 
-const CHECKPOINT_SCHEMA = Type.Object({
-  current: Type.String({ minLength: 1, maxLength: 2048 }),
-  completed: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 40 }),
-  findings: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 40 }),
-  decisions: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 40 }),
-  failed_approaches: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 30 }),
-  blockers: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 30 }),
-  verification: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 40 }),
-  next_action: Type.String({ minLength: 1, maxLength: 2048 }),
-}, { additionalProperties: false });
-
+const CHECKPOINT_TEXT_MAX_LENGTH = 2048;
+const CHECKPOINT_LIST_ITEM_MAX_LENGTH = 1024;
 const CHECKPOINT_ARRAY_FIELDS = [
   "completed",
   "findings",
@@ -126,6 +117,52 @@ const CHECKPOINT_ARRAY_FIELDS = [
   "blockers",
   "verification",
 ] as const;
+type CheckpointArrayField = (typeof CHECKPOINT_ARRAY_FIELDS)[number];
+const CHECKPOINT_MAX_ITEMS: Record<CheckpointArrayField, number> = {
+  completed: 40,
+  findings: 40,
+  decisions: 40,
+  failed_approaches: 30,
+  blockers: 30,
+  verification: 40,
+};
+
+const CHECKPOINT_SCHEMA = Type.Object({
+  current: Type.String({
+    minLength: 1,
+    maxLength: CHECKPOINT_TEXT_MAX_LENGTH,
+    description: "Present objective and status only; keep this compact.",
+  }),
+  completed: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.completed, description: "Finished work only." },
+  ),
+  findings: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.findings, description: "Observed facts and constraints." },
+  ),
+  decisions: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.decisions, description: "Chosen approaches and rationale." },
+  ),
+  failed_approaches: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.failed_approaches, description: "Failed attempts to avoid repeating." },
+  ),
+  blockers: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.blockers, description: "Unresolved impediments only." },
+  ),
+  verification: Type.Array(
+    Type.String({ minLength: 1, maxLength: CHECKPOINT_LIST_ITEM_MAX_LENGTH }),
+    { maxItems: CHECKPOINT_MAX_ITEMS.verification, description: "Commands and outcomes only." },
+  ),
+  next_action: Type.String({
+    minLength: 1,
+    maxLength: CHECKPOINT_TEXT_MAX_LENGTH,
+    description: "One concrete next action only; keep this compact.",
+  }),
+}, { additionalProperties: false });
 const CHECKPOINT_FIELDS = new Set<string>([
   "current",
   ...CHECKPOINT_ARRAY_FIELDS,
@@ -190,17 +227,56 @@ export function repairCheckpointArguments(args: unknown): unknown {
   return repaired;
 }
 
+const CHECKPOINT_RETRY_HINT =
+  "Summarize only continuation state and retry; do not paste plans, logs, test output, or file lists.";
 const INVALID_CHECKPOINT_MESSAGE = [
   "Invalid checkpoint payload.",
   "Limits: current and next_action 1-2048 characters; each list item 1-1024 characters;",
   "completed, findings, decisions, and verification at most 40 items;",
   "failed_approaches and blockers at most 30 items.",
-  "Summarize the continuation state and retry.",
+  CHECKPOINT_RETRY_HINT,
 ].join(" ");
+
+function checkpointLimitViolation(args: unknown): string | undefined {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return undefined;
+  const input = args as Record<string, unknown>;
+
+  for (const field of ["current", "next_action"] as const) {
+    const value = input[field];
+    if (typeof value === "string" && value.length > CHECKPOINT_TEXT_MAX_LENGTH) {
+      return `${field} is ${value.length} characters (maximum ${CHECKPOINT_TEXT_MAX_LENGTH}).`;
+    }
+  }
+
+  for (const field of CHECKPOINT_ARRAY_FIELDS) {
+    const value = input[field];
+    if (!Array.isArray(value)) continue;
+    const maxItems = CHECKPOINT_MAX_ITEMS[field];
+    if (value.length > maxItems) {
+      return `${field} has ${value.length} items (maximum ${maxItems}).`;
+    }
+    const oversizedIndex = value.findIndex(
+      (item) => typeof item === "string" && item.length > CHECKPOINT_LIST_ITEM_MAX_LENGTH,
+    );
+    if (oversizedIndex !== -1) {
+      const item = value[oversizedIndex] as string;
+      return `${field}[${oversizedIndex}] is ${item.length} characters (maximum ${CHECKPOINT_LIST_ITEM_MAX_LENGTH}).`;
+    }
+  }
+
+  return undefined;
+}
 
 export function prepareCheckpointArguments(args: unknown): CheckpointPayload {
   const repaired = repairCheckpointArguments(args);
-  if (!Value.Check(CHECKPOINT_SCHEMA, repaired)) throw new Error(INVALID_CHECKPOINT_MESSAGE);
+  if (!Value.Check(CHECKPOINT_SCHEMA, repaired)) {
+    const detail = checkpointLimitViolation(repaired);
+    throw new Error(
+      detail
+        ? `Invalid checkpoint payload: ${detail} ${CHECKPOINT_RETRY_HINT}`
+        : INVALID_CHECKPOINT_MESSAGE,
+    );
+  }
   return repaired as CheckpointPayload;
 }
 
@@ -768,6 +844,8 @@ const CHECKPOINT_FIELD_GUIDANCE = [
   "verification = verification commands and outcomes only.",
   "next_action = the one next concrete action.",
   "Do not put verification in completed, repeat current in next_action, or copy deterministic working-set facts such as modified files into authored sections; the extension supplies those facts separately.",
+  "Use a compact budget well below the hard limits: current <=400 characters, next_action <=250 characters, at most 3 items per list, and each item <=180 characters.",
+  "Never paste plans, logs, raw test output, or file lists. Keep only facts needed to resume; the extension adds the deterministic working set automatically.",
   "Checkpoint limits: current and next_action are 1-2048 characters; every list item is 1-1024 characters; completed, findings, decisions, and verification allow at most 40 items; failed_approaches and blockers allow at most 30. Summarize before calling checkpoint_notes rather than exceeding these limits.",
 ].join(" ");
 
