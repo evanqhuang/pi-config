@@ -1274,6 +1274,10 @@ export class GoalController {
 
   scheduleSubagentWake(): void {
     if (this.navigationPending) return;
+    if (this.evaluationInFlight) {
+      this.evaluationQueued = true;
+      return;
+    }
     if (this.pendingWake || this.loopContinuationToken) {
       this.retryPendingWake();
       return;

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -786,6 +787,58 @@ describe("goal controller lifecycle guards", () => {
     vi.runOnlyPendingTimers();
 
     expect(continueMessages(pi)).toHaveLength(0);
+  });
+
+  it("coalesces a subagent wake while fixed-point evaluation is in flight", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-wake-race-"));
+    const agentDir = join(root, "agent");
+    const loopId = "loop-wake-race";
+    const artifactDir = join(agentDir, "goal-loops", loopId);
+    const planPath = join(artifactDir, "original-plan.md");
+    const plan = "# Approved plan\nImplement and test the feature.\n";
+    await mkdir(artifactDir, { recursive: true });
+    await writeFile(planPath, plan, "utf8");
+
+    const { controller, ctx, pi, setBranch } = harness();
+    const state: GoalStateV2 = {
+      schemaVersion: 2,
+      loopId,
+      generation: 1,
+      contextEpoch: 0,
+      phase: "implementing",
+      cycle: 0,
+      maxCycles: 3,
+      objective: "ship feature",
+      criteria: ["tests pass"],
+      plan: {
+        sourceKind: "explicit",
+        sourcePath: planPath,
+        snapshotPath: planPath,
+        snapshotHash: createHash("sha256").update(plan).digest("hex"),
+      },
+    };
+    setBranch([{ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state }]);
+    (controller as any).loopAgentDirs.set(loopId, agentDir);
+    controller.refresh(ctx);
+
+    const judge = deferred<{ output: string; aborted: boolean; steered: boolean }>();
+    subagents.runEvaluator.mockReturnValueOnce(judge.promise);
+    controller.requestEvaluation(ctx);
+    await vi.waitFor(() => expect(subagents.runEvaluator).toHaveBeenCalledTimes(1));
+
+    pi.sendMessage.mockClear();
+    controller.scheduleSubagentWake();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(continueMessages(pi)).toHaveLength(0);
+
+    controller.stop(ctx);
+    judge.resolve({
+      output: JSON.stringify({ ok: false, reason: "more work is required" }),
+      aborted: false,
+      steered: false,
+    });
+    await vi.waitFor(() => expect(controller.currentLoop?.phase).toBe("stopped"));
+    await rm(root, { recursive: true, force: true });
   });
 
   it.each([
