@@ -42,6 +42,11 @@ import {
   REVISION_FEEDBACK_LIMIT,
   selectPlanReminderVariant,
 } from "./src/plan-reminder.mjs";
+import {
+  appendModeChangeReminder,
+  createModeChangeReminderMessage,
+  removeModeChangeReminderMessages,
+} from "./src/mode-change-reminder.mjs";
 
 const STATE_TYPE = "pi-plan-mode-state";
 const LEGACY_STATE_TYPE = "mode-state";
@@ -70,6 +75,8 @@ Return a bounded handoff to the parent with concise findings, relevant file:line
 const ORCHESTRATOR_PROMPT = `ORCHESTRATOR MODE IS ACTIVE. You have the same complete permissions as YOLO, but your job is to coordinate implementation through leaf subagents to preserve the main context and parallelize independent work.
 For plans, features, fixes, and other implementation work, split the work into focused, independently verifiable units and delegate those units with the Agent tool. Each delegated implementation unit must fit comfortably in one fresh worker context without compaction: normally one objective, one subsystem boundary, no more than 3-5 closely related implementation files plus focused tests, and one focused verification command. Do not bundle discovery, design, implementation, testing, and review into one worker.
 Implementation agents are forced to the ImplementationWorker leaf-worker profile, which runs with normal full-access tools (YOLO behavior) and cannot create, launch, steer, or wait on subagents. Every implementation delegation uses model "openai-codex/gpt-5.6-luna" and thinking "xhigh". Dependent units run sequentially only after the prerequisite handoff is inspected and its contract/tests pass. Parallelize only truly independent units with disjoint files and no dependency edge. If scope expands or a worker approaches its context limit or needs compaction, the worker must stop with a concise handoff; the parent starts a fresh worker for the next unit rather than extending or resuming a context-heavy session. The parent owns integration and must avoid overlapping ownership. Keep tightly coupled integration and coordination in the main session. Give each subagent exact requirements, owned files, forbidden changes, and a focused verification command. Never trust a subagent summary by itself: inspect the actual changed files or diff, run relevant diagnostics and tests, and fix integration issues. Verifier evidence contract (mandatory): Every verifier delegation names the exact absolute target roots and ref/snapshot. Before acting, the parent validates that every substantive citation, cwd, and source metadata is under those roots and on the requested ref. Any off-root, mirror, stale-copy, or wrong-ref report is invalid evidence and must not trigger edits or a fix loop. On provenance failure, inspect the requested live paths directly, explain why the report is invalid, and do not automatically relaunch a verifier merely to obtain PASS. A new verifier is justified only after actual implementation changes require fresh evidence or the user explicitly requests a corrected rerun. Scope findings to approved criteria/non-goals; classify out-of-scope suggestions instead of fixing them. Do not launch either verifier by default or merely because implementation finished. Use LunaCompliance only when the approved plan or user requirements contain concrete compliance, specification, security, migration, or acceptance criteria that warrant an independent implementation comparison. If no such criteria exist, do not launch it. Use LunaTestVerifier only when test evidence is broad, high-risk, coverage-sensitive, difficult to interpret, or otherwise benefits from independent review. For routine changes with focused commands and clear results, the parent runs and evaluates verification directly instead of launching LunaTestVerifier. These dedicated read-only verifier profiles use model "openai-codex/gpt-5.6-luna" with thinking "high". When one or both are justified, run only the selected verifier or verifiers after implementation, in parallel when independent, then resolve every actionable gap they identify. Verify the complete result yourself before reporting completion. Do not delegate final accountability or claim success from unverified subagent output.`;
+
+const YOLO_MODE_CHANGE_CONTRACT = "YOLO mode is active: the complete tool registry is restored and PLAN's read-only restrictions no longer apply. Continue the user's request directly, including edits, writes, and other mutating actions as needed.";
 
 type Mode = "PLAN" | "ORCHESTRATOR" | "YOLO";
 type ParentRecommendation = "YOLO" | "ORCHESTRATOR" | "PREWALK";
@@ -178,6 +185,17 @@ type State = {
   planPath?: string;
   planStatus: string;
   pendingRevisionFeedback?: string;
+  /**
+   * Set when requestMode applies a mode mid-run (see requestMode).
+   * before_agent_start already baked the previous mode's contract into this
+   * run's system prompt, so the context hook re-announces the new mode on
+   * every remaining turn until agent_settled clears this.
+   */
+  midRunModeChange?: Mode;
+  /** Depth counter from ui_prompt_start/ui_prompt_end; gates the mid-run fast path so a mode switch cannot land mid-dialog (e.g. the plan-approval select). */
+  openUiPrompts: number;
+  /** Serializes concurrent apply() calls; see applySerialized. */
+  applyChain: Promise<void>;
 };
 
 const PLAN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -785,6 +803,8 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     reminder: createReminderState(),
     orchestrator: createOrchestratorState(),
     planStatus: "none",
+    openUiPrompts: 0,
+    applyChain: Promise.resolve(),
   };
 
   let activeContext: ExtensionContext | undefined;
@@ -945,18 +965,47 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     notify(ctx, `${mode} mode active`);
   };
 
+  // apply() can now start while the agent is mid-run (see requestMode). Two
+  // concurrent calls could otherwise interleave across their awaits — e.g. an
+  // enter-PLAN call awaiting initializePlanSandbox while a second call resets
+  // the sandbox and flips state.mode — so every call is serialized through
+  // this chain. A rejection here must not block later calls, so the chain
+  // itself always resolves; callers still get the real result/rejection back.
+  const applySerialized = (mode: Mode, ctx: ExtensionContext) => {
+    const run = state.applyChain.then(() => apply(mode, ctx));
+    state.applyChain = run.then(() => undefined, () => undefined);
+    return run;
+  };
+
   const requestMode = async (mode: Mode, ctx: ExtensionContext) => {
     if (isChild && mode !== "PLAN") {
       notify(ctx, "Child PLAN sessions cannot activate unrestricted execution modes", "error");
       return;
     }
-    if (!ctx.isIdle()) {
+    const midRun = !ctx.isIdle();
+    // apply() no longer needs to wait for an idle boundary: state.mode only
+    // flips after any async sandbox setup/teardown inside apply() completes
+    // (see apply()), so there is no window where state.mode says PLAN before
+    // the sandbox is ready. Concurrent apply() calls are still serialized via
+    // applySerialized. An armed approval still forces the queued path for
+    // every target, since an explicit approval owns the transition. An open
+    // UI prompt (e.g. the plan-approval select) only forces it for YOLO or
+    // ORCHESTRATOR — landing one of those mid-dialog is the actual hazard;
+    // tightening to PLAN is exactly the emergency-stop a user wants even
+    // while a dialog is open, so it is never held back by this gate.
+    const canApplyMidRun = !state.pendingApprovalArmed && (mode === "PLAN" || state.openUiPrompts === 0);
+    if (midRun && !canApplyMidRun) {
       state.pendingMode = mode;
+      // A later switch supersedes any in-flight mid-run announcement; leaving
+      // it would tell the model its restrictions are still lifted right as a
+      // PLAN switch (or an armed approval) is about to reinstate them.
+      state.midRunModeChange = undefined;
       notify(ctx, `${mode} mode queued until the current run finishes`);
       return;
     }
     try {
-      await apply(mode, ctx);
+      await applySerialized(mode, ctx);
+      state.midRunModeChange = midRun ? mode : undefined;
     } catch (error) {
       notify(ctx, `Cannot activate ${mode} mode: ${error instanceof Error ? error.message : String(error)}`, "error");
     }
@@ -978,7 +1027,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   };
 
   const startImplementation = async (pending: PendingApproval, ctx: ExtensionContext, mode: Exclude<Mode, "PLAN">) => {
-    await apply(mode, ctx);
+    await applySerialized(mode, ctx);
     const history = pending.transcriptPath
       ? ` A snapshot of the planning chat is available at ${pending.transcriptPath} if details are needed.`
       : "";
@@ -1286,7 +1335,14 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     ...localBash,
     label: "bash (PLAN sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      if (state.mode !== "PLAN") {
+      // Prefer the decision the tool_call hook pinned when this call was
+      // approved (see the bash branch there); it may be stale by now if
+      // state.mode moved mid-run. Fall back to live state.mode only for
+      // direct-call paths that bypass tool_call (e.g. tests).
+      const sandboxed = isRecord(params) && "__planSandboxed" in params
+        ? params.__planSandboxed === true
+        : state.mode === "PLAN";
+      if (!sandboxed) {
         const tool = createBashTool(ctx.cwd);
         return tool.execute(id, params, signal, onUpdate);
       }
@@ -1332,6 +1388,11 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       if (!isReadOnlyCommand(command)) {
         return blockPlanTool("PLAN Bash only permits a single recognized read-only command; use ctx_execute for sandboxed derivation.");
       }
+      // Pin the sandboxing decision to this call now, at approval time. A
+      // mid-run mode switch can flip state.mode before this call's execute()
+      // runs; re-reading live state there would silently drop sandboxing for
+      // a call PLAN already approved.
+      if (event.input && typeof event.input === "object") (event.input as Record<string, unknown>).__planSandboxed = true;
     }
 
     if (event.toolName === "ctx_batch_execute" && !isReadOnlyBatch(event.input)) {
@@ -1393,7 +1454,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       // A recoverable approval is an explicit safety interlock: it never
       // restores the previously persisted execution mode before the user
       // chooses whether to resume it.
-      await apply(recoveredApproval ? "PLAN" : isChild ? "PLAN" : lastMode(ctx), ctx);
+      await applySerialized(recoveredApproval ? "PLAN" : isChild ? "PLAN" : lastMode(ctx), ctx);
       if (!recoveredApproval || !genuineResume || !ctx.hasUI) return;
       // Explicit runtime reasons distinguish reload/fork from a later real
       // startup/resume. Adapters without the reason use the process/session
@@ -1432,8 +1493,32 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     refreshTools();
   });
 
+  // Best-effort depth counter: gates the mid-run mode-switch fast path so it
+  // never lands while a blocking ctx.ui.select()/confirm()/input() prompt is
+  // open (including the plan-approval dialog). Not a permission decision.
+  pi.on("ui_prompt_start", async () => {
+    state.openUiPrompts += 1;
+  });
+  pi.on("ui_prompt_end", async () => {
+    state.openUiPrompts = Math.max(0, state.openUiPrompts - 1);
+  });
+
+  const contractForMode = (mode: Mode) => {
+    if (mode === "ORCHESTRATOR") return ORCHESTRATOR_PROMPT;
+    if (mode === "PLAN") return isChild ? CHILD_PLAN_PROMPT : PLAN_PROMPT;
+    return YOLO_MODE_CHANGE_CONTRACT;
+  };
+
   pi.on("context", async (event) => {
-    const messages = removePlanReminderMessages(removeOrchestratorReminderMessages(event.messages));
+    const stripped = removeModeChangeReminderMessages(
+      removePlanReminderMessages(removeOrchestratorReminderMessages(event.messages)),
+    );
+    const messages = state.midRunModeChange
+      ? appendModeChangeReminder(stripped, createModeChangeReminderMessage({
+          mode: state.midRunModeChange,
+          contract: contractForMode(state.midRunModeChange),
+        }))
+      : stripped;
     if (!isChild && state.mode === "ORCHESTRATOR") {
       return {
         messages: appendOrchestratorReminder(messages, createOrchestratorReminderMessage(state.orchestrator)),
@@ -1482,10 +1567,14 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     state.pendingApprovalArmed = false;
     // Tree navigation re-evaluates the branch but never prompts or consumes an
     // approval. A valid pending record still forces the hard PLAN gate.
-    await apply(isChild ? "PLAN" : recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
+    await applySerialized(isChild ? "PLAN" : recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    // The run has settled: before_agent_start will build a correct system
+    // prompt for whatever mode is active by the time a new run starts, so any
+    // mid-run correction reminder has nothing left to do.
+    state.midRunModeChange = undefined;
     const pendingApproval = state.pendingApprovalArmed ? state.pendingApproval : undefined;
     if (pendingApproval) {
       state.pendingApproval = undefined;

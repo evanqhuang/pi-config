@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -151,6 +151,118 @@ test("non-PLAN Bash follows the session context cwd", async (t) => {
   assert.ok(bash);
   const result = await bash.execute("cwd-check", { command: "pwd" }, undefined, undefined, ctx);
   assert.equal(result.content[0].text.trim(), expectedCwd);
+});
+
+test("a bash call pinned sandboxed at approval time stays sandboxed even if state.mode moves before execute() runs", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") { t.skip("native sandbox is only supported on macOS/Linux"); return; }
+  const targetCwd = mkdtempSync(join(process.cwd(), ".pi-plan-bash-pin-"));
+  t.after(() => rmSync(targetCwd, { recursive: true, force: true }));
+
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  ctx.cwd = targetCwd;
+  // A fresh session defaults to YOLO; the bash tool's execute() would take
+  // the unsandboxed branch on live state.mode alone.
+  await pi.commands.get("yolo").handler(undefined, ctx);
+
+  const bash = pi.tools.get("bash");
+  const pinnedTarget = join(targetCwd, "pinned-write-denied");
+  await assert.rejects(
+    () => bash.execute("pinned", { command: `touch ${pinnedTarget}`, __planSandboxed: true }, undefined, undefined, ctx),
+    /Operation not permitted|denied/i,
+    "the pinned decision keeps this call sandboxed regardless of the current mode",
+  );
+  assert.equal(existsSync(pinnedTarget), false);
+
+  const unpinnedTarget = join(targetCwd, "unpinned-write-allowed");
+  await bash.execute("unpinned", { command: `touch ${unpinnedTarget}` }, undefined, undefined, ctx);
+  assert.equal(existsSync(unpinnedTarget), true, "a call without a pinned decision falls back to live state.mode (YOLO here)");
+});
+
+test("requestMode fast-paths every target mid-run, including PLAN, but keeps queuing an armed approval or an open UI prompt", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") { t.skip("native sandbox is only supported on macOS/Linux"); return; }
+  isolatedEnvironment(t);
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  await pi.commands.get("yolo").handler(undefined, ctx);
+
+  // Entering PLAN applies immediately mid-run too: state.mode only flips
+  // after apply()'s async sandbox setup completes, so there is no window
+  // where the tool_call hard gate reports PLAN before the sandbox is ready.
+  ctx.running = true;
+  await pi.commands.get("plan").handler(undefined, ctx);
+  assert.match(ctx.notifications.at(-1).message, /PLAN mode active/);
+  assert.notDeepEqual(pi.active, [...pi.tools.keys()], "PLAN's restricted tool set applies mid-run, not at the next settle");
+  const midRunContext = await pi.handlers.get("context")({ messages: [] });
+  const midRunAnnouncement = midRunContext.messages.find((message) => message.customType === "pi-plan-mode-mode-change-reminder");
+  assert.ok(midRunAnnouncement, "a mid-run flip into PLAN also announces itself so the model stops treating prior mutating instructions as still authorized");
+  assert.match(midRunAnnouncement.content, /switched the session mode to PLAN during this run/);
+  assert.match(midRunAnnouncement.content, /PLAN MODE IS ACTIVE/);
+  ctx.running = false;
+  await pi.handlers.get("agent_settled")({}, ctx);
+
+  // PLAN bypasses the open-UI-prompt gate: tightening is the emergency stop
+  // a user wants right now, and must not wait on an open dialog such as a
+  // model-raised ask_user_question. Only loosening (YOLO/ORCHESTRATOR) waits
+  // for the dialog to close, per the "queued while a UI prompt is open"
+  // coverage above.
+  await pi.commands.get("yolo").handler(undefined, ctx);
+  ctx.running = true;
+  await pi.handlers.get("ui_prompt_start")({ reason: "ui_prompt" }, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
+  assert.match(ctx.notifications.at(-1).message, /PLAN mode active/, "PLAN tightens immediately even while a UI prompt is open");
+  assert.notDeepEqual(pi.active, [...pi.tools.keys()]);
+  await pi.handlers.get("ui_prompt_end")({ reason: "ui_prompt" }, ctx);
+  ctx.running = false;
+  await pi.handlers.get("agent_settled")({}, ctx);
+
+  // An armed approval takes precedence over a later manual switch, even for
+  // a target (ORCHESTRATOR) that would otherwise fast-path. Mode is already
+  // PLAN from the settle above, which manage_plan_draft requires.
+  const draftTool = pi.tools.get("manage_plan_draft");
+  const approvalTool = pi.tools.get("submit_plan_for_approval");
+  const draft = await draftTool.execute("draft", { action: "create", plan: "# Armed\n\n1. Do it." }, undefined, undefined, ctx);
+  ctx.selections.push("Implement with YOLO");
+  await approvalTool.execute("approval", { planPath: draft.details.planPath }, undefined, undefined, ctx);
+  ctx.running = true;
+  await pi.commands.get("orchestrator").handler(undefined, ctx);
+  assert.match(ctx.notifications.at(-1).message, /queued until the current run finishes/);
+  assert.equal(pi.active.includes("write"), false, "still PLAN; the armed approval, not the manual switch, owns the transition");
+  ctx.running = false;
+  await pi.handlers.get("agent_settled")({}, ctx);
+  assert.match(pi.sentMessages.at(-1), /Implement the approved plan/, "the armed approval's transition ran, not the queued manual switch");
+});
+
+test("rapid mid-run mode requests serialize so the final mode and its sandbox state match the last request", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") { t.skip("native sandbox is only supported on macOS/Linux"); return; }
+  isolatedEnvironment(t);
+  const targetCwd = mkdtempSync(join(process.cwd(), ".pi-plan-mode-race-"));
+  t.after(() => rmSync(targetCwd, { recursive: true, force: true }));
+
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  ctx.cwd = targetCwd;
+  await pi.commands.get("yolo").handler(undefined, ctx);
+
+  // Fire PLAN then YOLO back to back without awaiting the first: without
+  // applySerialized, PLAN's async sandbox setup and YOLO's teardown could
+  // interleave, leaving state.mode and the actual sandbox state disagreeing
+  // about which mode really won.
+  ctx.running = true;
+  const first = pi.commands.get("plan").handler(undefined, ctx);
+  const second = pi.commands.get("yolo").handler(undefined, ctx);
+  await Promise.all([first, second]);
+
+  assert.deepEqual(pi.active, [...pi.tools.keys()], "the last request (YOLO) wins with a fully consistent tool set");
+  assert.equal(ctx.notifications.at(-1).message, "YOLO mode active");
+
+  const bash = pi.tools.get("bash");
+  const target = join(targetCwd, "race-write-should-succeed");
+  await bash.execute("race-check", { command: `touch ${target}` }, undefined, undefined, ctx);
+  assert.equal(existsSync(target), true, "YOLO's sandbox teardown fully completed rather than being left half-applied by an interleaved PLAN entry");
 });
 
 test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YOLO modes", async (t) => {
@@ -415,11 +527,43 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.ok(pi.shortcuts.has("shift+tab"));
   ctx.running = true;
   await pi.shortcuts.get("shift+tab").handler(ctx);
-  assert.equal(pi.active.includes("write"), false);
+  // PLAN -> ORCHESTRATOR is a non-PLAN target with no armed approval or open
+  // UI prompt, so it applies immediately mid-run instead of queuing.
+  assert.deepEqual(pi.active, [...pi.tools.keys()]);
+  assert.match(ctx.notifications.at(-1).message, /ORCHESTRATOR mode active/);
+  const midRunContext = await pi.handlers.get("context")({ messages: [] });
+  const midRunAnnouncement = midRunContext.messages.find((message) => message.customType === "pi-plan-mode-mode-change-reminder");
+  assert.ok(midRunAnnouncement, "a mid-run flip announces the mode change so the next turn's context corrects the stale system prompt");
+  assert.match(midRunAnnouncement.content, /switched the session mode to ORCHESTRATOR during this run/);
+  assert.match(midRunAnnouncement.content, /ORCHESTRATOR MODE IS ACTIVE/);
+  assert.match(midRunContext.messages.at(-1).content, /pi-plan-mode-orchestrator-reminder/, "the orchestrator lifecycle reminder still attaches every turn");
+
+  // A mode request raised while a blocking UI prompt is open still queues,
+  // even though the target isn't PLAN, so it cannot land mid-dialog. Stay on
+  // ORCHESTRATOR here so the downstream ORCHESTRATOR assertions below still
+  // apply after this settles.
+  await pi.handlers.get("ui_prompt_start")({ reason: "ui_prompt" }, ctx);
+  await pi.commands.get("orchestrator").handler(undefined, ctx);
   assert.match(ctx.notifications.at(-1).message, /queued until the current run finishes/);
+  assert.deepEqual(pi.active, [...pi.tools.keys()], "queueing does not change ORCHESTRATOR's already-full tool set");
+  const queuedContext = await pi.handlers.get("context")({ messages: [] });
+  assert.equal(
+    queuedContext.messages.some((message) => message.customType === "pi-plan-mode-mode-change-reminder"),
+    false,
+    "a later queued switch supersedes the prior mid-run announcement instead of leaving contradictory context",
+  );
+  await pi.handlers.get("ui_prompt_end")({ reason: "ui_prompt" }, ctx);
+
   ctx.running = false;
   await pi.handlers.get("agent_settled")({}, ctx);
   assert.deepEqual(pi.active, [...pi.tools.keys()]);
+  assert.match(ctx.notifications.at(-1).message, /ORCHESTRATOR mode active/);
+  const settledContext = await pi.handlers.get("context")({ messages: [] });
+  assert.equal(
+    settledContext.messages.some((message) => message.customType === "pi-plan-mode-mode-change-reminder"),
+    false,
+    "the mid-run announcement is gone once the run has settled",
+  );
   const malformedAgent = await pi.handlers.get("tool_call")({ toolName: "Agent", input: null });
   assert.equal(malformedAgent.block, true);
   assert.equal(malformedAgent.terminate, undefined);
