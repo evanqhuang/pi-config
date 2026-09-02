@@ -155,6 +155,15 @@ function epochMessages(pi: any): any[] {
   return pi.sendMessage.mock.calls.filter(([message]: any[]) => message.customType === GOAL_CONTEXT_EPOCH_TYPE);
 }
 
+async function startReadyLoop(runtime: ReturnType<typeof harness>, planPath: string, agentDir: string): Promise<void> {
+  runtime.setIdle(false);
+  await runtime.controller.startLoop(runtime.ctx, "ship feature", ["tests pass"], { planPath, agentDir });
+  runtime.setIdle(true);
+  expect(runtime.controller.retryPendingWake(runtime.ctx)).toBe(true);
+  await vi.waitFor(() => expect(epochMessages(runtime.pi)).toHaveLength(1));
+  await vi.waitFor(() => expect(continueMessages(runtime.pi)).toHaveLength(1));
+}
+
 beforeEach(() => {
   subagents.hasActiveSubagents.mockReset();
   subagents.hasActiveSubagents.mockReturnValue(false);
@@ -1078,6 +1087,192 @@ describe("goal controller lifecycle guards", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("retries malformed V2 verifier output and completes from a valid second response", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-retry-success-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    const rawPriorOutput = "RAW_PRIOR_OUTPUT_SECRET";
+    let verifierCalls = 0;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({
+          output: JSON.stringify({ ok: true, reason: "candidate complete" }),
+          aborted: false,
+          steered: false,
+        });
+      }
+      verifierCalls += 1;
+      return Promise.resolve({
+        output: verifierCalls === 1
+          ? `not JSON: ${rawPriorOutput}`
+          : JSON.stringify({ outcome: "pass", reason: "All acceptance checks pass.", repositoryFingerprint: "repo-after-retry" }),
+        aborted: false,
+        steered: false,
+      });
+    });
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("completed"));
+
+      expect(verifierCalls).toBe(2);
+      expect(subagents.runEvaluator.mock.calls.map(([, , type]) => type)).toEqual([
+        "GoalJudge",
+        "GoalVerifier",
+        "GoalVerifier",
+      ]);
+      const verifierPrompts = subagents.runEvaluator.mock.calls
+        .filter(([, , type]) => type === "GoalVerifier")
+        .map(([, , , prompt]) => prompt as string);
+      expect(verifierPrompts[1]).toContain(verifierPrompts[0]);
+      expect(verifierPrompts[1]).toContain("Schema correction (one retry only)");
+      expect(verifierPrompts[1]).toContain("category=no-object");
+      expect(verifierPrompts[1]).not.toContain(rawPriorOutput);
+      expect(continueMessages(runtime.pi)).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry a valid first V2 verifier response", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-no-retry-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => Promise.resolve(
+      type === "GoalJudge"
+        ? { output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false }
+        : { output: JSON.stringify({ outcome: "pass", reason: "verified", repositoryFingerprint: "repo-first" }), aborted: false, steered: false },
+    ));
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("completed"));
+      expect(subagents.runEvaluator.mock.calls.map(([, , type]) => type)).toEqual(["GoalJudge", "GoalVerifier"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a legacy V1-shaped response when evaluating a V2 loop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-retry-legacy-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    let verifierCalls = 0;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      verifierCalls += 1;
+      return Promise.resolve({
+        output: verifierCalls === 1
+          ? JSON.stringify({ ok: true, reason: "legacy response" })
+          : JSON.stringify({ outcome: "pass", reason: "verified", repositoryFingerprint: "repo-after-legacy-retry" }),
+        aborted: false,
+        steered: false,
+      });
+    });
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("completed"));
+      expect(verifierCalls).toBe(2);
+      const retryPrompt = subagents.runEvaluator.mock.calls[2][3] as string;
+      expect(retryPrompt).toContain("category=legacy-v1-shape");
+      expect(retryPrompt).toContain("Do not return the legacy {\"ok\":...} shape.");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks after two malformed V2 responses with bounded diagnostics only", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-retry-blocked-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    const first = '{"outcome":"pass","reason":"FIRST_RAW_SECRET",}';
+    const second = '{"unexpected":"SECOND_RAW_SECRET"}';
+    let verifierCalls = 0;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      verifierCalls += 1;
+      return Promise.resolve({ output: verifierCalls === 1 ? first : second, aborted: false, steered: false });
+    });
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("blocked"));
+      const reason = runtime.controller.currentLoop?.reasons?.block ?? "";
+      expect(verifierCalls).toBe(2);
+      expect(reason).toContain("GoalVerifier returned malformed fixed-point output after one schema retry.");
+      expect(reason).toContain("First attempt diagnostic:");
+      expect(reason).toContain("Second attempt diagnostic:");
+      expect(reason).toContain(createHash("sha256").update(first).digest("hex"));
+      expect(reason).toContain(createHash("sha256").update(second).digest("hex"));
+      expect(reason).not.toContain("FIRST_RAW_SECRET");
+      expect(reason).not.toContain("SECOND_RAW_SECRET");
+      expect(reason.length).toBeLessThan(2_000);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["failure", "abort"] as const)("uses the inconclusive path when the schema retry %s", async kind => {
+    const root = await mkdtemp(join(tmpdir(), `pi-goal-loop-verifier-retry-${kind}-`));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    let verifierCalls = 0;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      verifierCalls += 1;
+      return Promise.resolve(verifierCalls === 1
+        ? { output: "malformed first response", aborted: false, steered: false }
+        : kind === "failure"
+          ? { output: "", failure: "retry transport failed", aborted: false, steered: false }
+          : { output: "", aborted: true, steered: false });
+    });
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("blocked"));
+      expect(verifierCalls).toBe(2);
+      expect(runtime.controller.currentLoop?.reasons?.block).toBe(
+        kind === "failure" ? "GoalVerifier was inconclusive: retry transport failed" : "GoalVerifier was inconclusive: GoalVerifier aborted",
+      );
+      expect(runtime.controller.currentLoop?.reasons?.block).not.toContain("malformed fixed-point output after one schema retry");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the V1 verifier path to one attempt", async () => {
+    const runtime = harness();
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => Promise.resolve(
+      type === "GoalJudge"
+        ? { output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false }
+        : { output: "malformed V1 response", aborted: false, steered: false },
+    ));
+
+    runtime.controller.start(runtime.ctx, "ship feature", ["tests pass"]);
+    runtime.controller.requestEvaluation(runtime.ctx);
+    await vi.waitFor(() => expect(runtime.controller.current?.verificationFailures).toBe(1));
+
+    expect(subagents.runEvaluator.mock.calls.map(([, , type]) => type)).toEqual(["GoalJudge", "GoalVerifier"]);
+    expect(subagents.runEvaluator).toHaveBeenCalledTimes(2);
   });
 
   it("keeps implementation entry normal and preserves verification intent across pause/resume", async () => {

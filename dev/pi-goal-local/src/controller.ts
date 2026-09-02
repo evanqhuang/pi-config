@@ -41,6 +41,8 @@ import {
 } from "./types.js";
 import {
   buildVerifierPrompt,
+  buildVerifierRetryPrompt,
+  diagnoseVerifierOutput,
   parseVerifierVerdict,
   type GoalLoopVerifierVerdict,
 } from "./verifier.js";
@@ -1546,6 +1548,7 @@ export class GoalController {
     this.persistLoop(verifying);
     const verifyToken = { ...token };
     let verifierOutput: string;
+    let verifierPrompt: string;
     const verifierAbort = new AbortController();
     try {
       this.evaluatorAbort = verifierAbort;
@@ -1568,7 +1571,7 @@ export class GoalController {
         });
         correction = { path: artifact.path, hash: artifact.hash, content: artifact.content };
       }
-      const verifier = await runEvaluator(this.pi, ctx, "GoalVerifier", buildVerifierPrompt({
+      verifierPrompt = buildVerifierPrompt({
         objective: verifying.objective,
         criteria: verifying.criteria,
         judgeReason: judgeVerdict.reason,
@@ -1584,7 +1587,8 @@ export class GoalController {
           evidenceFingerprint,
           previousRepositoryFingerprint: verifying.verifier?.repositoryFingerprint,
         },
-      }), verifierAbort.signal);
+      });
+      const verifier = await runEvaluator(this.pi, ctx, "GoalVerifier", verifierPrompt, verifierAbort.signal);
       if (verifier.failure || verifier.aborted) throw new Error(verifier.failure ?? "GoalVerifier aborted");
       verifierOutput = verifier.output;
     } catch (error) {
@@ -1597,13 +1601,43 @@ export class GoalController {
     }
 
     if (!this.refreshLoopEvaluationState(ctx, verifyToken, ["verifying"]) || !this.loopState) return;
-    const parsed = parseVerifierVerdict(verifierOutput);
+    let parsed = parseVerifierVerdict(verifierOutput);
     if (!parsed || !("outcome" in parsed)) {
-      this.blockLoop(this.loopState, "GoalVerifier returned malformed fixed-point output.", {
-        outcome: "inconclusive",
-        evidenceFingerprint,
-      });
-      return;
+      const firstDiagnostic = diagnoseVerifierOutput(verifierOutput);
+      this.evaluatorAbort = verifierAbort;
+      try {
+        const retry = await runEvaluator(
+          this.pi,
+          ctx,
+          "GoalVerifier",
+          buildVerifierRetryPrompt(verifierPrompt, firstDiagnostic, evidenceFingerprint),
+          verifierAbort.signal,
+        );
+        if (retry.failure || retry.aborted) throw new Error(retry.failure ?? "GoalVerifier aborted");
+        verifierOutput = retry.output;
+      } catch (error) {
+        if (this.refreshLoopEvaluationState(ctx, verifyToken)) {
+          this.blockLoop(this.loopState!, `GoalVerifier was inconclusive: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return;
+      } finally {
+        if (this.evaluatorAbort === verifierAbort) this.evaluatorAbort = undefined;
+      }
+
+      if (!this.refreshLoopEvaluationState(ctx, verifyToken, ["verifying"]) || !this.loopState) return;
+      parsed = parseVerifierVerdict(verifierOutput);
+      if (!parsed || !("outcome" in parsed)) {
+        const secondDiagnostic = diagnoseVerifierOutput(verifierOutput);
+        this.blockLoop(this.loopState, [
+          "GoalVerifier returned malformed fixed-point output after one schema retry.",
+          `First attempt diagnostic: ${firstDiagnostic.summary}`,
+          `Second attempt diagnostic: ${secondDiagnostic.summary}`,
+        ].join(" "), {
+          outcome: "inconclusive",
+          evidenceFingerprint,
+        });
+        return;
+      }
     }
     await this.applyLoopVerifierVerdict(ctx, verifyToken, parsed, evidenceFingerprint, settings.maxCorrectionBytes, settings.repeatedFingerprintThreshold);
   }

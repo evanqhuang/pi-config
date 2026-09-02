@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseGoalCommand } from "../src/commands.js";
 import { agentRunWasAborted } from "../src/index.js";
@@ -11,7 +12,11 @@ import {
   parseGoalStateV2,
 } from "../src/state.js";
 import { fingerprintEvidence } from "../src/transcript.js";
-import { parseVerifierVerdict } from "../src/verifier.js";
+import {
+  buildVerifierRetryPrompt,
+  diagnoseVerifierOutput,
+  parseVerifierVerdict,
+} from "../src/verifier.js";
 import {
   DEFAULT_GOAL_LOOP_SETTINGS,
   GOAL_LOOP_SETTING_BOUNDS,
@@ -331,6 +336,60 @@ describe("evaluator parsing", () => {
       reason: "acceptance check failed\nEvidence: npm test: 1 failed | src/x.ts mismatch",
       evidence: ["npm test: 1 failed", "src/x.ts mismatch"],
     });
+  });
+
+  it("diagnoses malformed verifier output with bounded safe metadata", () => {
+    const raw = JSON.stringify({
+      outcome: "pass",
+      reason: "DO_NOT_PERSIST_THIS_REASON_VALUE",
+      evidence: ["DO_NOT_PERSIST_THIS_EVIDENCE_VALUE"],
+      "unsafe-key": "DO_NOT_PERSIST_THIS_KEY_VALUE",
+      safeKey: "value",
+      "$safe": "value",
+    });
+    const diagnostic = diagnoseVerifierOutput(raw);
+    const expectedHash = createHash("sha256").update(raw, "utf8").digest("hex");
+
+    expect(diagnostic.category).toBe("invalid-v2-schema");
+    expect(diagnostic.charLength).toBe(raw.length);
+    expect(diagnostic.byteLength).toBe(Buffer.byteLength(raw, "utf8"));
+    expect(diagnostic.sha256).toBe(expectedHash);
+    expect(diagnostic.fingerprint).toBe(expectedHash);
+    expect(diagnostic.bracesFound).toBe(true);
+    expect(diagnostic.jsonObjectFound).toBe(true);
+    expect(diagnostic.topLevelKeys).toEqual(["$safe", "evidence", "outcome", "reason", "safeKey"]);
+    expect(diagnostic.summary.length).toBeLessThanOrEqual(500);
+    expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_REASON_VALUE");
+    expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_EVIDENCE_VALUE");
+    expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_KEY_VALUE");
+    expect(diagnoseVerifierOutput(raw).sha256).toBe(diagnostic.sha256);
+
+    expect(diagnoseVerifierOutput("no JSON response")).toMatchObject({
+      category: "no-object",
+      bracesFound: false,
+      jsonObjectFound: false,
+      topLevelKeys: [],
+    });
+    expect(diagnoseVerifierOutput("{not valid JSON}").category).toBe("invalid-json");
+    expect(diagnoseVerifierOutput('{"ok":true,"reason":"legacy secret"}')).toMatchObject({
+      category: "legacy-v1-shape",
+      jsonObjectFound: true,
+      topLevelKeys: ["ok", "reason"],
+    });
+  });
+
+  it("builds a retry prompt from diagnostics without prior output", () => {
+    const raw = '{"reason":"RAW_PRIOR_SECRET","evidence":["RAW_EVIDENCE_SECRET"]}';
+    const diagnostic = diagnoseVerifierOutput(raw);
+    const prompt = buildVerifierRetryPrompt("base V2 prompt with evidence-3", diagnostic, "evidence-3");
+
+    expect(prompt).toContain("base V2 prompt with evidence-3");
+    expect(prompt).toContain("Schema correction (one retry only)");
+    expect(prompt).toContain(diagnostic.summary);
+    expect(prompt).toContain("exactly one JSON object using the existing V2 schema");
+    expect(prompt).toContain("evidence-3");
+    expect(prompt).not.toContain("RAW_PRIOR_SECRET");
+    expect(prompt).not.toContain("RAW_EVIDENCE_SECRET");
   });
 
   it("fingerprints evidence deterministically", () => {

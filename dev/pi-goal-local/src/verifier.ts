@@ -1,6 +1,12 @@
+import { createHash } from "node:crypto";
 import type { GoalVerifierVerdict, GoalLoopStrategy } from "./types.js";
 
 const MAX_REASON_LENGTH = 4000;
+const MAX_DIAGNOSTIC_LENGTH = 500;
+const MAX_DIAGNOSTIC_KEYS = 8;
+const MAX_DIAGNOSTIC_KEY_LENGTH = 24;
+const SAFE_DIAGNOSTIC_KEY = /^[A-Za-z_$][A-Za-z0-9_$]{0,23}$/u;
+const SAFE_FINGERPRINT = /^[A-Za-z0-9._:-]{1,256}$/u;
 const MAX_EVIDENCE_ITEMS = 32;
 const MAX_EVIDENCE_LENGTH = 2000;
 const MAX_FINGERPRINT_LENGTH = 256;
@@ -35,6 +41,105 @@ export interface GoalLoopVerifierVerdict {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+
+export type GoalVerifierOutputDiagnosticCategory =
+  | "no-object"
+  | "invalid-json"
+  | "legacy-v1-shape"
+  | "invalid-v2-schema";
+
+export interface GoalVerifierOutputDiagnostic {
+  category: GoalVerifierOutputDiagnosticCategory;
+  charLength: number;
+  byteLength: number;
+  /** SHA-256 of the complete ephemeral output; the output itself is never retained. */
+  sha256: string;
+  /** Alias for callers that refer to the SHA-256 as a fingerprint. */
+  fingerprint: string;
+  bracesFound: boolean;
+  jsonObjectFound: boolean;
+  topLevelKeys: string[];
+  /** A bounded, sanitized rendering suitable for a persisted reason or prompt. */
+  summary: string;
+}
+
+function diagnosticSummary(diagnostic: Pick<GoalVerifierOutputDiagnostic, "category" | "charLength" | "byteLength" | "sha256" | "bracesFound" | "jsonObjectFound" | "topLevelKeys">): string {
+  const category = diagnostic.category;
+  const charLength = Number.isSafeInteger(diagnostic.charLength) && diagnostic.charLength >= 0
+    ? diagnostic.charLength
+    : 0;
+  const byteLength = Number.isSafeInteger(diagnostic.byteLength) && diagnostic.byteLength >= 0
+    ? diagnostic.byteLength
+    : 0;
+  const sha256 = /^[a-f0-9]{64}$/u.test(diagnostic.sha256) ? diagnostic.sha256 : "invalid";
+  const keys = diagnostic.topLevelKeys
+    .filter(key => SAFE_DIAGNOSTIC_KEY.test(key))
+    .slice(0, MAX_DIAGNOSTIC_KEYS)
+    .join(",") || "none";
+  const summary = [
+    `category=${category}`,
+    `chars=${charLength}`,
+    `bytes=${byteLength}`,
+    `sha256=${sha256}`,
+    `braces=${diagnostic.bracesFound ? "yes" : "no"}`,
+    `jsonObject=${diagnostic.jsonObjectFound ? "yes" : "no"}`,
+    `keys=${keys}`,
+  ].join("; ");
+  return summary.slice(0, MAX_DIAGNOSTIC_LENGTH);
+}
+
+/**
+ * Return only bounded structural metadata for an ephemeral GoalVerifier
+ * response. This deliberately does not retain or excerpt the response.
+ */
+export function diagnoseVerifierOutput(raw: string): GoalVerifierOutputDiagnostic {
+  const charLength = raw.length;
+  const byteLength = Buffer.byteLength(raw, "utf8");
+  const sha256 = createHash("sha256").update(raw, "utf8").digest("hex");
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  const bracesFound = start >= 0 || end >= 0;
+  let parsed: unknown;
+  let jsonObjectFound = false;
+  let category: GoalVerifierOutputDiagnosticCategory;
+
+  if (start < 0 || end <= start) {
+    category = "no-object";
+  } else {
+    try {
+      parsed = JSON.parse(raw.slice(start, end + 1));
+      const object = isRecord(parsed) ? parsed : undefined;
+      jsonObjectFound = object !== undefined;
+      if (!object) category = "invalid-json";
+      else if (Object.hasOwn(object, "outcome")) category = "invalid-v2-schema";
+      else if (Object.hasOwn(object, "ok")) category = "legacy-v1-shape";
+      else category = "invalid-v2-schema";
+    } catch {
+      category = "invalid-json";
+    }
+  }
+
+  const topLevelKeys = jsonObjectFound && isRecord(parsed)
+    ? Object.keys(parsed)
+      .filter(key => key.length <= MAX_DIAGNOSTIC_KEY_LENGTH && SAFE_DIAGNOSTIC_KEY.test(key))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .slice(0, MAX_DIAGNOSTIC_KEYS)
+    : [];
+  const diagnostic = {
+    category,
+    charLength,
+    byteLength,
+    sha256,
+    fingerprint: sha256,
+    bracesFound,
+    jsonObjectFound,
+    topLevelKeys,
+  } satisfies Omit<GoalVerifierOutputDiagnostic, "summary">;
+  return { ...diagnostic, summary: diagnosticSummary(diagnostic) };
+}
+
+/** Alias matching the V2-specific helper naming used by integrations. */
+export const diagnoseGoalVerifierOutput = diagnoseVerifierOutput;
 
 function boundedText(value: unknown, max: number): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -281,6 +386,30 @@ export function buildVerifierPrompt(input: VerifierPromptInput): string {
     "The repositoryFingerprint must identify the exact repository state you inspected. The evidenceFingerprint must exactly equal the controller fingerprint above. Keep correction bounded and actionable. Never claim PASS from GoalJudge's assertion alone.",
   ].filter(Boolean).join("\n\n");
 }
+
+/**
+ * Append one bounded schema-correction instruction to an already-built V2
+ * prompt. The prior response is represented only by its sanitized diagnostic.
+ */
+export function buildVerifierRetryPrompt(
+  basePrompt: string,
+  diagnostic: GoalVerifierOutputDiagnostic,
+  evidenceFingerprint: string,
+): string {
+  const safeFingerprint = SAFE_FINGERPRINT.test(evidenceFingerprint) ? evidenceFingerprint : undefined;
+  const evidenceInstruction = safeFingerprint
+    ? `Echo the exact controller evidence fingerprint already present in the base prompt: ${safeFingerprint}.`
+    : "Echo the exact controller evidence fingerprint already present in the base prompt; do not invent or alter it.";
+  return [
+    basePrompt,
+    "Schema correction (one retry only): the prior GoalVerifier response was rejected with this sanitized diagnostic:",
+    diagnosticSummary(diagnostic),
+    "Return exactly one JSON object using the existing V2 schema above. Do not return the legacy {\"ok\":...} shape.",
+    evidenceInstruction,
+  ].join("\n\n").slice(0, basePrompt.length + MAX_DIAGNOSTIC_LENGTH + 600);
+}
+
+export const buildGoalVerifierRetryPrompt = buildVerifierRetryPrompt;
 
 export function parseGoalVerifierVerdict(raw: string): GoalLoopVerifierVerdict | undefined {
   const parsed = parseVerifierVerdict(raw);
