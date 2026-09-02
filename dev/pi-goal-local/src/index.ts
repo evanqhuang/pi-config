@@ -22,6 +22,7 @@ import {
 } from "./plan-bridge.js";
 import {
   type GoalLoopPhase,
+  type GoalStateV1,
   type GoalStateV2,
 } from "./types.js";
 
@@ -41,6 +42,29 @@ type TokenSpan = {
   start: number;
   end: number;
 };
+
+type DeferredResumeTarget =
+  | {
+    schemaVersion: 1;
+    id: string;
+    generation: number;
+  }
+  | {
+    schemaVersion: 2;
+    loopId: string;
+    generation: number;
+    contextEpoch: number;
+    cycle: number;
+    planHash?: string;
+  };
+
+type DeferredResumeRequest = {
+  sessionId: string;
+  selectionGeneration: number;
+  target: DeferredResumeTarget;
+};
+
+type DeferredResumeOutcome = "none" | "blocked" | "consumed" | "cancelled";
 
 export function agentRunWasAborted(messages: readonly unknown[]): boolean {
   return messages.some(message => {
@@ -402,19 +426,140 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let cliDispatchStarted = false;
   let shutDown = false;
   let selectionGeneration = 0;
-  let deferredResume: { sessionId: string; selectionGeneration: number } | undefined;
+  let deferredResume: DeferredResumeRequest | undefined;
+  let deferredResumeClaimInFlight = false;
+  let resumePublicationPending = false;
   let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
 
-  const invalidateDeferredResume = (): void => {
-    selectionGeneration += 1;
+  const deferredResumeTarget = (
+    marker: GoalStateV1 | GoalStateV2 | undefined,
+  ): DeferredResumeTarget | undefined => {
+    if (marker?.schemaVersion === 1 && marker.status === "paused") {
+      return {
+        schemaVersion: 1,
+        id: marker.id,
+        generation: marker.generation,
+      };
+    }
+    if (marker?.schemaVersion === 2 && marker.phase === "paused") {
+      return {
+        schemaVersion: 2,
+        loopId: marker.loopId,
+        generation: marker.generation,
+        contextEpoch: marker.contextEpoch,
+        cycle: marker.cycle,
+        planHash: marker.plan.snapshotHash,
+      };
+    }
+    return undefined;
+  };
+
+  const deferredResumeTargetMatches = (
+    target: DeferredResumeTarget,
+    marker: GoalStateV1 | GoalStateV2 | undefined,
+  ): boolean => {
+    if (target.schemaVersion === 1) {
+      return marker?.schemaVersion === 1
+        && marker.status === "paused"
+        && marker.id === target.id
+        && marker.generation === target.generation;
+    }
+    return marker?.schemaVersion === 2
+      && marker.phase === "paused"
+      && marker.loopId === target.loopId
+      && marker.generation === target.generation
+      && marker.contextEpoch === target.contextEpoch
+      && marker.cycle === target.cycle
+      && marker.plan.snapshotHash === target.planHash;
+  };
+
+  const cancelDeferredResume = (
+    reason?: string,
+    notifyCtx: ExtensionContext | undefined = ctx,
+  ): boolean => {
+    if (!deferredResume) return false;
     deferredResume = undefined;
+    if (reason && notifyCtx?.hasUI) {
+      notifyCtx.ui.notify(`Queued goal resume cancelled because ${reason}.`, "warning");
+    }
+    return true;
+  };
+
+  const invalidateDeferredLifecycle = (
+    reason: string,
+    notifyCtx: ExtensionContext | undefined = ctx,
+  ): void => {
+    selectionGeneration += 1;
+    cancelDeferredResume(reason, notifyCtx);
+    resumePublicationPending = false;
     deferredCompactionRestore = undefined;
   };
+
+  const consumeDeferredResume = async (
+    reportBlocked = false,
+  ): Promise<DeferredResumeOutcome> => {
+    const pending = deferredResume;
+    if (!pending) return "none";
+    const activeCtx = ctx;
+    const selection = activeCtx ? selectionOf(activeCtx) : undefined;
+    const stillSelected = !shutDown
+      && selection?.sessionId === pending.sessionId
+      && selectionGeneration === pending.selectionGeneration;
+    if (!activeCtx || !stillSelected) {
+      cancelDeferredResume("the selected session or branch changed", activeCtx);
+      return "cancelled";
+    }
+
+    const marker = controller.refreshMarker(activeCtx);
+    if (!deferredResumeTargetMatches(pending.target, marker)) {
+      cancelDeferredResume("the paused goal target changed", activeCtx);
+      return "cancelled";
+    }
+
+    if (!activeCtx.isIdle() || activeCtx.hasPendingMessages()) {
+      if (reportBlocked && activeCtx.hasUI) {
+        activeCtx.ui.notify(
+          activeCtx.hasPendingMessages()
+            ? "Queued goal resume is still waiting for pending messages to settle."
+            : "Queued goal resume is still waiting for the current agent turn to settle.",
+          "warning",
+        );
+      }
+      return "blocked";
+    }
+
+    // Claim before controller.resume can await a V2 reanchor. The command's
+    // idle wake and agent_settled backup may race, but only one may publish.
+    deferredResume = undefined;
+    deferredCompactionRestore = undefined;
+    deferredResumeClaimInFlight = true;
+    try {
+      const next = await Promise.resolve(controller.resume(activeCtx));
+      const adoptedBranch = controller.consumeResumeAdoptedBranch();
+      resumePublicationPending = next !== undefined;
+      if (activeCtx.hasUI) {
+        activeCtx.ui.notify(
+          next ? resumedGoalMessage(adoptedBranch) : "The queued goal resume was no longer applicable.",
+          next ? "info" : "warning",
+        );
+      }
+      return next ? "consumed" : "cancelled";
+    } catch (error) {
+      resumePublicationPending = false;
+      if (activeCtx.hasUI) {
+        activeCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+      return "cancelled";
+    } finally {
+      deferredResumeClaimInFlight = false;
+    }
+  };
+
   const eventUnsubscribers: Array<() => void> = [];
 
   pi.on("session_start", (_event, nextCtx) => {
     if (shutDown) return;
-    invalidateDeferredResume();
+    invalidateDeferredLifecycle("the active session changed", nextCtx);
     ctx = nextCtx;
     controller.restore(nextCtx);
     if (!autocompleteInstalled && typeof nextCtx.ui?.addAutocompleteProvider === "function") {
@@ -447,22 +592,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_switch", () => {
-    invalidateDeferredResume();
+    invalidateDeferredLifecycle("the session is switching");
     controller.prepareForNavigation();
   });
 
   pi.on("session_before_fork", () => {
-    invalidateDeferredResume();
+    invalidateDeferredLifecycle("the session is forking");
     controller.prepareForNavigation();
   });
 
   pi.on("session_before_tree", (_event, treeCtx) => {
-    invalidateDeferredResume();
+    invalidateDeferredLifecycle("tree navigation started", treeCtx);
     controller.prepareForTreeNavigation(treeCtx);
   });
 
   pi.on("session_before_compact", () => {
-    invalidateDeferredResume();
+    deferredCompactionRestore = undefined;
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -472,7 +617,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (event, compactCtx) => {
     if (shutDown) return;
-    invalidateDeferredResume();
     ctx = compactCtx;
     // Native overflow recovery retries immediately after this event. Defer
     // goal-owned marker/continuation delivery until that retry settles so the
@@ -575,7 +719,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
       try { eventUnsubscribers.pop()?.(); } catch {}
     }
     controller.shutdown();
-    invalidateDeferredResume();
+    invalidateDeferredLifecycle("the session shut down");
+    deferredResumeClaimInFlight = false;
+    resumePublicationPending = false;
     ctx = undefined;
     currentRunAborted = false;
   });
@@ -610,7 +756,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "start": {
-          deferredResume = undefined;
+          cancelDeferredResume("another goal was started", activeCtx);
+          resumePublicationPending = false;
           const wantsLoop = command.loop === true
             || command.planPath !== undefined
             || command.maxCycles !== undefined;
@@ -639,7 +786,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "fresh": {
-          deferredResume = undefined;
+          cancelDeferredResume("a fresh goal loop was started", activeCtx);
+          resumePublicationPending = false;
           try {
             const selection = selectionOf(activeCtx);
             const plan = await bridge.resolvePlan();
@@ -655,7 +803,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "pause": {
-          deferredResume = undefined;
+          cancelDeferredResume("the goal was paused again", activeCtx);
+          resumePublicationPending = false;
           const next = controller.pause(activeCtx);
           commandCtx.ui.notify(next ? "Goal paused." : "There is no active goal to pause.", next ? "info" : "warning");
           return;
@@ -664,23 +813,33 @@ export default function goalExtension(pi: ExtensionAPI): void {
           try {
             if (!activeCtx.isIdle() || activeCtx.hasPendingMessages()) {
               const marker = controller.refreshMarker(activeCtx);
-              const resumable = marker?.schemaVersion === 2
-                ? marker.phase === "paused"
-                : marker?.status === "paused";
+              const target = deferredResumeTarget(marker);
               const selection = selectionOf(activeCtx);
-              if (!resumable || !selection) {
-                deferredResume = undefined;
+              if (!target || !selection) {
+                cancelDeferredResume();
                 commandCtx.ui.notify("There is no paused goal to resume.", "warning");
                 return;
               }
-              deferredResume = {
+              const request: DeferredResumeRequest = {
                 sessionId: selection.sessionId,
                 selectionGeneration,
+                target,
               };
+              deferredResume = request;
               commandCtx.ui.notify("Goal resume queued until the current agent turn settles.", "info");
+              try {
+                await commandCtx.waitForIdle();
+              } catch (error) {
+                // A failed idle barrier must not leave an armed request that a
+                // later unrelated settlement could consume. Do not clear a
+                // newer explicit request that replaced this one while waiting.
+                if (deferredResume === request) deferredResume = undefined;
+                throw error;
+              }
+              await consumeDeferredResume(true);
               return;
             }
-            deferredResume = undefined;
+            cancelDeferredResume();
             const next = await Promise.resolve(controller.resume(activeCtx));
             const adoptedBranch = controller.consumeResumeAdoptedBranch();
             commandCtx.ui.notify(
@@ -693,13 +852,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
           return;
         }
         case "stop": {
-          deferredResume = undefined;
+          cancelDeferredResume("the goal was stopped", activeCtx);
+          resumePublicationPending = false;
           const next = controller.stop(activeCtx);
           commandCtx.ui.notify(next ? "Goal stopped." : "There is no goal to stop.", next ? "info" : "warning");
           return;
         }
         case "clear": {
-          deferredResume = undefined;
+          cancelDeferredResume("the goal was cleared", activeCtx);
+          resumePublicationPending = false;
           const next = controller.clear(activeCtx);
           commandCtx.ui.notify(next ? "Goal cleared." : "There is no goal to clear.", next ? "info" : "warning");
           return;
@@ -710,6 +871,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_start", () => {
     currentRunAborted = false;
+    resumePublicationPending = false;
   });
 
   pi.on("agent_end", (event) => {
@@ -722,34 +884,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
     const aborted = currentRunAborted;
     currentRunAborted = false;
 
-    const pendingResume = deferredResume;
-    if (pendingResume) {
-      const selection = selectionOf(settledCtx);
-      const stillSelected = selection?.sessionId === pendingResume.sessionId
-        && selectionGeneration === pendingResume.selectionGeneration;
-      if (!stillSelected) {
-        deferredResume = undefined;
-      } else {
-        if (!settledCtx.isIdle() || settledCtx.hasPendingMessages()) return;
-        deferredResume = undefined;
-        deferredCompactionRestore = undefined;
-        try {
-          const next = await Promise.resolve(controller.resume(settledCtx));
-          const adoptedBranch = controller.consumeResumeAdoptedBranch();
-          if (settledCtx.hasUI) {
-            settledCtx.ui.notify(
-              next ? resumedGoalMessage(adoptedBranch) : "The queued goal resume was no longer applicable.",
-              next ? "info" : "warning",
-            );
-          }
-        } catch (error) {
-          if (settledCtx.hasUI) {
-            settledCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-          }
-        }
-        return;
-      }
-    }
+    const resumeOutcome = await consumeDeferredResume();
+    if (resumeOutcome === "consumed"
+      || resumeOutcome === "blocked"
+      || deferredResumeClaimInFlight
+      || resumePublicationPending) return;
 
     const pendingCompaction = deferredCompactionRestore;
     if (pendingCompaction) {

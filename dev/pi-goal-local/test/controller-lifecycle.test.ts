@@ -983,6 +983,10 @@ describe("goal controller lifecycle guards", () => {
         await vi.waitFor(() => expect(controller.currentLoop?.phase).toBe("blocked"));
 
         expect(subagents.runEvaluator).toHaveBeenCalledTimes(2);
+        expect(subagents.runEvaluator.mock.calls.map(([, , type]) => type)).toEqual([
+          "GoalJudge",
+          "GoalVerifier",
+        ]);
         expect(controller.currentLoop).toMatchObject({
           phase: "blocked",
           cycle: 0,

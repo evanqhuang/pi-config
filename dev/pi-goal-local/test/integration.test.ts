@@ -10,7 +10,31 @@ import {
   buildContextEpochBootstrap,
   createContextEpochMarker,
 } from "../src/context-epoch.js";
-import { GOAL_CONTEXT_EPOCH_TYPE, GOAL_STATE_V2_TYPE, type GoalStateV2 } from "../src/types.js";
+import {
+  GOAL_CONTEXT_EPOCH_TYPE,
+  GOAL_CONTINUE_MESSAGE,
+  GOAL_STATE_TYPE,
+  GOAL_STATE_V2_TYPE,
+  type GoalStateV1,
+  type GoalStateV2,
+} from "../src/types.js";
+
+function pausedGoal(): GoalStateV1 {
+  return {
+    schemaVersion: 1,
+    id: "goal-v1",
+    generation: 1,
+    status: "paused",
+    objective: "Implement the feature.",
+    criteria: ["tests pass"],
+    createdAt: 1,
+    updatedAt: 1,
+    iteration: 0,
+    consecutiveJudgeFailures: 0,
+    verificationFailures: 0,
+    noProgressCycles: 0,
+  };
+}
 
 function loopState(agentDir = "/agent"): GoalStateV2 {
   const plan = "# Approved plan\nImplement the feature.\n";
@@ -71,6 +95,10 @@ function integrationHarness() {
   let command: any;
   let baseCompletionApplications = 0;
   const sentMessages: any[] = [];
+  const publicationOrder: string[] = [];
+  const notifications = vi.fn();
+  let idleBarrier = deferred<void>();
+  const waitForIdle = vi.fn(() => idleBarrier.promise);
   let leafId = "integration-leaf";
   let sessionId = "integration-session";
   let idle = true;
@@ -102,7 +130,7 @@ function integrationHarness() {
   };
   const ui = {
     addAutocompleteProvider(factory: any) { provider = factory(baseProvider); },
-    notify() {},
+    notify: notifications,
   };
   const ctx = {
     cwd: "/workspace",
@@ -131,13 +159,22 @@ function integrationHarness() {
     registerCommand(_name: string, value: any) { command = value; },
     registerFlag() {},
     getFlag() { return undefined; },
-    appendEntry(customType: string, data: unknown) { branch.push({ type: "custom", customType, data }); },
+    appendEntry(customType: string, data: unknown) {
+      branch.push({ type: "custom", customType, data });
+      if (customType === GOAL_STATE_V2_TYPE) {
+        publicationOrder.push(`state:${(data as GoalStateV2).phase}`);
+      } else if (customType === "pi-goal-state-v1") {
+        publicationOrder.push(`state:${(data as { status: string }).status}`);
+      }
+    },
     sendMessage(message: unknown) {
       if (typeof message === "object" && message !== null && "customType" in message) {
         const persisted = { role: "custom", ...message } as Record<string, unknown>;
         if (persisted.customType === GOAL_CONTEXT_EPOCH_TYPE && typeof persisted.timestamp !== "number") {
           persisted.timestamp = 0;
         }
+        if (persisted.customType === GOAL_CONTEXT_EPOCH_TYPE) publicationOrder.push("epoch");
+        if (persisted.customType === "pi-goal-continue-v1") publicationOrder.push("continuation");
         sentMessages.push(persisted);
       } else {
         sentMessages.push(message);
@@ -152,6 +189,20 @@ function integrationHarness() {
     handlers,
     get command() { return command; },
     sentMessages,
+    publicationOrder,
+    notifications,
+    commandContext() { return { ui, waitForIdle }; },
+    resolveIdleWait() {
+      const current = idleBarrier;
+      idleBarrier = deferred<void>();
+      current.resolve();
+    },
+    rejectIdleWait(error: Error) {
+      const current = idleBarrier;
+      idleBarrier = deferred<void>();
+      current.reject(error);
+    },
+    get waitForIdleCalls() { return waitForIdle.mock.calls.length; },
     get provider() { return provider; },
     get baseCompletionApplications() { return baseCompletionApplications; },
     sessionManager,
@@ -167,8 +218,40 @@ type Message = ContextEvent["messages"][number];
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(next => { resolve = next; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((next, fail) => {
+    resolve = next;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+async function pausedLoopHarness(prefix: string) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  const artifactDir = join(root, "goal-loops", "loop-integration");
+  const plan = "# Approved plan\nImplement the feature.\n";
+  await mkdir(artifactDir, { recursive: true });
+  await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+  const harness = integrationHarness();
+  const state: GoalStateV2 = {
+    ...loopState(root),
+    phase: "paused",
+    reasons: { pause: "Paused by user." },
+  };
+  state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+  harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+  await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+  return {
+    harness,
+    state,
+    async cleanup() {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    },
+  };
 }
 
 describe("goal extension provider integration", () => {
@@ -191,6 +274,201 @@ describe("goal extension provider integration", () => {
     expect(harness.sentMessages).toEqual([]);
     await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
   });
+
+  it.each(["command-wake", "settlement-backup"] as const)(
+    "consumes a busy V2 resume exactly once through the %s ordering",
+    async wakeOrder => {
+      const { harness, cleanup } = await pausedLoopHarness("pi-goal-busy-resume-");
+      try {
+        harness.setIdle(false);
+        const resumeCommand = harness.command.handler("resume", harness.commandContext());
+
+        expect(harness.waitForIdleCalls).toBe(1);
+        expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused", contextEpoch: 0 } });
+        expect(harness.sentMessages).toEqual([]);
+
+        harness.setIdle(true);
+        if (wakeOrder === "command-wake") {
+          harness.resolveIdleWait();
+          await resumeCommand;
+          await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+        } else {
+          await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+          harness.resolveIdleWait();
+          await resumeCommand;
+        }
+
+        await vi.waitFor(() => expect(harness.sentMessages).toHaveLength(2));
+        expect(harness.branch.filter(entry =>
+          entry.customType === GOAL_STATE_V2_TYPE && entry.data?.phase === "implementing"
+        )).toHaveLength(1);
+        expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE)).toHaveLength(1);
+        expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTINUE_MESSAGE)).toHaveLength(1);
+        expect(harness.publicationOrder).toEqual([
+          "state:implementing",
+          "epoch",
+          "continuation",
+        ]);
+        expect(harness.notifications.mock.calls.filter(([message]) => message === "Goal resumed.")).toHaveLength(1);
+      } finally {
+        await cleanup();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "preserves a busy V2 resume across compaction (willRetry=%s)",
+    async willRetry => {
+      const { harness, cleanup } = await pausedLoopHarness("pi-goal-compact-resume-");
+      try {
+        harness.setIdle(false);
+        const resumeCommand = harness.command.handler("resume", harness.commandContext());
+        harness.handlers.get("session_before_compact")!({ type: "session_before_compact" }, harness.ctx);
+        harness.handlers.get("session_compact")!({ type: "session_compact", willRetry }, harness.ctx);
+
+        expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused", contextEpoch: 0 } });
+        expect(harness.sentMessages).toEqual([]);
+
+        harness.setIdle(true);
+        harness.resolveIdleWait();
+        await resumeCommand;
+        await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+        await vi.waitFor(() => expect(harness.sentMessages).toHaveLength(2));
+
+        expect(harness.branch.filter(entry =>
+          entry.customType === GOAL_STATE_V2_TYPE && entry.data?.phase === "implementing"
+        )).toHaveLength(1);
+        expect(harness.publicationOrder).toEqual([
+          "state:implementing",
+          "epoch",
+          "continuation",
+        ]);
+      } finally {
+        await cleanup();
+      }
+    },
+  );
+
+  it("cancels a busy V2 resume when its exact paused target is replaced", async () => {
+    const { harness, state, cleanup } = await pausedLoopHarness("pi-goal-replaced-resume-");
+    try {
+      harness.setIdle(false);
+      const resumeCommand = harness.command.handler("resume", harness.commandContext());
+      harness.branch.push({
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: { ...state, loopId: "replacement-loop", phase: "paused" },
+      });
+
+      harness.setIdle(true);
+      harness.resolveIdleWait();
+      await resumeCommand;
+
+      expect(harness.branch.some(entry =>
+        entry.customType === GOAL_STATE_V2_TYPE
+          && entry.data?.loopId === state.loopId
+          && entry.data?.phase === "implementing"
+      )).toBe(false);
+      expect(harness.sentMessages).toEqual([]);
+      expect(harness.notifications).toHaveBeenCalledWith(
+        "Queued goal resume cancelled because the paused goal target changed.",
+        "warning",
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("resumes a busy V1 goal once without V2 epoch traffic", async () => {
+    const harness = integrationHarness();
+    harness.branch.push({ type: "custom", customType: GOAL_STATE_TYPE, data: pausedGoal() });
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+
+    harness.setIdle(false);
+    const resumeCommand = harness.command.handler("resume", harness.commandContext());
+    harness.setIdle(true);
+    harness.resolveIdleWait();
+    await resumeCommand;
+    await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+
+    expect(harness.branch.filter(entry =>
+      entry.customType === GOAL_STATE_TYPE && entry.data?.status === "active"
+    )).toHaveLength(1);
+    expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE)).toHaveLength(0);
+    expect(harness.sentMessages.filter(message => message.customType === GOAL_CONTINUE_MESSAGE)).toHaveLength(1);
+    expect(harness.publicationOrder).toEqual(["state:active", "continuation"]);
+  });
+
+  it("disarms a queued resume when the idle barrier fails", async () => {
+    const harness = integrationHarness();
+    harness.branch.push({ type: "custom", customType: GOAL_STATE_TYPE, data: pausedGoal() });
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+
+    harness.setIdle(false);
+    const resumeCommand = harness.command.handler("resume", harness.commandContext());
+    harness.rejectIdleWait(new Error("idle barrier failed"));
+    await resumeCommand;
+
+    harness.setIdle(true);
+    await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+    expect(harness.branch.some(entry =>
+      entry.customType === GOAL_STATE_TYPE && entry.data?.status === "active"
+    )).toBe(false);
+    expect(harness.sentMessages).toEqual([]);
+    expect(harness.notifications).toHaveBeenCalledWith("idle barrier failed", "error");
+  });
+
+  it.each(["session_before_switch", "session_before_fork"] as const)(
+    "cancels a busy resume when %s starts",
+    async eventName => {
+      const harness = integrationHarness();
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_TYPE, data: pausedGoal() });
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      harness.setIdle(false);
+      const resumeCommand = harness.command.handler("resume", harness.commandContext());
+
+      harness.handlers.get(eventName)!({ type: eventName }, harness.ctx);
+      harness.setIdle(true);
+      harness.resolveIdleWait();
+      await resumeCommand;
+
+      expect(harness.branch.some(entry =>
+        entry.customType === GOAL_STATE_TYPE && entry.data?.status === "active"
+      )).toBe(false);
+      expect(harness.notifications.mock.calls.some(([message]) =>
+        String(message).startsWith("Queued goal resume cancelled because")
+      )).toBe(true);
+    },
+  );
+
+  it.each(["start", "fresh", "pause", "stop", "clear"] as const)(
+    "does not revive the old target after a conflicting /goal %s",
+    async action => {
+      const harness = integrationHarness();
+      const oldGoal = pausedGoal();
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_TYPE, data: oldGoal });
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      harness.setIdle(false);
+      const resumeCommand = harness.command.handler("resume", harness.commandContext());
+
+      await harness.command.handler(
+        action === "start" ? "replacement objective" : action,
+        harness.commandContext(),
+      );
+      harness.setIdle(true);
+      harness.resolveIdleWait();
+      await resumeCommand;
+
+      expect(harness.branch.some(entry =>
+        entry.customType === GOAL_STATE_TYPE
+          && entry.data?.id === oldGoal.id
+          && entry.data?.status === "active"
+      )).toBe(false);
+      expect(harness.notifications.mock.calls.some(([message]) =>
+        String(message).startsWith("Queued goal resume cancelled because")
+      )).toBe(true);
+    },
+  );
 
   it("filters an active V2 epoch without old traffic and keeps the selected session stable", async () => {
     const harness = integrationHarness();
@@ -451,10 +729,9 @@ describe("goal extension provider integration", () => {
         },
       });
 
-      const notify = vi.fn();
       harness.setIdle(false);
-      await harness.command.handler("resume", { ui: { notify } });
-      expect(notify).toHaveBeenCalledWith(
+      const navigationResume = harness.command.handler("resume", harness.commandContext());
+      expect(harness.notifications).toHaveBeenCalledWith(
         "Goal resume queued until the current agent turn settles.",
         "info",
       );
@@ -480,6 +757,8 @@ describe("goal extension provider integration", () => {
       harness.handlers.get("session_before_tree")!({ type: "session_before_tree" }, harness.ctx);
       harness.handlers.get("session_tree")!({ type: "session_tree" }, harness.ctx);
       harness.setIdle(true);
+      harness.resolveIdleWait();
+      await navigationResume;
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
       expect(harness.branch.at(-1)).toMatchObject({
         customType: GOAL_STATE_V2_TYPE,
@@ -487,17 +766,7 @@ describe("goal extension provider integration", () => {
       });
 
       harness.setIdle(false);
-      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
-      harness.handlers.get("session_before_compact")!({ type: "session_before_compact" }, harness.ctx);
-      harness.setIdle(true);
-      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
-      expect(harness.branch.at(-1)).toMatchObject({
-        customType: GOAL_STATE_V2_TYPE,
-        data: { phase: "paused", contextEpoch: 0 },
-      });
-
-      harness.setIdle(false);
-      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      const pendingResume = harness.command.handler("resume", harness.commandContext());
       harness.branch.push({
         id: "active-turn-descendant",
         parentId: "remembered-leaf",
@@ -509,10 +778,16 @@ describe("goal extension provider integration", () => {
       harness.setIdle(true);
       harness.setPendingMessages(true);
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+      harness.resolveIdleWait();
+      await pendingResume;
       expect(harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)).toMatchObject({
         customType: GOAL_STATE_V2_TYPE,
         data: { phase: "paused", contextEpoch: 0 },
       });
+      expect(harness.notifications).toHaveBeenCalledWith(
+        "Queued goal resume is still waiting for pending messages to settle.",
+        "warning",
+      );
 
       harness.setPendingMessages(false);
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
@@ -525,11 +800,13 @@ describe("goal extension provider integration", () => {
       ).toHaveLength(1));
       expect(harness.sentMessages.filter(message => message.customType === "pi-goal-continue-v1")).toHaveLength(1);
 
-      await harness.command.handler("pause", { ui: { notify: vi.fn() } });
+      await harness.command.handler("pause", harness.commandContext());
       harness.setIdle(false);
-      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
-      await harness.command.handler("pause", { ui: { notify: vi.fn() } });
+      const conflictingResume = harness.command.handler("resume", harness.commandContext());
+      await harness.command.handler("pause", harness.commandContext());
       harness.setIdle(true);
+      harness.resolveIdleWait();
+      await conflictingResume;
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
       expect(harness.branch.at(-1)).toMatchObject({
         customType: GOAL_STATE_V2_TYPE,
@@ -537,9 +814,11 @@ describe("goal extension provider integration", () => {
       });
 
       harness.setIdle(false);
-      await harness.command.handler("resume", { ui: { notify: vi.fn() } });
+      const shutdownResume = harness.command.handler("resume", harness.commandContext());
       await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
       harness.setIdle(true);
+      harness.resolveIdleWait();
+      await shutdownResume;
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
       expect(harness.branch.at(-1)).toMatchObject({
         customType: GOAL_STATE_V2_TYPE,
