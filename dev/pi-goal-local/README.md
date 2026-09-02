@@ -9,12 +9,17 @@ Owned native `/goal` implementation for this pi-config profile.
 - `/goal <objective> --loop --plan <path>` — start an opt-in V2 fixed-point loop from an explicit plan.
 - `/goal <objective> --loop` — start from the latest plan approved by `pi-plan-mode`.
 - `/goal <objective> --loop --max-cycles <n>` — bound corrective replans (`1`–`100`).
+- `/goal <objective> --verify` — start V2 with one no-edit parent verification turn.
+- `/goal <objective> --implement` — start V2 at the normal implementation entry.
 - `/goal fresh` — start a new V2 loop from the latest approved plan.
+- `/goal fresh --verify` or `/goal fresh --implement` — choose the fresh loop entry.
 - `/goal status`, `/goal pause`, `/goal resume`, `/goal stop`, `/goal clear`
 
-Loop flags may be combined with an objective and criteria in any order. Quoted plan paths are supported. The `/goal` autocomplete offers management commands and loop flags; while editing a `--plan` value it delegates to Pi's ordinary file/path completion.
+Loop and entry flags may be combined with an objective and criteria in any order. `--verify` and `--implement` are mutually exclusive boolean switches. Either switch implies V2, so `--loop` is not required. Quoted plan paths are supported. The `/goal` autocomplete offers management, loop, and entry switches; while editing a `--plan` value it delegates to Pi's ordinary file/path completion. `/goal start` remains a V1 objective, not a subcommand.
 
-The startup flags `--goal-loop`, `--goal-plan <path>`, and `--goal-max-cycles <n>` provide the equivalent initial loop dispatch. An explicit plan always wins over the approved-plan bridge. Without either source, a loop start fails closed rather than treating an ordinary V1 goal as a loop.
+The startup flags `--goal-loop`, `--goal-plan <path>`, and `--goal-max-cycles <n>` retain their existing behavior. The global `--verify` and `--implement` switches provide V2 startup entry selection, for example `pi --verify --goal-plan plans/approved.md` or `pi --implement --goal-plan plans/approved.md`. An explicit plan always wins over the approved-plan bridge, and `--verify` still requires a plan through that same resolution path. Without either source, a loop start fails closed rather than treating an ordinary V1 goal as a loop.
+
+A verify entry performs one no-edit parent verification turn against the immutable plan snapshot, then follows the unchanged `GoalJudge` → `GoalVerifier` flow. The `verifying` phase remains evaluator-only: it never grants the parent permission to edit. `--verify` and `--implement` cannot be supplied together. Start a fresh Pi process after changing this extension; a full Pi restart is required to load extension changes.
 
 ## Effective boundary
 

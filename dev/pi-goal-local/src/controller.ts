@@ -31,6 +31,7 @@ import {
   GOAL_STATE_V2_TYPE,
   GOAL_STATUS_MESSAGE,
   GOAL_SUBAGENT_UPDATE_MESSAGE,
+  type GoalLoopEntry,
   type GoalLoopPhase,
   type GoalLoopStrategy,
   type GoalReanchorProof,
@@ -113,6 +114,8 @@ export interface GoalLoopStartOptions {
   maxCycles?: number;
   /** Required for a PREWALK loop; unsafe PREWALK starts are blocked. */
   prewalkReady?: boolean;
+  /** Select whether the first parent turn implements or only verifies. */
+  entry?: GoalLoopEntry;
   /** Test/deployment override; production artifact storage uses the agent dir. */
   agentDir?: string;
 }
@@ -857,6 +860,10 @@ export class GoalController {
     if (strategy !== undefined && strategy !== "YOLO" && strategy !== "ORCHESTRATOR" && strategy !== "PREWALK") {
       throw new Error("Unknown goal loop execution strategy.");
     }
+    const entry = options.entry;
+    if (entry !== undefined && entry !== "implement" && entry !== "verify") {
+      throw new Error("Unknown goal loop entry.");
+    }
 
     const loopId = randomUUID();
     this.loopAgentDirs.set(loopId, options.agentDir);
@@ -880,6 +887,9 @@ export class GoalController {
       phase: strategy === "PREWALK" && options.prewalkReady !== true ? "blocked" : "implementing",
       cycle: 0,
       maxCycles,
+      ...(entry === "verify" && !(strategy === "PREWALK" && options.prewalkReady !== true)
+        ? { pendingVerificationEntry: true as const }
+        : {}),
       objective: objective.trim() || "Implement the referenced plan.",
       criteria: [...criteria],
       plan: snapshot.provenance,
@@ -957,9 +967,11 @@ export class GoalController {
         requiredValidation: ["Re-run the focused checks required by the acceptance criteria."],
       },
       capabilityGuidance: [this.capabilities()],
-      continuationInstruction: state.strategy === "PREWALK"
-        ? "PREWALK strategy is authoritative; continue only with the approved PREWALK execution path."
-        : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
+      continuationInstruction: state.pendingVerificationEntry === true
+        ? "Inspect the repository and gather relevant tests and evidence only. Make no edits or implementation changes. Do not invoke GoalJudge or GoalVerifier directly. Stop after this one parent turn with concise evidence for the controller."
+        : state.strategy === "PREWALK"
+          ? "PREWALK strategy is authoritative; continue only with the approved PREWALK execution path."
+          : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
       maxBootstrapBytes,
     });
   }
@@ -1062,13 +1074,22 @@ export class GoalController {
         || !LOOP_PHASE_ACTIVE.includes(afterMarker.phase)) return;
       this.pi.sendMessage({
         customType: GOAL_CONTINUE_MESSAGE,
-        content: [
-          "Continue autonomous pursuit of the active fixed-point goal.",
-          `Objective: ${current!.objective}`,
-          `Immutable plan snapshot: ${current!.plan.snapshotPath}`,
-          current!.verifier?.correctionPath ? `Current corrective snapshot: ${current!.verifier.correctionPath}` : "",
-          current!.reasons?.stagnation ? `Latest execution guidance: ${current!.reasons.stagnation}` : "",
-        ].filter(Boolean).join("\n\n"),
+        content: current!.pendingVerificationEntry === true
+          ? [
+            "Inspect the repository and gather relevant tests and evidence for the active fixed-point goal.",
+            "Make no edits or implementation changes.",
+            "Do not invoke GoalJudge or GoalVerifier directly.",
+            "Stop after this one parent turn with concise evidence for the controller.",
+            `Objective: ${current!.objective}`,
+            `Immutable plan snapshot: ${current!.plan.snapshotPath}`,
+          ].join("\n\n")
+          : [
+            "Continue autonomous pursuit of the active fixed-point goal.",
+            `Objective: ${current!.objective}`,
+            `Immutable plan snapshot: ${current!.plan.snapshotPath}`,
+            current!.verifier?.correctionPath ? `Current corrective snapshot: ${current!.verifier.correctionPath}` : "",
+            current!.reasons?.stagnation ? `Latest execution guidance: ${current!.reasons.stagnation}` : "",
+          ].filter(Boolean).join("\n\n"),
         display: false,
         details: {
           loopId: current!.loopId,
@@ -1380,7 +1401,8 @@ export class GoalController {
 
   private async evaluateLoopOnce(ctx: ExtensionContext, initial: GoalStateV2): Promise<void> {
     if (initial.phase !== "implementing") return;
-    const token = {
+    let current = initial;
+    let token = {
       epoch: this.sessionEpoch,
       loopId: initial.loopId,
       generation: initial.generation,
@@ -1388,6 +1410,79 @@ export class GoalController {
       contextEpoch: initial.contextEpoch,
     };
     if (!parentReady(ctx) || hasActiveSubagents()) return;
+
+    if (initial.pendingVerificationEntry === true) {
+      if (!this.refreshLoopEvaluationState(ctx, token)
+        || !this.loopState
+        || this.loopState.pendingVerificationEntry !== true) return;
+      initial = this.loopState;
+      current = initial;
+      const lifecycleGuard = this.createLoopContextGuard(ctx, initial);
+      if (!lifecycleGuard) return;
+      const { pendingVerificationEntry: _pending, epochMarker: _epochMarker, ...candidateIdentity } = initial;
+      const candidate: GoalStateV2 = {
+        ...candidateIdentity,
+        contextEpoch: initial.contextEpoch + 1,
+        updatedAt: Date.now(),
+      };
+      const failClosed = (error: unknown): void => {
+        const latest = this.branchLoopState(ctx);
+        this.loopState = latest;
+        // A lifecycle transition owns any superseding branch. Never append a
+        // terminal marker to that branch while handling the stale operation.
+        if (this.ctx !== ctx || this.navigationPending || token.epoch !== this.sessionEpoch) return;
+        if (!latest
+          || latest.loopId !== initial.loopId
+          || latest.generation !== initial.generation
+          || latest.cycle !== initial.cycle
+          || !LOOP_PHASE_ACTIVE.includes(latest.phase)
+          || (latest.contextEpoch !== initial.contextEpoch && latest.contextEpoch !== candidate.contextEpoch)) return;
+        try {
+          this.blockLoop(latest, `Unable to establish the verification context epoch: ${error instanceof Error ? error.message : String(error)}`);
+        } catch {
+          // Failing closed must not fall through to evaluator launch if state
+          // persistence itself is unavailable.
+        }
+      };
+
+      try {
+        const settings = loadGoalLoopSettings(ctx.cwd);
+        const marked = await this.markLoopEpoch(
+          ctx,
+          candidate,
+          settings.maxBootstrapBytes,
+          this.loopStorageAgentDir(initial),
+        );
+        if (!lifecycleGuard()) throw new Error("Goal loop verification entry was superseded before its context epoch was marked.");
+        this.persistLoop(marked.state);
+        const freshToken = { ...token, contextEpoch: marked.state.contextEpoch };
+        if (!this.refreshLoopEvaluationState(ctx, freshToken) || !this.loopState) {
+          throw new Error("Goal loop verification entry was superseded before its context epoch was published.");
+        }
+        const freshState = this.loopState;
+        const freshLifecycleGuard = this.createLoopContextGuard(ctx, freshState);
+        if (!freshLifecycleGuard || !freshLifecycleGuard()) {
+          throw new Error("Goal loop verification entry was superseded before its context epoch was published.");
+        }
+        // This replacement marker is the only publication for the fresh
+        // verification epoch; it intentionally cannot trigger a parent turn.
+        this.pi.sendMessage({
+          customType: GOAL_CONTEXT_EPOCH_TYPE,
+          content: marked.marker.content,
+          display: false,
+          details: marked.marker.details,
+        }, { deliverAs: "followUp", triggerTurn: false });
+        if (!this.refreshLoopEvaluationState(ctx, freshToken)) {
+          throw new Error("Goal loop verification entry was superseded while its context epoch was published.");
+        }
+        current = freshState;
+        token = freshToken;
+      } catch (error) {
+        failClosed(error);
+        return;
+      }
+    }
+
     const entries = ctx.sessionManager.buildContextEntries();
     const evidenceText = buildGoalEvidence(entries);
     const evidenceFingerprint = fingerprintEvidence(evidenceText);
@@ -1398,10 +1493,10 @@ export class GoalController {
     let judgeOutput: string;
     try {
       const judge = await runEvaluator(this.pi, ctx, "GoalJudge", buildJudgePrompt({
-        objective: initial.objective,
-        criteria: initial.criteria,
+        objective: current.objective,
+        criteria: current.criteria,
         evidence: evidenceText,
-        iteration: initial.cycle,
+        iteration: current.cycle,
         capabilities: this.capabilities(),
       }), judgeAbort.signal);
       if (judge.failure || judge.aborted) throw new Error(judge.failure ?? "GoalJudge aborted");
@@ -1426,11 +1521,11 @@ export class GoalController {
       return;
     }
     if (!judgeVerdict.ok) {
-      const previous = this.judgeNoProgress.get(initial.loopId);
+      const previous = this.judgeNoProgress.get(current.loopId);
       const judgeProgress = previous?.fingerprint === evidenceFingerprint
         ? { fingerprint: evidenceFingerprint, count: previous.count + 1 }
         : { fingerprint: evidenceFingerprint, count: 1 };
-      this.judgeNoProgress.set(initial.loopId, judgeProgress);
+      this.judgeNoProgress.set(current.loopId, judgeProgress);
       if (judgeProgress.count >= settings.repeatedFingerprintThreshold) {
         this.blockLoop(this.loopState, `No progress: GoalJudge evidence fingerprint repeated ${judgeProgress.count} times.`);
         return;
@@ -1446,7 +1541,7 @@ export class GoalController {
       return;
     }
 
-    this.judgeNoProgress.delete(initial.loopId);
+    this.judgeNoProgress.delete(current.loopId);
     const verifying: GoalStateV2 = { ...this.loopState, phase: "verifying", updatedAt: Date.now() };
     this.persistLoop(verifying);
     const verifyToken = { ...token };
@@ -1663,8 +1758,9 @@ export class GoalController {
       return;
     }
 
+    const { pendingVerificationEntry: _pendingVerificationEntry, ...replanningIdentity } = replanning;
     const nextCandidate: GoalStateV2 = {
-      ...replanning,
+      ...replanningIdentity,
       phase: "implementing",
       cycle: current.cycle + 1,
       contextEpoch: current.contextEpoch + 1,

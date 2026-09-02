@@ -1012,6 +1012,169 @@ describe("goal controller lifecycle guards", () => {
     },
   );
 
+  it("starts a verification entry with one read-only parent turn before evaluation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verify-entry-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nInspect and verify the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      const started = await runtime.controller.startLoop(runtime.ctx, "verify feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+        entry: "verify",
+      });
+      expect(started).toMatchObject({ phase: "implementing", contextEpoch: 0, pendingVerificationEntry: true });
+      expect(epochMessages(runtime.pi)).toHaveLength(0);
+      expect(continueMessages(runtime.pi)).toHaveLength(0);
+      expect(subagents.runEvaluator).not.toHaveBeenCalled();
+
+      runtime.setIdle(true);
+      expect(runtime.controller.retryPendingWake(runtime.ctx)).toBe(true);
+      await vi.waitFor(() => expect(epochMessages(runtime.pi)).toHaveLength(1));
+      expect(continueMessages(runtime.pi)).toHaveLength(1);
+      expect(JSON.parse(epochMessages(runtime.pi)[0][0].content)).toMatchObject({
+        pendingVerificationEntry: true,
+        contextEpoch: 0,
+      });
+      expect(JSON.parse(epochMessages(runtime.pi)[0][0].content).continuationInstruction).toEqual(
+        expect.stringContaining("Make no edits or implementation changes."),
+      );
+      expect(continueMessages(runtime.pi)[0][0].content).toEqual(expect.stringContaining("Make no edits or implementation changes."));
+      expect(continueMessages(runtime.pi)[0][0].content).toEqual(expect.stringContaining("Do not invoke GoalJudge or GoalVerifier directly."));
+      expect(continueMessages(runtime.pi)[0][0].content).toEqual(expect.stringContaining("Stop after this one parent turn with concise evidence"));
+      expect(subagents.runEvaluator).not.toHaveBeenCalled();
+
+      subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string) => Promise.resolve(
+        type === "GoalJudge"
+          ? { output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false }
+          : {
+            output: JSON.stringify({
+              outcome: "pass",
+              reason: "Evidence confirms completion.",
+              repositoryFingerprint: "repo-verified",
+              evidenceFingerprint: "evidence-verified",
+            }),
+            aborted: false,
+            steered: false,
+          },
+      ));
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("completed"));
+
+      expect(runtime.controller.currentLoop?.contextEpoch).toBe(1);
+      expect(runtime.controller.currentLoop?.pendingVerificationEntry).toBeUndefined();
+      expect(epochMessages(runtime.pi)).toHaveLength(2);
+      const replacementBootstrap = JSON.parse(epochMessages(runtime.pi)[1][0].content);
+      expect(replacementBootstrap.contextEpoch).toBe(1);
+      expect(replacementBootstrap.pendingVerificationEntry).toBeUndefined();
+      const replacementCall = epochMessages(runtime.pi)[1];
+      expect(replacementCall[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: false });
+      expect(continueMessages(runtime.pi)).toHaveLength(1);
+      expect(subagents.runEvaluator.mock.calls.map(([, , type]) => type)).toEqual(["GoalJudge", "GoalVerifier"]);
+      expect(runtime.pi.sendMessage.mock.calls.findIndex(([message]: any[]) => message.customType === GOAL_CONTEXT_EPOCH_TYPE)
+        < runtime.pi.sendMessage.mock.calls.findIndex(([message]: any[]) => message.customType === GOAL_CONTINUE_MESSAGE)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps implementation entry normal and preserves verification intent across pause/resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-entry-lifecycle-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const verifyRuntime = harness();
+    verifyRuntime.setIdle(false);
+    const implementRuntime = harness();
+    implementRuntime.setIdle(false);
+    const defaultRuntime = harness();
+    defaultRuntime.setIdle(false);
+
+    try {
+      await expect(defaultRuntime.controller.startLoop(defaultRuntime.ctx, "invalid feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+        entry: "unknown" as any,
+      })).rejects.toThrow("Unknown goal loop entry.");
+
+      const verifying = await verifyRuntime.controller.startLoop(verifyRuntime.ctx, "verify feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+        entry: "verify",
+      });
+      expect(verifying.pendingVerificationEntry).toBe(true);
+      const paused = verifyRuntime.controller.pause(verifyRuntime.ctx) as GoalStateV2;
+      expect(paused).toMatchObject({ phase: "paused", pendingVerificationEntry: true });
+      const resumed = verifyRuntime.controller.resume(verifyRuntime.ctx) as GoalStateV2;
+      expect(resumed).toMatchObject({ phase: "implementing", pendingVerificationEntry: true, contextEpoch: 0 });
+      expect(subagents.runEvaluator).not.toHaveBeenCalled();
+
+      const implemented = await implementRuntime.controller.startLoop(implementRuntime.ctx, "implement feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+        entry: "implement",
+      });
+      expect(implemented.phase).toBe("implementing");
+      expect(implemented.pendingVerificationEntry).toBeUndefined();
+      implementRuntime.setIdle(true);
+      implementRuntime.controller.retryPendingWake(implementRuntime.ctx);
+      await vi.waitFor(() => expect(continueMessages(implementRuntime.pi)).toHaveLength(1));
+      expect(continueMessages(implementRuntime.pi)[0][0].content).toEqual(
+        expect.stringContaining("Continue autonomous pursuit of the active fixed-point goal."),
+      );
+      expect(continueMessages(implementRuntime.pi)[0][0].content).not.toEqual(
+        expect.stringContaining("Make no edits or implementation changes."),
+      );
+
+      await expect(defaultRuntime.controller.startLoop(defaultRuntime.ctx, "default feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+      })).resolves.toMatchObject({ phase: "implementing" });
+      expect(defaultRuntime.controller.currentLoop?.pendingVerificationEntry).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when verification epoch marking is superseded", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verify-superseded-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nInspect and verify the feature.\n", "utf8");
+    const runtime = harness();
+    runtime.setIdle(false);
+
+    try {
+      await runtime.controller.startLoop(runtime.ctx, "verify feature", ["tests pass"], {
+        planPath,
+        agentDir: root,
+        entry: "verify",
+      });
+      runtime.setIdle(true);
+      runtime.controller.retryPendingWake(runtime.ctx);
+      await vi.waitFor(() => expect(continueMessages(runtime.pi)).toHaveLength(1));
+
+      const gate = deferred<void>();
+      const originalMark = (runtime.controller as any).markLoopEpoch.bind(runtime.controller);
+      vi.spyOn(runtime.controller as any, "markLoopEpoch").mockImplementation(async (...args: any[]) => {
+        await gate.promise;
+        return originalMark(...args);
+      });
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect((runtime.controller as any).markLoopEpoch).toHaveBeenCalledTimes(1));
+      runtime.controller.pause(runtime.ctx, "Paused while verification epoch was being marked.");
+      gate.resolve();
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(subagents.runEvaluator).not.toHaveBeenCalled();
+      expect(runtime.controller.currentLoop?.phase).toBe("paused");
+      expect(runtime.controller.currentLoop?.pendingVerificationEntry).toBe(true);
+      expect(epochMessages(runtime.pi)).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("runs an actual V2 verifier replan through a new immutable context epoch", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-controller-"));
     const cwd = join(root, "workspace");
@@ -1075,9 +1238,16 @@ describe("goal controller lifecycle guards", () => {
       controller.requestEvaluation(ctx);
       await vi.waitFor(() => expect(controller.currentLoop?.cycle).toBe(1));
       expect(controller.currentLoop).toMatchObject({ phase: "implementing", contextEpoch: 1, cycle: 1 });
+      expect(controller.currentLoop?.pendingVerificationEntry).toBeUndefined();
       expect(controller.currentLoop?.verifier).toMatchObject({ outcome: "replan", repositoryFingerprint: "repo-before-fix" });
       expect(controller.currentLoop?.verifier?.correctionPath).toContain("cycle-1-plan.md");
       await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(4));
+      expect(continueMessages(pi).at(-1)?.[0].content).toEqual(
+        expect.stringContaining("Continue autonomous pursuit of the active fixed-point goal."),
+      );
+      expect(continueMessages(pi).at(-1)?.[0].content).not.toEqual(
+        expect.stringContaining("Make no edits or implementation changes."),
+      );
       controller.requestEvaluation(ctx);
       await vi.waitFor(() => expect(controller.currentLoop?.phase).toBe("completed"));
       expect(loopEntries(branch).at(-1)).toMatchObject({ phase: "completed", cycle: 1, contextEpoch: 1 });

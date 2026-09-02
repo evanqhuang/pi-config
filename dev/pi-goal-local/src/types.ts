@@ -19,6 +19,9 @@ export interface GoalStateV1 {
   lastEvidenceFingerprint?: string;
 }
 
+/** Entry mode selected when starting an opt-in fixed-point goal loop. */
+export type GoalLoopEntry = "implement" | "verify";
+
 /** Lifecycle phases persisted by an opt-in fixed-point goal loop. */
 export type GoalLoopPhase =
   | "implementing"
@@ -89,6 +92,8 @@ export interface GoalStateV2 {
   phase: GoalLoopPhase;
   cycle: number;
   maxCycles: number;
+  /** Set when a verification entry was requested but needs a later handoff. */
+  pendingVerificationEntry?: true;
   objective: string;
   criteria: string[];
   plan: GoalPlanProvenance;

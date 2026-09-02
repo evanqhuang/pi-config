@@ -37,6 +37,7 @@ export interface ContextEpochBootstrap {
   generation: number;
   contextEpoch: number;
   cycle: number;
+  pendingVerificationEntry?: true;
   objective: string;
   criteria: string[];
   originalPlan: ContextEpochPlanContent;
@@ -280,6 +281,7 @@ function validateBootstrapAgainstState(bootstrap: ContextEpochBootstrap, stateIn
     || bootstrap.generation !== state.generation
     || bootstrap.contextEpoch !== state.contextEpoch
     || bootstrap.cycle !== state.cycle
+    || (bootstrap.pendingVerificationEntry === true) !== (state.pendingVerificationEntry === true)
     || bootstrap.objective !== state.objective
     || !sameStrings(bootstrap.criteria, state.criteria)) {
     fail("STATE_MISMATCH", "Epoch bootstrap identity does not match GoalStateV2.");
@@ -310,12 +312,16 @@ function validateBootstrapAgainstState(bootstrap: ContextEpochBootstrap, stateIn
 
 function normalizeBootstrap(value: unknown, maxBootstrapBytes: number): ContextEpochBootstrap {
   if (!isRecord(value) || !hasOnlyKeys(value, [
-    "schemaVersion", "loopId", "generation", "contextEpoch", "cycle", "objective", "criteria",
+    "schemaVersion", "loopId", "generation", "contextEpoch", "cycle", "pendingVerificationEntry", "objective", "criteria",
     "originalPlan", "correction", "verifier", "capabilityGuidance", "continuationInstruction",
   ])) {
     fail("INVALID_INPUT", "Epoch bootstrap has an unknown or missing field.");
   }
   if (value.schemaVersion !== CONTEXT_EPOCH_SCHEMA_VERSION) fail("INVALID_INPUT", "Unsupported epoch bootstrap version.");
+  const hasPendingVerificationEntry = Object.prototype.hasOwnProperty.call(value, "pendingVerificationEntry");
+  if (hasPendingVerificationEntry && value.pendingVerificationEntry !== true) {
+    fail("INVALID_INPUT", "pendingVerificationEntry must be true when present.");
+  }
   const correction = value.correction === undefined ? undefined : normalizePlan(value.correction, "correction");
   const bootstrap: ContextEpochBootstrap = {
     schemaVersion: CONTEXT_EPOCH_SCHEMA_VERSION,
@@ -330,6 +336,7 @@ function normalizeBootstrap(value: unknown, maxBootstrapBytes: number): ContextE
     capabilityGuidance: validateStringList(value.capabilityGuidance, "capabilityGuidance"),
     continuationInstruction: boundedText(value.continuationInstruction, "continuationInstruction"),
   };
+  if (hasPendingVerificationEntry) bootstrap.pendingVerificationEntry = true;
   if (correction !== undefined) bootstrap.correction = correction;
 
   const serialized = canonicalJson(bootstrap);
@@ -365,6 +372,7 @@ export function createContextEpochBootstrap(options: ContextEpochBootstrapOption
       : [...options.capabilityGuidance],
     continuationInstruction: options.continuationInstruction,
   };
+  if (state.pendingVerificationEntry === true) candidate.pendingVerificationEntry = true;
   if (options.correction !== undefined) candidate.correction = options.correction;
   const bootstrap = normalizeBootstrap(candidate, maxBytes);
   const normalizedState = validateBootstrapAgainstState(bootstrap, state);

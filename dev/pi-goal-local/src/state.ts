@@ -231,7 +231,7 @@ export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
   if (!isRecord(value) || value.schemaVersion !== 2) return undefined;
   if (!hasOnlyKeys(value, [
     "schemaVersion", "loopId", "generation", "contextEpoch", "phase", "cycle", "maxCycles",
-    "objective", "criteria", "plan", "strategy", "verifier", "epochMarker", "reasons", "reanchor", "createdAt", "updatedAt",
+    "objective", "criteria", "plan", "strategy", "verifier", "epochMarker", "reasons", "reanchor", "createdAt", "updatedAt", "pendingVerificationEntry",
   ])) return undefined;
 
   const loopId = boundedString(value.loopId, MAX_ID_LENGTH);
@@ -260,7 +260,9 @@ export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
     || reanchor.planSnapshotHash !== plan.snapshotHash)) return undefined;
   const createdAt = value.createdAt === undefined ? undefined : value.createdAt;
   const updatedAt = value.updatedAt === undefined ? undefined : value.updatedAt;
-  if ((createdAt !== undefined && !finiteNumber(createdAt)) || (updatedAt !== undefined && !finiteNumber(updatedAt))) return undefined;
+  const hasPendingVerificationEntry = Object.prototype.hasOwnProperty.call(value, "pendingVerificationEntry");
+  if ((createdAt !== undefined && !finiteNumber(createdAt)) || (updatedAt !== undefined && !finiteNumber(updatedAt))
+    || (hasPendingVerificationEntry && value.pendingVerificationEntry !== true)) return undefined;
 
   const result: GoalStateV2 = {
     schemaVersion: 2,
@@ -274,6 +276,7 @@ export function parseGoalStateV2(value: unknown): GoalStateV2 | undefined {
     criteria,
     plan,
   };
+  if (hasPendingVerificationEntry) result.pendingVerificationEntry = true;
   if (strategy !== undefined) result.strategy = strategy;
   if (verifier !== undefined) result.verifier = verifier;
   if (epochMarker !== undefined) result.epochMarker = epochMarker;

@@ -18,6 +18,7 @@ import {
   type GoalStateV1,
   type GoalStateV2,
 } from "../src/types.js";
+import { PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL } from "../src/plan-bridge.js";
 
 function pausedGoal(): GoalStateV1 {
   return {
@@ -82,13 +83,20 @@ function controllerEpochMarker(state: GoalStateV2) {
     },
     verifier: { discrepancies: [], requiredValidation: ["Re-run the focused checks required by the acceptance criteria."] },
     capabilityGuidance: ["Use the main session's currently selected PLAN / ORCHESTRATOR / YOLO mode and available tools. Do not assume unavailable capabilities. Goal evaluation itself cannot mutate through GoalJudge; GoalVerifier is read-only acceptance verification."],
-    continuationInstruction: "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
+    continuationInstruction: state.pendingVerificationEntry === true
+      ? "Inspect the repository and gather relevant tests and evidence only. Make no edits or implementation changes. Do not invoke GoalJudge or GoalVerifier directly. Stop after this one parent turn with concise evidence for the controller."
+      : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
   });
   return createContextEpochMarker(bootstrap, { timestamp: 1 });
 }
 
-function integrationHarness() {
+type IntegrationHarnessOptions = {
+  flags?: Record<string, boolean | string | undefined>;
+};
+
+function integrationHarness(options: IntegrationHarnessOptions = {}) {
   const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const registeredFlags = new Map<string, any>();
   const listeners = new Map<string, Set<(data: unknown) => void>>();
   const branch: any[] = [];
   let provider: any;
@@ -96,6 +104,7 @@ function integrationHarness() {
   let baseCompletionApplications = 0;
   const sentMessages: any[] = [];
   const publicationOrder: string[] = [];
+  const emittedChannels: string[] = [];
   const notifications = vi.fn();
   let idleBarrier = deferred<void>();
   const waitForIdle = vi.fn(() => idleBarrier.promise);
@@ -150,6 +159,7 @@ function integrationHarness() {
       return () => set.delete(listener);
     },
     emit(channel: string, data: unknown) {
+      emittedChannels.push(channel);
       for (const listener of [...(listeners.get(channel) ?? [])]) listener(data);
     },
   };
@@ -157,8 +167,8 @@ function integrationHarness() {
     events,
     on(name: string, handler: (event: any, eventCtx: any) => unknown) { handlers.set(name, handler); },
     registerCommand(_name: string, value: any) { command = value; },
-    registerFlag() {},
-    getFlag() { return undefined; },
+    registerFlag(name: string, definition: any) { registeredFlags.set(name, definition); },
+    getFlag(name: string) { return options.flags?.[name]; },
     appendEntry(customType: string, data: unknown) {
       branch.push({ type: "custom", customType, data });
       if (customType === GOAL_STATE_V2_TYPE) {
@@ -190,7 +200,9 @@ function integrationHarness() {
     get command() { return command; },
     sentMessages,
     publicationOrder,
+    emittedChannels,
     notifications,
+    registeredFlags,
     commandContext() { return { ui, waitForIdle }; },
     resolveIdleWait() {
       const current = idleBarrier;
@@ -224,6 +236,29 @@ function deferred<T>() {
     reject = fail;
   });
   return { promise, resolve, reject };
+}
+
+async function explicitPlanHarness(
+  prefix: string,
+  flags: Record<string, boolean | string | undefined>,
+  includeGoalPlan = true,
+) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  const sourcePath = join(root, "source-plan.md");
+  await writeFile(sourcePath, "# Integration plan\nVerify the implementation.\n", "utf8");
+  const harness = integrationHarness({ flags: includeGoalPlan ? { ...flags, "goal-plan": sourcePath } : flags });
+  return {
+    harness,
+    root,
+    sourcePath,
+    async cleanup() {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    },
+  };
 }
 
 async function pausedLoopHarness(prefix: string) {
@@ -565,6 +600,42 @@ describe("goal extension provider integration", () => {
       expect(result.messages.filter(message => (message as { role?: string }).role === "custom")).toHaveLength(1);
 
       await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reanchors pending verification with matching no-edit fallback guidance", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verify-reanchor-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const plan = "# Approved plan\nImplement the feature.\n";
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), plan, "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.pendingVerificationEntry = true;
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const expectedMarker = controllerEpochMarker(state);
+      state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      await harness.handlers.get("session_compact")!({ type: "session_compact" }, harness.ctx);
+      await vi.waitFor(() => expect(
+        harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
+      ).toHaveLength(1));
+
+      const reanchored = harness.sentMessages.find(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE);
+      const bootstrap = JSON.parse(reanchored!.content);
+      expect(bootstrap).toMatchObject({ pendingVerificationEntry: true, contextEpoch: state.contextEpoch });
+      expect(bootstrap.continuationInstruction).toContain("Make no edits or implementation changes.");
+      expect(bootstrap.continuationInstruction).toContain("Do not invoke GoalJudge or GoalVerifier directly.");
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1048,7 +1119,190 @@ describe("goal extension provider integration", () => {
     await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
   });
 
-  it("offers loop management and delegates --plan path completion to the ordinary provider", async () => {
+  it("registers global entry switches and starts a verify V2 loop through CLI dispatch", async () => {
+    const { harness, cleanup } = await explicitPlanHarness("pi-goal-cli-verify-", { verify: true });
+    try {
+      expect(harness.registeredFlags.get("verify")).toMatchObject({
+        type: "boolean",
+        default: false,
+      });
+      expect(harness.registeredFlags.get("implement")).toMatchObject({
+        type: "boolean",
+        default: false,
+      });
+      expect(harness.registeredFlags.get("verify").description).toMatch(/verification/u);
+      expect(harness.registeredFlags.get("implement").description).toMatch(/implementation/u);
+      expect(harness.registeredFlags.get("goal-loop")).toMatchObject({ type: "boolean" });
+      expect(harness.registeredFlags.get("goal-plan")).toMatchObject({ type: "string" });
+      expect(harness.registeredFlags.get("goal-max-cycles")).toMatchObject({ type: "string" });
+
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await vi.waitFor(() => expect(
+        harness.branch.filter(entry => entry.customType === GOAL_STATE_V2_TYPE),
+      ).toHaveLength(1));
+      const state = harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)?.data as GoalStateV2;
+      expect(state).toMatchObject({
+        phase: "implementing",
+        objective: "Verify the referenced plan.",
+        pendingVerificationEntry: true,
+      });
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it("requires a plan for a global --verify start through the existing resolver", async () => {
+    const harness = integrationHarness({ flags: { verify: true } });
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    await vi.waitFor(() => expect(harness.notifications.mock.calls.some(([message]) =>
+      String(message).includes("No approved plan is available"),
+    )).toBe(true));
+    expect(harness.emittedChannels).toContain(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL);
+    expect(harness.branch.some(entry => entry.customType === GOAL_STATE_V2_TYPE)).toBe(false);
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+  });
+
+  it("rejects conflicting global entry switches before resolver or durable V2 state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-cli-conflict-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    const harness = integrationHarness({ flags: { verify: true, implement: true } });
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      expect(harness.notifications).toHaveBeenCalledWith(
+        "--verify and --implement are mutually exclusive.",
+        "error",
+      );
+      expect(harness.emittedChannels).not.toContain(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL);
+      expect(harness.branch.some(entry => entry.customType === GOAL_STATE_V2_TYPE)).toBe(false);
+      await expect(realpath(join(root, "goal-loops"))).rejects.toThrow();
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("starts a global --implement loop with the normal objective", async () => {
+    const { harness, cleanup } = await explicitPlanHarness("pi-goal-cli-implement-", { implement: true });
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await vi.waitFor(() => expect(
+        harness.branch.filter(entry => entry.customType === GOAL_STATE_V2_TYPE),
+      ).toHaveLength(1));
+      const state = harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)?.data as GoalStateV2;
+      expect(state.objective).toBe("Implement the referenced plan.");
+      expect(state.pendingVerificationEntry).toBeUndefined();
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it("preserves the existing global loop, plan, and max-cycle switches", async () => {
+    const { harness, cleanup } = await explicitPlanHarness("pi-goal-cli-existing-", {
+      "goal-loop": true,
+      "goal-max-cycles": "7",
+    });
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await vi.waitFor(() => expect(
+        harness.branch.filter(entry => entry.customType === GOAL_STATE_V2_TYPE),
+      ).toHaveLength(1));
+      const state = harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)?.data as GoalStateV2;
+      expect(state).toMatchObject({
+        objective: "Implement the referenced plan.",
+        maxCycles: 7,
+      });
+      expect(state.pendingVerificationEntry).toBeUndefined();
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it.each([
+    { label: "verify default", args: "--verify", objective: "Verify the referenced plan.", pending: true },
+    { label: "implement default", args: "--implement", objective: "Implement the referenced plan.", pending: false },
+    { label: "verify explicit", args: "Inspect the implementation --verify", objective: "Inspect the implementation", pending: true },
+    { label: "implement explicit", args: "Improve the implementation --implement", objective: "Improve the implementation", pending: false },
+  ])("forwards slash objective $label entry metadata", async ({ args, objective, pending }) => {
+    const { harness, sourcePath, cleanup } = await explicitPlanHarness("pi-goal-slash-entry-", {}, false);
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await harness.command.handler(`${args} --plan ${sourcePath}`, harness.commandContext());
+      const state = harness.branch.findLast(entry => entry.customType === GOAL_STATE_V2_TYPE)?.data as GoalStateV2;
+      expect(state.objective).toBe(objective);
+      expect(state.pendingVerificationEntry).toBe(pending ? true : undefined);
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it.each([
+    { switch: "verify", objective: "Verify the referenced plan." },
+    { switch: "implement", objective: "Implement the referenced plan." },
+  ])("forwards /goal fresh --$switch entry metadata", async ({ switch: entry, objective }) => {
+    const { harness, sourcePath, cleanup } = await explicitPlanHarness("pi-goal-fresh-entry-", {}, false);
+    const unsubscribe = harness.pi.events.on(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL, (request: any) => {
+      harness.pi.events.emit(`${PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL}:reply:${request.requestId}`, {
+        version: 1,
+        requestId: request.requestId,
+        result: {
+          version: 1,
+          sourceKind: "approved",
+          sourcePath,
+          planPath: sourcePath,
+          action: "yolo-direct",
+          strategy: "YOLO",
+        },
+      });
+    });
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await harness.command.handler(`fresh --${entry}`, harness.commandContext());
+      const state = harness.branch.findLast(item => item.customType === GOAL_STATE_V2_TYPE)?.data as GoalStateV2;
+      expect(state.objective).toBe(objective);
+      expect(state.pendingVerificationEntry).toBe(entry === "verify" ? true : undefined);
+    } finally {
+      unsubscribe();
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it("keeps bare /goal start on the V1 path", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    await harness.command.handler("start", harness.commandContext());
+    expect(harness.branch.some(entry => entry.customType === GOAL_STATE_V2_TYPE)).toBe(false);
+    expect(harness.branch.findLast(entry => entry.customType === GOAL_STATE_TYPE)?.data).toMatchObject({
+      status: "active",
+      objective: "start",
+    });
+    await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+  });
+
+  it("does not persist slash entry conflicts before parser errors are reported", async () => {
+    const { harness, sourcePath, cleanup } = await explicitPlanHarness("pi-goal-slash-conflict-", {}, false);
+    try {
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      await harness.command.handler(`objective --verify --implement --plan ${sourcePath}`, harness.commandContext());
+      expect(harness.branch.some(entry => entry.customType === GOAL_STATE_V2_TYPE)).toBe(false);
+      expect(harness.notifications).toHaveBeenCalledWith(
+        "--verify and --implement are mutually exclusive.",
+        "error",
+      );
+    } finally {
+      await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+      await cleanup();
+    }
+  });
+
+  it("offers loop management, entry switches, and delegates --plan path completion to the ordinary provider", async () => {
     const harness = integrationHarness();
     await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
 
@@ -1065,7 +1319,18 @@ describe("goal extension provider integration", () => {
 
     const management = await harness.provider.getSuggestions(["/goal st"], 0, 9, { signal: new AbortController().signal });
     expect(management?.items.map((item: any) => item.value)).toContain("status");
-    expect(harness.command.getArgumentCompletions("Implement --")?.[0]?.value).toBe("Implement --loop");
+    const objectiveEntries = harness.command.getArgumentCompletions("Implement --") ?? [];
+    expect(objectiveEntries.map((item: any) => item.value)).toEqual(expect.arrayContaining([
+      "Implement --verify",
+      "Implement --implement",
+    ]));
+    expect(objectiveEntries.find((item: any) => item.value === "Implement --verify")?.description).toMatch(/no-edit/u);
+    const freshEntries = harness.command.getArgumentCompletions("fresh --") ?? [];
+    expect(freshEntries.map((item: any) => item.value)).toEqual(expect.arrayContaining([
+      "fresh --verify",
+      "fresh --implement",
+    ]));
+    expect(freshEntries.map((item: any) => item.value)).not.toContain("fresh start");
 
     const pathLine = "/goal --loop --plan plans/";
     const path = await harness.provider.getSuggestions([pathLine], 0, pathLine.length, { signal: new AbortController().signal });

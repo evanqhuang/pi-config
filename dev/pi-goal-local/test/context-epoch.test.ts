@@ -5,7 +5,11 @@ import {
   buildContextEpochBootstrap,
   createContextEpochMarker,
   filterContextWithDisposition,
+  hashContextEpochBootstrap,
+  parseContextEpochBootstrap,
   parseContextEpochMarker,
+  serializeContextEpochBootstrap,
+  validateContextEpochBootstrap,
   type ContextEpochBootstrap,
   type GoalContextMessage,
 } from "../src/context-epoch.js";
@@ -257,6 +261,37 @@ describe("durable goal context epochs", () => {
     expect(result.safeSuffixIncluded).toBe(false);
     expect(result.messages).toHaveLength(1);
     expect(JSON.stringify(result.messages)).not.toContain("orphaned old assistant");
+  });
+
+  it("binds pending verification metadata into bootstrap hashes and roundtrips it", () => {
+    const legacy = state();
+    const pending = state({ pendingVerificationEntry: true });
+    const legacyBootstrap = bootstrap(legacy);
+    const pendingBootstrap = bootstrap(pending);
+
+    expect(legacyBootstrap).not.toHaveProperty("pendingVerificationEntry");
+    expect(pendingBootstrap.pendingVerificationEntry).toBe(true);
+    expect(hashContextEpochBootstrap(legacyBootstrap)).not.toBe(hashContextEpochBootstrap(pendingBootstrap));
+
+    const serialized = serializeContextEpochBootstrap(pendingBootstrap);
+    expect(serialized).toContain('"pendingVerificationEntry":true');
+    expect(parseContextEpochBootstrap(serialized)).toEqual(pendingBootstrap);
+  });
+
+  it("rejects pending verification bootstrap mismatches in both directions while accepting legacy omission", () => {
+    const legacy = state();
+    const pending = state({ pendingVerificationEntry: true });
+    const legacyBootstrap = bootstrap(legacy);
+    const pendingBootstrap = bootstrap(pending);
+    const missingPendingBootstrap = { ...pendingBootstrap };
+    delete missingPendingBootstrap.pendingVerificationEntry;
+
+    expect(() => validateContextEpochBootstrap(
+      { ...legacyBootstrap, pendingVerificationEntry: true },
+      legacy,
+    )).toThrow(/identity|pendingVerificationEntry/i);
+    expect(() => validateContextEpochBootstrap(missingPendingBootstrap, pending)).toThrow(/identity|pendingVerificationEntry/i);
+    expect(validateContextEpochBootstrap(legacyBootstrap, legacy)).toEqual(legacyBootstrap);
   });
 
   it("rejects plan and marker hash mismatches", () => {

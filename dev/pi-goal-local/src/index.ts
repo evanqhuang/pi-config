@@ -21,6 +21,7 @@ import {
   type PlanBridge,
 } from "./plan-bridge.js";
 import {
+  type GoalLoopEntry,
   type GoalLoopPhase,
   type GoalStateV1,
   type GoalStateV2,
@@ -30,6 +31,8 @@ const LOOP_PHASES: readonly GoalLoopPhase[] = ["implementing", "verifying", "rep
 const GOAL_LOOP_FLAG = "goal-loop";
 const GOAL_PLAN_FLAG = "goal-plan";
 const GOAL_MAX_CYCLES_FLAG = "goal-max-cycles";
+const GOAL_VERIFY_FLAG = "verify";
+const GOAL_IMPLEMENT_FLAG = "implement";
 
 /** The provider type is re-exported structurally by the coding-agent package. */
 type AutocompleteProvider = Parameters<AutocompleteProviderFactory>[0];
@@ -138,6 +141,16 @@ function registerLoopFlags(pi: ExtensionAPI): void {
     type: "string",
     description: "Maximum corrective cycles for --goal-loop",
   });
+  api.registerFlag(GOAL_VERIFY_FLAG, {
+    type: "boolean",
+    default: false,
+    description: "Start V2 with one no-edit parent verification turn",
+  });
+  api.registerFlag(GOAL_IMPLEMENT_FLAG, {
+    type: "boolean",
+    default: false,
+    description: "Start V2 with the normal implementation entry",
+  });
 }
 
 function parsePositiveCycles(value: boolean | string | undefined): number | undefined {
@@ -240,6 +253,8 @@ const MANAGEMENT_ITEMS: readonly AutocompleteItem[] = [
 
 const LOOP_OPTION_ITEMS: readonly AutocompleteItem[] = [
   { value: "--loop", label: "--loop", description: "Use the V2 fixed-point loop" },
+  { value: "--verify", label: "--verify", description: "Start V2 with one no-edit parent verification turn" },
+  { value: "--implement", label: "--implement", description: "Start V2 with the normal implementation entry" },
   { value: "--plan ", label: "--plan <path>", description: "Use an explicit immutable plan snapshot" },
   { value: "--max-cycles ", label: "--max-cycles <n>", description: "Bound corrective replans (1-100)" },
 ];
@@ -331,19 +346,25 @@ function notifyLoopStart(ctx: ExtensionContext, state: GoalStateV2): void {
   );
 }
 
+function defaultLoopObjective(entry: GoalLoopEntry): string {
+  return entry === "verify" ? "Verify the referenced plan." : "Implement the referenced plan.";
+}
+
 async function startResolvedLoop(
   controller: GoalController,
   ctx: ExtensionContext,
   plan: GoalPlanBridgeResult,
   objective: string,
   criteria: string[],
-  maxCycles?: number,
+  maxCycles: number | undefined,
+  entry: GoalLoopEntry = "implement",
 ): Promise<GoalStateV2> {
   const options: GoalLoopStartOptions = {
     loop: true,
     sourceKind: plan.sourceKind,
     sourcePath: plan.sourcePath,
     maxCycles,
+    entry,
     ...(plan.sourceKind === "approved"
       ? {
         strategy: plan.strategy,
@@ -406,9 +427,11 @@ async function contextBootstrap(
     capabilityGuidance: [
       "Use the main session's currently selected PLAN / ORCHESTRATOR / YOLO mode and available tools. Do not assume unavailable capabilities. Goal evaluation itself cannot mutate through GoalJudge; GoalVerifier is read-only acceptance verification.",
     ],
-    continuationInstruction: state.strategy === "PREWALK"
-      ? "PREWALK strategy is authoritative; continue only with the approved PREWALK execution path."
-      : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
+    continuationInstruction: state.pendingVerificationEntry === true
+      ? "Inspect the repository and gather relevant tests and evidence only. Make no edits or implementation changes. Do not invoke GoalJudge or GoalVerifier directly. Stop after this one parent turn with concise evidence for the controller."
+      : state.strategy === "PREWALK"
+        ? "PREWALK strategy is authoritative; continue only with the approved PREWALK execution path."
+        : "Continue implementing the current immutable plan, then stop for GoalJudge and independent GoalVerifier evaluation.",
     maxBootstrapBytes: settings.maxBootstrapBytes,
   });
   requireCurrentContextBootstrap(guard);
@@ -561,6 +584,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
     if (shutDown) return;
     invalidateDeferredLifecycle("the active session changed", nextCtx);
     ctx = nextCtx;
+    const cliVerify = flagValue(pi, GOAL_VERIFY_FLAG) === true;
+    const cliImplement = flagValue(pi, GOAL_IMPLEMENT_FLAG) === true;
+    if (cliVerify && cliImplement) {
+      if (nextCtx.hasUI) nextCtx.ui.notify("--verify and --implement are mutually exclusive.", "error");
+      return;
+    }
     controller.restore(nextCtx);
     if (!autocompleteInstalled && typeof nextCtx.ui?.addAutocompleteProvider === "function") {
       nextCtx.ui.addAutocompleteProvider(withGoalAutocomplete);
@@ -573,17 +602,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
     const cyclesFlag = flagValue(pi, GOAL_MAX_CYCLES_FLAG);
     const hasCliPlan = typeof planFlag === "string" && planFlag.trim().length > 0;
     const hasCliCycles = cyclesFlag !== undefined && cyclesFlag !== false;
-    if (!cliLoop && !hasCliPlan && !hasCliCycles) return;
+    if (!cliLoop && !hasCliPlan && !hasCliCycles && !cliVerify && !cliImplement) return;
     cliDispatchStarted = true;
     void (async () => {
       try {
         const maxCycles = parsePositiveCycles(cyclesFlag);
+        const entry: GoalLoopEntry = cliVerify ? "verify" : "implement";
         const plan = await bridge.resolvePlan({ explicitPlanPath: hasCliPlan ? planFlag as string : undefined });
         if (!plan) throw new Error("No approved plan is available; supply --goal-plan or approve a plan in PLAN mode.");
         if (!ctx || !sameSelection(ctx, selectionOf(nextCtx) ?? { sessionId: "", leafId: null })) {
           throw new Error("Goal loop start was superseded by session navigation.");
         }
-        const state = await startResolvedLoop(controller, ctx, plan, "Implement the referenced plan.", [], maxCycles);
+        const state = await startResolvedLoop(controller, ctx, plan, defaultLoopObjective(entry), [], maxCycles, entry);
         notifyLoopStart(ctx, state);
       } catch (error) {
         if (nextCtx.hasUI) nextCtx.ui.notify(`Goal loop could not start: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -773,7 +803,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
             if (!ctx || !selection || !sameSelection(ctx, selection)) {
               throw new Error("Goal loop start was superseded by session navigation.");
             }
-            const next = await startResolvedLoop(controller, ctx, plan, command.objective, command.criteria, command.maxCycles);
+            const entry = command.entry ?? "implement";
+            const next = await startResolvedLoop(controller, ctx, plan, command.objective, command.criteria, command.maxCycles, entry);
             commandCtx.ui.notify(
               next.phase === "blocked"
                 ? `Goal loop blocked: ${next.reasons?.block ?? "unsafe loop start"}`
@@ -795,7 +826,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
             if (!ctx || !selection || !sameSelection(ctx, selection)) {
               throw new Error("Goal loop start was superseded by session navigation.");
             }
-            const next = await startResolvedLoop(controller, ctx, plan, "Implement the referenced plan.", []);
+            const entry = command.entry ?? "implement";
+            const next = await startResolvedLoop(controller, ctx, plan, defaultLoopObjective(entry), [], undefined, entry);
             commandCtx.ui.notify(`Fresh goal loop active: ${next.objective}`, "info");
           } catch (error) {
             commandCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");

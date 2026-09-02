@@ -1,6 +1,9 @@
+import type { GoalLoopEntry } from "./types.js";
+
 export type GoalCommand =
-  | { kind: "start"; objective: string; criteria: string[]; loop?: boolean; planPath?: string; maxCycles?: number }
-  | { kind: "status" | "pause" | "resume" | "stop" | "clear" | "fresh" };
+  | { kind: "start"; objective: string; criteria: string[]; loop?: boolean; planPath?: string; maxCycles?: number; entry?: GoalLoopEntry }
+  | { kind: "fresh"; entry?: GoalLoopEntry }
+  | { kind: "status" | "pause" | "resume" | "stop" | "clear" };
 
 type GoalToken = {
   value: string;
@@ -84,6 +87,14 @@ function isOption(token: GoalToken): boolean {
   return !token.quoted && token.value.startsWith("-");
 }
 
+function isGoalLoopEntryFlag(token: GoalToken): boolean {
+  return !token.quoted && (token.value === "--verify" || token.value === "--implement");
+}
+
+function isGoalLoopEntryValue(token: GoalToken): boolean {
+  return !token.quoted && (token.value.startsWith("--verify=") || token.value.startsWith("--implement="));
+}
+
 function hasLoopSyntax(tokens: readonly GoalToken[]): boolean {
   return tokens.some(token => !token.quoted && token.value.startsWith("--") && token.value !== "--");
 }
@@ -107,6 +118,7 @@ function parseLoopCommand(tokens: readonly GoalToken[]): GoalCommand {
   const criteria: GoalToken[] = [];
   let inCriteria = false;
   let loop = false;
+  let entry: GoalLoopEntry | undefined;
   let planPath: string | undefined;
   let maxCycles: number | undefined;
 
@@ -122,6 +134,18 @@ function parseLoopCommand(tokens: readonly GoalToken[]): GoalCommand {
       if (token.value !== "--loop") throw new Error("--loop does not take a value.");
       if (loop) throw new Error("--loop may be provided only once.");
       loop = true;
+      continue;
+    }
+    if (isGoalLoopEntryValue(token)) {
+      throw new Error(`${token.value.startsWith("--verify=") ? "--verify" : "--implement"} does not take a value.`);
+    }
+    if (isGoalLoopEntryFlag(token)) {
+      const requestedEntry = token.value === "--verify" ? "verify" : "implement" as const;
+      if (entry !== undefined) {
+        if (entry === requestedEntry) throw new Error(`${token.value} may be provided only once.`);
+        throw new Error("--verify and --implement are mutually exclusive.");
+      }
+      entry = requestedEntry;
       continue;
     }
     if (!token.quoted && (token.value === "--plan" || token.value.startsWith("--plan="))) {
@@ -151,13 +175,35 @@ function parseLoopCommand(tokens: readonly GoalToken[]): GoalCommand {
   if (!objectiveText && !planPath) throw new Error("Goal objective cannot be empty without --plan.");
   const result: GoalCommand = {
     kind: "start",
-    objective: objectiveText || "Implement the referenced plan.",
+    objective: objectiveText || (entry === "verify" ? "Verify the referenced plan." : "Implement the referenced plan."),
     criteria: criteriaFromTokens(criteria),
   };
-  if (loop) result.loop = true;
+  if (loop || entry !== undefined) result.loop = true;
   if (planPath !== undefined) result.planPath = planPath;
   if (maxCycles !== undefined) result.maxCycles = maxCycles;
+  if (entry !== undefined) result.entry = entry;
   return result;
+}
+
+function parseFreshCommand(tokens: readonly GoalToken[]): GoalCommand | undefined {
+  const first = tokens[0];
+  if (!first || first.quoted || first.value !== "fresh" || tokens.length < 2) return undefined;
+
+  let entry: GoalLoopEntry | undefined;
+  for (const token of tokens.slice(1)) {
+    if (isGoalLoopEntryValue(token)) {
+      throw new Error(`${token.value.startsWith("--verify=") ? "--verify" : "--implement"} does not take a value.`);
+    }
+    if (!isGoalLoopEntryFlag(token)) return undefined;
+    const requestedEntry = token.value === "--verify" ? "verify" : "implement" as const;
+    if (entry !== undefined) {
+      if (entry === requestedEntry) throw new Error(`${token.value} may be provided only once.`);
+      throw new Error("--verify and --implement are mutually exclusive.");
+    }
+    entry = requestedEntry;
+  }
+
+  return entry === undefined ? { kind: "fresh" } : { kind: "fresh", entry };
 }
 
 function parseLegacyGoalCommand(value: string): GoalCommand {
@@ -187,9 +233,11 @@ export function parseGoalCommand(raw: string | undefined): GoalCommand {
   } catch (error) {
     // Legacy goals treated quote characters as ordinary objective text. Only
     // turn an unterminated quote into an error when loop syntax is present.
-    if (/(^|\s)--(?:loop|plan|max-cycles)(?:=|\s|$)/u.test(value)) throw error;
+    if (/(^|\s)--(?:loop|plan|max-cycles|verify|implement)(?:=|\s|$)/u.test(value)) throw error;
     return parseLegacyGoalCommand(value);
   }
+  const freshCommand = parseFreshCommand(tokens);
+  if (freshCommand) return freshCommand;
   if (!hasLoopSyntax(tokens)) return parseLegacyGoalCommand(value);
   return parseLoopCommand(tokens);
 }

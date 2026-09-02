@@ -86,15 +86,49 @@ function progressEvidence(timestamp: number, toolCallId: string, output = "PASS"
 }
 
 describe("goal command parser", () => {
-  it("parses management commands and criteria", () => {
+  it("parses management commands, criteria, and the legacy start objective", () => {
     expect(parseGoalCommand("status")).toEqual({ kind: "status" });
     expect(parseGoalCommand("pause")).toEqual({ kind: "pause" });
     expect(parseGoalCommand("fresh")).toEqual({ kind: "fresh" });
+    expect(parseGoalCommand("start")).toEqual({ kind: "start", objective: "start", criteria: [] });
     expect(parseGoalCommand("build it -- tests pass; docs updated")).toEqual({
       kind: "start",
       objective: "build it",
       criteria: ["tests pass", "docs updated"],
     });
+  });
+
+  it("parses implement and verify loop entries with plan defaults", () => {
+    expect(parseGoalCommand("--verify --plan path/to/plan.md")).toEqual({
+      kind: "start",
+      objective: "Verify the referenced plan.",
+      criteria: [],
+      loop: true,
+      planPath: "path/to/plan.md",
+      entry: "verify",
+    });
+    expect(parseGoalCommand("--implement --plan path/to/plan.md")).toEqual({
+      kind: "start",
+      objective: "Implement the referenced plan.",
+      criteria: [],
+      loop: true,
+      planPath: "path/to/plan.md",
+      entry: "implement",
+    });
+    expect(parseGoalCommand("Audit repo --verify --plan path/to/plan.md")).toEqual({
+      kind: "start",
+      objective: "Audit repo",
+      criteria: [],
+      loop: true,
+      planPath: "path/to/plan.md",
+      entry: "verify",
+    });
+  });
+
+  it("parses fresh loop entries without changing bare fresh", () => {
+    expect(parseGoalCommand("fresh")).toEqual({ kind: "fresh" });
+    expect(parseGoalCommand("fresh --verify")).toEqual({ kind: "fresh", entry: "verify" });
+    expect(parseGoalCommand("fresh --implement")).toEqual({ kind: "fresh", entry: "implement" });
   });
 
   it("parses loop flags in any position and supports quoted plan paths", () => {
@@ -130,6 +164,16 @@ describe("goal command parser", () => {
     expect(() => parseGoalCommand("--loop --max-cycles 1.5 implement")).toThrow(/positive integer/);
     expect(() => parseGoalCommand("--loop --unknown implement")).toThrow(/Unknown goal option/);
     expect(() => parseGoalCommand("--loop -- tests pass")).toThrow(/objective cannot be empty/);
+  });
+
+  it("rejects duplicate, valued, and mutually exclusive entry switches", () => {
+    expect(() => parseGoalCommand("--verify --verify --plan path.md")).toThrow(/only once/);
+    expect(() => parseGoalCommand("--implement --implement --plan path.md")).toThrow(/only once/);
+    expect(() => parseGoalCommand("--verify=true --plan path.md")).toThrow(/does not take a value/);
+    expect(() => parseGoalCommand("--implement=false --plan path.md")).toThrow(/does not take a value/);
+    expect(() => parseGoalCommand("--verify --implement --plan path.md")).toThrow(/mutually exclusive/);
+    expect(() => parseGoalCommand("fresh --verify --verify")).toThrow(/only once/);
+    expect(() => parseGoalCommand("fresh --verify --implement")).toThrow(/mutually exclusive/);
   });
 });
 
@@ -192,6 +236,27 @@ describe("goal state", () => {
       ...entries,
       { type: "custom", customType: GOAL_STATE_V2_TYPE, data: malformed } as unknown as SessionEntry,
     ])).toBeUndefined();
+  });
+
+  it("strictly parses pending verification metadata and preserves old v2 markers", () => {
+    const legacy = loopState();
+    expect(parseGoalStateV2(legacy)).toEqual(legacy);
+    expect(latestGoalStateMarker([
+      { type: "custom", customType: GOAL_STATE_V2_TYPE, data: legacy },
+    ] as unknown as SessionEntry[])).toEqual(legacy);
+    expect(latestGoalStateMarker([
+      { type: "custom", customType: GOAL_STATE_TYPE, data: legacy },
+    ] as unknown as SessionEntry[])).toEqual(legacy);
+
+    const pending = loopState({ pendingVerificationEntry: true });
+    expect(parseGoalStateV2(pending)).toEqual(pending);
+    expect(pending.pendingVerificationEntry).toBe(true);
+    expect(pending.phase).toBe("implementing");
+
+    for (const invalid of [false, "true", 1, null, undefined]) {
+      expect(parseGoalStateV2({ ...legacy, pendingVerificationEntry: invalid })).toBeUndefined();
+    }
+    expect(parseGoalStateV2({ ...legacy, unexpected: true })).toBeUndefined();
   });
 
   it("strictly validates durable tree reanchor proofs", () => {
