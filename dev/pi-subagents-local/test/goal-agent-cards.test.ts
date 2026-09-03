@@ -27,7 +27,7 @@ describe("native goal evaluator cards", () => {
     expect(verifier?.skills).toBe(false);
     expect(verifier?.model).toBe("openai-codex/gpt-5.6-luna");
     expect(verifier?.thinking).toBe("high");
-    expect(verifier?.maxTurns).toBe(6);
+    expect(verifier?.maxTurns).toBe(50);
     expect(verifier?.persistSession).toBe(false);
     expect(verifier?.outputTranscript).toBe(false);
     expect(verifier?.isolation).toBe("worktree");

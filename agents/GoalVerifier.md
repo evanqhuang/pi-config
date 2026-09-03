@@ -8,7 +8,7 @@ skills: false
 disallowed_tools: request_deeper_reasoning
 model: openai-codex/gpt-5.6-luna
 thinking: high
-max_turns: 6
+max_turns: 50
 persist_session: false
 output_transcript: false
 isolation: worktree
