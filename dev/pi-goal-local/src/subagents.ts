@@ -10,6 +10,11 @@ interface EphemeralAgentResult {
   steered: boolean;
 }
 
+export interface EvaluatorProgressCallbacks {
+  onTurnEnd?: (turnCount: number) => void;
+  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+}
+
 interface PiSubagentsServiceV3 {
   runEphemeralAgent(options: {
     pi: ExtensionAPI;
@@ -20,6 +25,8 @@ interface PiSubagentsServiceV3 {
     signal?: AbortSignal;
     model?: string;
     thinkingLevel?: GoalJudgeThinking;
+    onTurnEnd?: (turnCount: number) => void;
+    onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   }): Promise<EphemeralAgentResult>;
   hasActiveAgents(): boolean;
 }
@@ -47,6 +54,7 @@ export function runEvaluator(
   type: "GoalJudge" | "GoalVerifier",
   prompt: string,
   signal?: AbortSignal,
+  progress: EvaluatorProgressCallbacks = {},
 ): Promise<EphemeralAgentResult> {
   const judge = type === "GoalJudge" ? loadGoalJudgeSettings(ctx.cwd) : undefined;
   return subagents().runEphemeralAgent({
@@ -58,5 +66,7 @@ export function runEvaluator(
     signal,
     model: judge?.model,
     thinkingLevel: judge?.thinking,
+    onTurnEnd: progress.onTurnEnd,
+    onAssistantUsage: progress.onAssistantUsage,
   });
 }

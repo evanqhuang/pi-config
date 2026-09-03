@@ -119,6 +119,33 @@ describe("ephemeral service safety and cleanup", () => {
     },
   );
 
+  it("forwards sanitized turn and usage progress callbacks", async () => {
+    const cwd = join(tempRoot, "project");
+    const child = session();
+    const onTurnEnd = vi.fn();
+    const onAssistantUsage = vi.fn();
+    const usage = { input: 10, output: 3, cacheWrite: 2 };
+    mocks.runAgent.mockImplementationOnce(async (_ctx: unknown, _type: string, _prompt: string, options: any) => {
+      options.onSessionCreated?.(child.value);
+      options.onTurnEnd?.(4);
+      options.onAssistantUsage?.(usage);
+      return { responseText: "checked", session: child.value, aborted: false, steered: false };
+    });
+
+    const service = getPiSubagentsServiceV3();
+    await service.runEphemeralAgent({
+      pi: {} as any,
+      ctx: context(cwd),
+      type: "general-purpose",
+      prompt: "run",
+      onTurnEnd,
+      onAssistantUsage,
+    });
+
+    expect(onTurnEnd).toHaveBeenCalledWith(4);
+    expect(onAssistantUsage).toHaveBeenCalledWith(usage);
+  });
+
   it("disposes a session captured before a later runner rejection", async () => {
     const cwd = join(tempRoot, "project");
     const child = session();

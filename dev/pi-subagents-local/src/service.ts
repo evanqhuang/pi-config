@@ -19,6 +19,8 @@ export interface EphemeralAgentOptions {
   signal?: AbortSignal;
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  onTurnEnd?: (turnCount: number) => void;
+  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number; cacheRead?: number; cost?: number }) => void;
 }
 
 export interface EphemeralAgentResult {
@@ -110,6 +112,8 @@ function createService(): PiSubagentsServiceV3 {
           // later await rejects, its result is never returned to this service,
           // so the callback is the only way to ensure ephemeral cleanup runs.
           onSessionCreated: createdSession => { session = createdSession; },
+          onTurnEnd: options.onTurnEnd,
+          onAssistantUsage: options.onAssistantUsage,
         });
         session = result.session;
         return {

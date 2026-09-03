@@ -1159,6 +1159,86 @@ describe("goal controller lifecycle guards", () => {
     }
   });
 
+  it("shows sanitized live V1 GoalVerifier progress and clears it after settlement", async () => {
+    const runtime = harness();
+    const setStatus = vi.fn();
+    runtime.ctx.hasUI = true;
+    runtime.ctx.ui = { setStatus };
+    const verifier = deferred<{ output: string; aborted: boolean; steered: boolean }>();
+    let progress: any;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string, _prompt: string, _signal: AbortSignal, callbacks: any) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      progress = callbacks;
+      return verifier.promise;
+    });
+
+    runtime.controller.start(runtime.ctx, "ship feature", ["tests pass"]);
+    runtime.controller.requestEvaluation(runtime.ctx);
+    await vi.waitFor(() => expect(progress).toBeDefined());
+    progress.onAssistantUsage({ input: 700, output: 200, cacheWrite: 100 });
+    progress.onTurnEnd(2);
+    expect(setStatus).toHaveBeenLastCalledWith(
+      "goal-verifier",
+      expect.stringMatching(/· 2 turns · 1,000 tokens$/),
+    );
+
+    verifier.resolve({
+      output: JSON.stringify({ ok: true, reason: "verified" }),
+      aborted: false,
+      steered: false,
+    });
+    await vi.waitFor(() => expect(runtime.controller.current?.status).toBe("completed"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal-verifier", undefined);
+  });
+
+  it("shows sanitized live V2 GoalVerifier progress and clears it after settlement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-progress-"));
+    const planPath = join(root, "approved-plan.md");
+    await writeFile(planPath, "# Approved plan\nImplement and test the feature.\n", "utf8");
+    const runtime = harness();
+    const setStatus = vi.fn();
+    runtime.ctx.hasUI = true;
+    runtime.ctx.ui = { setStatus };
+    const verifier = deferred<{ output: string; aborted: boolean; steered: boolean }>();
+    let progress: any;
+    subagents.runEvaluator.mockImplementation((_pi: any, _ctx: any, type: string, _prompt: string, _signal: AbortSignal, callbacks: any) => {
+      if (type === "GoalJudge") {
+        return Promise.resolve({ output: JSON.stringify({ ok: true, reason: "candidate complete" }), aborted: false, steered: false });
+      }
+      progress = callbacks;
+      return verifier.promise;
+    });
+
+    try {
+      await startReadyLoop(runtime, planPath, root);
+      runtime.controller.requestEvaluation(runtime.ctx);
+      await vi.waitFor(() => expect(progress).toBeDefined());
+      expect(setStatus).toHaveBeenCalledWith(
+        "goal-verifier",
+        expect.stringMatching(/^● GOAL VERIFYING · \d+s · 0 turns · 0 tokens$/),
+      );
+
+      progress.onAssistantUsage({ input: 1_000, output: 250, cacheWrite: 50 });
+      progress.onTurnEnd(1);
+      expect(setStatus).toHaveBeenLastCalledWith(
+        "goal-verifier",
+        expect.stringMatching(/· 1 turn · 1,300 tokens$/),
+      );
+
+      verifier.resolve({
+        output: JSON.stringify({ outcome: "pass", reason: "verified", repositoryFingerprint: "repo-first" }),
+        aborted: false,
+        steered: false,
+      });
+      await vi.waitFor(() => expect(runtime.controller.currentLoop?.phase).toBe("completed"));
+      expect(setStatus).toHaveBeenLastCalledWith("goal-verifier", undefined);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("retries a legacy V1-shaped response when evaluating a V2 loop", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verifier-retry-legacy-"));
     const planPath = join(root, "approved-plan.md");

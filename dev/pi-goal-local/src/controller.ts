@@ -1401,6 +1401,47 @@ export class GoalController {
       && phases.includes(current.phase);
   }
 
+  private async runGoalVerifier(
+    ctx: ExtensionContext,
+    prompt: string,
+    signal: AbortSignal,
+  ): ReturnType<typeof runEvaluator> {
+    if (!ctx.hasUI) return runEvaluator(this.pi, ctx, "GoalVerifier", prompt, signal);
+
+    const startedAt = Date.now();
+    let turns = 0;
+    let tokens = 0;
+    const render = () => {
+      const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1_000));
+      const elapsed = elapsedSeconds >= 60
+        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
+        : `${elapsedSeconds}s`;
+      ctx.ui.setStatus(
+        "goal-verifier",
+        `● GOAL VERIFYING · ${elapsed} · ${turns} ${turns === 1 ? "turn" : "turns"} · ${tokens.toLocaleString("en-US")} tokens`,
+      );
+    };
+    render();
+    const timer = setInterval(render, 1_000);
+    timer.unref?.();
+
+    try {
+      return await runEvaluator(this.pi, ctx, "GoalVerifier", prompt, signal, {
+        onTurnEnd: turnCount => {
+          turns = turnCount;
+          render();
+        },
+        onAssistantUsage: usage => {
+          tokens += usage.input + usage.output + usage.cacheWrite;
+          render();
+        },
+      });
+    } finally {
+      clearInterval(timer);
+      ctx.ui.setStatus("goal-verifier", undefined);
+    }
+  }
+
   private async evaluateLoopOnce(ctx: ExtensionContext, initial: GoalStateV2): Promise<void> {
     if (initial.phase !== "implementing") return;
     let current = initial;
@@ -1588,7 +1629,7 @@ export class GoalController {
           previousRepositoryFingerprint: verifying.verifier?.repositoryFingerprint,
         },
       });
-      const verifier = await runEvaluator(this.pi, ctx, "GoalVerifier", verifierPrompt, verifierAbort.signal);
+      const verifier = await this.runGoalVerifier(ctx, verifierPrompt, verifierAbort.signal);
       if (verifier.failure || verifier.aborted) throw new Error(verifier.failure ?? "GoalVerifier aborted");
       verifierOutput = verifier.output;
     } catch (error) {
@@ -1606,10 +1647,8 @@ export class GoalController {
       const firstDiagnostic = diagnoseVerifierOutput(verifierOutput);
       this.evaluatorAbort = verifierAbort;
       try {
-        const retry = await runEvaluator(
-          this.pi,
+        const retry = await this.runGoalVerifier(
           ctx,
-          "GoalVerifier",
           buildVerifierRetryPrompt(verifierPrompt, firstDiagnostic, evidenceFingerprint),
           verifierAbort.signal,
         );
@@ -1897,7 +1936,7 @@ export class GoalController {
       const verifierAbort = new AbortController();
       try {
         this.evaluatorAbort = verifierAbort;
-        const verifier = await runEvaluator(this.pi, ctx, "GoalVerifier", buildVerifierPrompt({
+        const verifier = await this.runGoalVerifier(ctx, buildVerifierPrompt({
           objective: current.objective,
           criteria: current.criteria,
           judgeReason: verdict.reason,
