@@ -680,7 +680,7 @@ describe("goal extension provider integration", () => {
     }
   });
 
-  it("does not use a compaction handoff for a mismatched transient summary", async () => {
+  it("does not use a stale handoff after compaction failure", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-mismatch-"));
     const artifactDir = join(root, "goal-loops", "loop-integration");
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -702,6 +702,12 @@ describe("goal extension provider integration", () => {
         reason: "threshold",
         willRetry: false,
       }, harness.ctx);
+      await harness.handlers.get("session_compact_failed")!({
+        type: "session_compact_failed",
+        reason: "threshold",
+        willRetry: false,
+        aborted: true,
+      }, harness.ctx);
       const compactionEntry = {
         id: "compact-entry",
         parentId: "integration-leaf",
@@ -721,7 +727,7 @@ describe("goal extension provider integration", () => {
       }, harness.ctx);
       await harness.handlers.get("context")!({
         type: "context",
-        messages: [{ role: "compactionSummary", summary: "different summary", tokensBefore: 100_000, timestamp: 1 }],
+        messages: [{ role: "compactionSummary", summary: "trusted summary", tokensBefore: 100_000, timestamp: 1 }],
       }, harness.ctx);
 
       expect(harness.aborts).toBe(1);

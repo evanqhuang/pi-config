@@ -725,6 +725,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.restoreSelectedBranch(treeCtx);
   });
 
+  const compactionFailureEvents = pi as ExtensionAPI & {
+    on(
+      event: "session_compact_failed",
+      handler: (event: unknown, context: ExtensionContext) => void,
+    ): void;
+  };
+  compactionFailureEvents.on("session_compact_failed", () => {
+    deferredCompactionRestore = undefined;
+    compactionAttempt = undefined;
+    successfulCompactionHandoff = undefined;
+  });
+
   pi.on("session_compact", (event, compactCtx) => {
     if (shutDown) return;
     ctx = compactCtx;
