@@ -71,10 +71,11 @@ type DeferredResumeRequest = {
 
 type DeferredResumeOutcome = "none" | "blocked" | "consumed" | "cancelled";
 
-type SuccessfulCompactionHandoff = {
+type CompactionAttempt = {
   sessionId: string;
-  leafId: string;
+  parentLeafId: string;
   selectionGeneration: number;
+  reason: "manual" | "threshold";
   loopId: string;
   generation: number;
   contextEpoch: number;
@@ -82,6 +83,10 @@ type SuccessfulCompactionHandoff = {
   planHash: string;
   epochMarkerId: string;
   epochMarkerHash: string;
+};
+
+type SuccessfulCompactionHandoff = Omit<CompactionAttempt, "parentLeafId" | "reason"> & {
+  compactionEntryId: string;
   summary: string;
 };
 
@@ -469,6 +474,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let deferredResumeClaimInFlight = false;
   let resumePublicationPending = false;
   let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
+  let compactionAttempt: CompactionAttempt | undefined;
   let successfulCompactionHandoff: SuccessfulCompactionHandoff | undefined;
 
   const deferredResumeTarget = (
@@ -533,6 +539,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     cancelDeferredResume(reason, notifyCtx);
     resumePublicationPending = false;
     deferredCompactionRestore = undefined;
+    compactionAttempt = undefined;
     successfulCompactionHandoff = undefined;
   };
 
@@ -605,13 +612,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
     if (!pending) return undefined;
     successfulCompactionHandoff = undefined;
     const selection = selectionOf(context);
+    const compactionStillSelected = context.sessionManager.getBranch().some(entry =>
+      entry.id === pending.compactionEntryId
+    );
     const summaryPresent = incomingMessages.some(message => {
       const candidate = message as { role?: unknown; summary?: unknown };
       return candidate.role === "compactionSummary" && candidate.summary === pending.summary;
     });
     const marker = loop.epochMarker;
     return selection?.sessionId === pending.sessionId
-      && selection.leafId === pending.leafId
+      && compactionStillSelected
       && selectionGeneration === pending.selectionGeneration
       && loop.loopId === pending.loopId
       && loop.generation === pending.generation
@@ -683,9 +693,31 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.prepareForTreeNavigation(treeCtx);
   });
 
-  pi.on("session_before_compact", () => {
+  pi.on("session_before_compact", (event, compactCtx) => {
     deferredCompactionRestore = undefined;
+    compactionAttempt = undefined;
     successfulCompactionHandoff = undefined;
+    if (event.willRetry || event.reason === "overflow") return;
+    const selection = selectionOf(compactCtx);
+    const loop = controller.refreshLoop(compactCtx);
+    if (selection?.leafId
+      && loopStateIsActive(loop)
+      && loop.epochMarker
+      && typeof loop.plan.snapshotHash === "string") {
+      compactionAttempt = {
+        sessionId: selection.sessionId,
+        parentLeafId: selection.leafId,
+        selectionGeneration,
+        reason: event.reason,
+        loopId: loop.loopId,
+        generation: loop.generation,
+        contextEpoch: loop.contextEpoch,
+        cycle: loop.cycle,
+        planHash: loop.plan.snapshotHash,
+        epochMarkerId: loop.epochMarker.id,
+        epochMarkerHash: loop.epochMarker.hash,
+      };
+    }
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -699,6 +731,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // Native overflow recovery retries immediately after this event. Defer
     // goal-owned marker/continuation delivery until that retry settles so the
     // context handler cannot observe a half-published epoch.
+    const attempt = compactionAttempt;
+    compactionAttempt = undefined;
     if (event.willRetry) {
       successfulCompactionHandoff = undefined;
       const selection = selectionOf(compactCtx);
@@ -718,29 +752,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // current compaction summary under the existing epoch bootstrap.
     successfulCompactionHandoff = undefined;
     const selection = selectionOf(compactCtx);
-    const loop = controller.refreshLoop(compactCtx);
     const compactionEntry = event.compactionEntry;
     const compactionSummary = typeof compactionEntry?.summary === "string"
       ? compactionEntry.summary
       : undefined;
-    if (compactionEntry
-      && selection?.leafId
-      && selection.leafId === compactionEntry.id
-      && loopStateIsActive(loop)
-      && loop.epochMarker
-      && typeof loop.plan.snapshotHash === "string"
+    if (attempt
+      && compactionEntry
+      && selection?.sessionId === attempt.sessionId
+      && selectionGeneration === attempt.selectionGeneration
+      && event.reason === attempt.reason
+      && compactionEntry.parentId === attempt.parentLeafId
       && compactionSummary !== undefined) {
       successfulCompactionHandoff = {
-        sessionId: selection.sessionId,
-        leafId: selection.leafId,
-        selectionGeneration,
-        loopId: loop.loopId,
-        generation: loop.generation,
-        contextEpoch: loop.contextEpoch,
-        cycle: loop.cycle,
-        planHash: loop.plan.snapshotHash,
-        epochMarkerId: loop.epochMarker.id,
-        epochMarkerHash: loop.epochMarker.hash,
+        sessionId: attempt.sessionId,
+        selectionGeneration: attempt.selectionGeneration,
+        loopId: attempt.loopId,
+        generation: attempt.generation,
+        contextEpoch: attempt.contextEpoch,
+        cycle: attempt.cycle,
+        planHash: attempt.planHash,
+        epochMarkerId: attempt.epochMarkerId,
+        epochMarkerHash: attempt.epochMarkerHash,
+        compactionEntryId: compactionEntry.id,
         summary: compactionSummary,
       };
     }

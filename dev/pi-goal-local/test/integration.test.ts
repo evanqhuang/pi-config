@@ -625,13 +625,33 @@ describe("goal extension provider integration", () => {
       state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
       harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
       harness.setIdle(false);
+      await harness.handlers.get("session_before_compact")!({
+        type: "session_before_compact",
+        reason: "threshold",
+        willRetry: false,
+      }, harness.ctx);
+      const compactionEntry = {
+        id: "compact-entry",
+        parentId: "integration-leaf",
+        type: "compaction",
+        summary,
+        tokensBefore: 100_000,
+        timestamp: new Date(1).toISOString(),
+      };
+      harness.branch.push(compactionEntry);
+      harness.setLeaf("compact-entry");
 
       await harness.handlers.get("session_compact")!({
         type: "session_compact",
         reason: "threshold",
         willRetry: false,
-        compactionEntry: { id: "integration-leaf", summary, tokensBefore: 100_000, timestamp: 1 },
+        compactionEntry,
       }, harness.ctx);
+      // Goal-owned follow-up publication may advance the selected leaf before
+      // the immediate provider context hook; ancestry, not leaf equality,
+      // proves that the successful compaction remains selected.
+      harness.branch.push({ id: "post-compact-child", parentId: "compact-entry", type: "custom_message" });
+      harness.setLeaf("post-compact-child");
       expect(harness.sentMessages).toEqual([]);
 
       const result = await harness.handlers.get("context")!({
@@ -643,7 +663,8 @@ describe("goal extension provider integration", () => {
       expect(result.messages[0]).toMatchObject({ customType: GOAL_CONTEXT_EPOCH_TYPE, details: state.epochMarker });
       expect(result.messages[1]).toEqual({ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 });
       expect(harness.aborts).toBe(0);
-      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "implementing" } });
+      expect(harness.branch.filter(entry => entry.customType === GOAL_STATE_V2_TYPE).at(-1))
+        .toMatchObject({ data: { phase: "implementing" } });
 
       // The handoff is consumed exactly once; it cannot bless a later markerless request.
       await harness.handlers.get("context")!({
@@ -676,12 +697,27 @@ describe("goal extension provider integration", () => {
       state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
       harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
       harness.setIdle(false);
+      await harness.handlers.get("session_before_compact")!({
+        type: "session_before_compact",
+        reason: "threshold",
+        willRetry: false,
+      }, harness.ctx);
+      const compactionEntry = {
+        id: "compact-entry",
+        parentId: "integration-leaf",
+        type: "compaction",
+        summary: "trusted summary",
+        tokensBefore: 100_000,
+        timestamp: new Date(1).toISOString(),
+      };
+      harness.branch.push(compactionEntry);
+      harness.setLeaf("compact-entry");
 
       await harness.handlers.get("session_compact")!({
         type: "session_compact",
         reason: "threshold",
         willRetry: false,
-        compactionEntry: { id: "integration-leaf", summary: "trusted summary", tokensBefore: 100_000, timestamp: 1 },
+        compactionEntry,
       }, harness.ctx);
       await harness.handlers.get("context")!({
         type: "context",
