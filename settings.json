@@ -46,7 +46,7 @@
     },
     "npm:@haemmid/pi-processes"
   ],
-  "defaultProvider": "qwen38-main",
+  "defaultProvider": "openai-codex",
   "enabledModels": [
     "openai-codex/gpt-5.6-sol",
     "openai-codex/gpt-5.6-luna",
@@ -225,6 +225,6 @@
   "extensions": [
     "+extensions/pr-worktree-guard/index.ts"
   ],
-  "defaultThinkingLevel": "medium",
-  "defaultModel": "qwen3.8-27b"
+  "defaultThinkingLevel": "xhigh",
+  "defaultModel": "gpt-5.6-luna"
 }

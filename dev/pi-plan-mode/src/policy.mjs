@@ -113,93 +113,225 @@ export function delegationProfile(input) {
   };
 }
 
-function shellTokens(command) {
-  const tokens = [];
+function shellSegments(command) {
+  const segments = [];
+  let tokens = [];
   let token = "";
+  let tokenStarted = false;
   let quote = "";
   let escaped = false;
 
-  for (const char of command) {
+  const finishToken = () => {
+    if (!tokenStarted) return;
+    tokens.push(token);
+    token = "";
+    tokenStarted = false;
+  };
+  const finishSegment = () => {
+    finishToken();
+    if (tokens.length === 0) return false;
+    segments.push(tokens);
+    tokens = [];
+    return true;
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
     if (escaped) {
       token += char;
+      tokenStarted = true;
       escaped = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = "";
+      else token += char;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') {
+        quote = "";
+      } else if (char === "\\" && ["$", "`", '"', "\\", "\n"].includes(command[index + 1])) {
+        escaped = true;
+      } else {
+        // Double quotes still expand variables and commands, so reject those
+        // forms rather than trying to emulate a shell.
+        if (char === "$" || char === "`") return null;
+        token += char;
+      }
+      tokenStarted = true;
       continue;
     }
     if (char === "\\") {
       escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      else token += char;
+      tokenStarted = true;
       continue;
     }
     if (char === "'" || char === '"') {
       quote = char;
+      tokenStarted = true;
       continue;
     }
-    if (/\s/.test(char)) {
-      if (token) {
-        tokens.push(token);
-        token = "";
-      }
+    if (char === "\n" || char === "\r" || char === "#" || char === "`" || char === "$" || char === "<" || char === ">" || char === "(" || char === ")" || char === "{" || char === "}" || char === "*" || char === "?" || char === "[") return null;
+    // POSIX shells split unquoted words on space and tab by default. Other
+    // JavaScript whitespace (for example NBSP or form feed) remains part of
+    // the executable token and must not masquerade as a safe command boundary.
+    if (char === " " || char === "\t") {
+      finishToken();
       continue;
     }
+    if (char === ";") {
+      if (!finishSegment()) return null;
+      continue;
+    }
+    if (char === "&") {
+      if (command[index + 1] !== "&" || !finishSegment()) return null;
+      index++;
+      continue;
+    }
+    if (char === "|") {
+      if (command[index + 1] === "&") return null;
+      const operatorLength = command[index + 1] === "|" ? 2 : 1;
+      if (!finishSegment()) return null;
+      index += operatorLength - 1;
+      continue;
+    }
+    if (char === "~" && !tokenStarted) return null;
     token += char;
+    tokenStarted = true;
   }
 
-  if (escaped || quote) return null;
-  if (token) tokens.push(token);
-  return tokens;
+  if (escaped || quote || !finishSegment()) return null;
+  return segments;
 }
 
 const SAFE_COMMANDS = new Set([
   "cat", "head", "tail", "grep", "rg", "find", "ls", "pwd", "stat", "file",
-  "wc", "sort", "uniq", "diff", "git", "npm", "yarn", "pnpm", "echo", "printf",
+  "wc", "sort", "uniq", "diff", "git", "gh", "npm", "yarn", "pnpm", "echo", "printf",
 ]);
 
 const FORBIDDEN_ARGUMENTS = new Set([
   "-exec", "-execdir", "-delete", "-ok", "-okdir", "--output", "--output-document",
 ]);
+const READ_ONLY_GIT_COMMANDS = new Set([
+  "status", "log", "diff", "show", "ls-files", "ls-tree", "rev-parse", "describe",
+]);
 
-function isSafeCommandShape(command) {
-  if (typeof command !== "string" || command.trim() === "") return false;
-  // A single argv-only command is intentional. The native sandbox remains the
-  // final defense, but rejecting shell composition prevents hidden second
-  // commands from being treated as automatically approved batch work.
-  if (/[;&|<>`\n\r]|\$\(|\$\{/.test(command)) return false;
+function hasOption(args, option) {
+  return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
+}
 
-  const tokens = shellTokens(command);
-  if (!tokens || tokens.length === 0) return false;
-  let index = 0;
-  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index++;
-  if (tokens[index] === "env" || tokens[index] === "command" || tokens[index] === "builtin") return false;
-  const executableToken = tokens[index] ?? "";
+function isReadOnlyGit(args) {
+  const subcommandIndex = args.findIndex((arg) => !arg.startsWith("-"));
+  if (subcommandIndex < 0) return false;
+  const subcommand = args[subcommandIndex];
+  const subcommandArgs = args.slice(subcommandIndex + 1);
+  if (args.slice(0, subcommandIndex).some((arg) => !["--no-pager", "--no-replace-objects", "--literal-pathspecs"].includes(arg))) return false;
+  if (args.some((arg) => arg === "--output" || arg.startsWith("--output=") || ["--ext-diff", "--textconv", "--show-signature"].includes(arg))) return false;
+
+  if (READ_ONLY_GIT_COMMANDS.has(subcommand)) return true;
+  if (subcommand === "worktree") {
+    if (subcommandArgs[0] !== "list") return false;
+    return subcommandArgs.slice(1).every((arg) => ["--porcelain", "-z", "--verbose"].includes(arg));
+  }
+  if (subcommand === "branch") {
+    const mutating = new Set(["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "--unset-upstream"]);
+    if (subcommandArgs.some((arg) => mutating.has(arg))) return false;
+    const valueOptions = new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--color", "--column", "--abbrev"]);
+    let listMode = false;
+    for (let index = 0; index < subcommandArgs.length; index++) {
+      const arg = subcommandArgs[index];
+      if (arg === "--list" || arg === "-l") {
+        listMode = true;
+      } else if (["-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--no-color", "--no-column", "--show-current", "--ignore-case"].includes(arg) || arg.startsWith("--format=") || arg.startsWith("--sort=") || arg.startsWith("--color=") || arg.startsWith("--column=") || arg.startsWith("--abbrev=")) {
+        continue;
+      } else if (valueOptions.has(arg)) {
+        if (!subcommandArgs[++index]) return false;
+      } else if (!arg.startsWith("-") && listMode) {
+        continue;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (subcommand === "remote") {
+    if (subcommandArgs.length === 0 || subcommandArgs.every((arg) => arg === "-v" || arg === "--verbose")) return true;
+    const action = subcommandArgs[0];
+    return (action === "show" && subcommandArgs.slice(1).every((arg) => !arg.startsWith("-") || arg === "-n"))
+      || (action === "get-url" && subcommandArgs.slice(1).every((arg) => !arg.startsWith("-") || ["--all", "--push"].includes(arg)));
+  }
+  if (subcommand === "tag") {
+    if (subcommandArgs.length === 0) return true;
+    const listMode = subcommandArgs.some((arg) => arg === "-l" || arg === "--list" || arg.startsWith("--list="));
+    return listMode && !subcommandArgs.some((arg) => ["-d", "--delete", "-f", "--force", "-a", "--annotate", "-s", "--sign"].includes(arg));
+  }
+  if (subcommand === "config") {
+    const queryOptions = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--show-origin", "--show-scope"];
+    return queryOptions.some((option) => hasOption(subcommandArgs, option))
+      && !subcommandArgs.some((arg) => ["--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "--edit", "-e"].includes(arg));
+  }
+  return false;
+}
+
+function consumeGhOptions(args, valueOptions, flagOptions) {
+  let positionalCount = 0;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--web") return false;
+    if (flagOptions.has(arg)) continue;
+    const equalsOption = [...valueOptions].find((option) => arg.startsWith(`${option}=`));
+    if (equalsOption) {
+      if (arg.length === equalsOption.length + 1) return false;
+      continue;
+    }
+    if (valueOptions.has(arg)) {
+      if (!args[++index] || args[index].startsWith("-")) return false;
+      continue;
+    }
+    if (arg.startsWith("-") || ++positionalCount > 1) return false;
+  }
+  return true;
+}
+
+function isReadOnlyGh(args) {
+  if (args[0] !== "pr" || !["view", "checks", "diff"].includes(args[1])) return false;
+  const subcommand = args[1];
+  const rest = args.slice(2);
+  if (subcommand === "view") return consumeGhOptions(rest, new Set(["--json", "--jq", "--template", "--repo", "-R"]), new Set(["--comments"]));
+  if (subcommand === "checks") return consumeGhOptions(rest, new Set(["--interval", "--json", "--jq", "--template", "--repo", "-R"]), new Set(["--fail-fast", "--required", "--watch"]));
+  return consumeGhOptions(rest, new Set(["--color", "--repo", "-R"]), new Set(["--name-only", "--patch"]));
+}
+
+function isSafeSegment(tokens) {
+  if (tokens.length === 0 || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) return false;
+  const executableToken = tokens[0];
+  if (["env", "command", "builtin"].includes(executableToken)) return false;
   // Do not trust a safe basename reached through an attacker-controlled path.
   if (executableToken.includes("/") || executableToken.includes("\\")) return false;
-  const executable = executableToken;
-  if (!SAFE_COMMANDS.has(executable)) return false;
+  if (!SAFE_COMMANDS.has(executableToken)) return false;
 
-  const args = tokens.slice(index + 1);
+  const args = tokens.slice(1);
   if (args.some((arg) => FORBIDDEN_ARGUMENTS.has(arg))) return false;
-  if (executable === "sort" && args.some((arg) => arg === "-o" || arg.startsWith("--output=") || /^-o.+/.test(arg))) return false;
-  if (executable === "find" && args.some((arg) => ["-fprint", "-fprint0", "-fprintf"].includes(arg))) return false;
+  if (executableToken === "sort" && args.some((arg) => arg === "-o" || arg.startsWith("--output=") || /^-o.+/.test(arg) || arg === "--compress-program" || arg.startsWith("--compress-program="))) return false;
+  if (executableToken === "find" && args.some((arg) => ["-fprint", "-fprint0", "-fprintf", "-fls"].includes(arg))) return false;
+  if (executableToken === "rg" && args.some((arg) => arg === "--pre" || arg.startsWith("--pre=") || arg === "--pre-glob" || arg.startsWith("--pre-glob=") || arg === "--hostname-bin" || arg.startsWith("--hostname-bin="))) return false;
+  if (executableToken === "git" && !isReadOnlyGit(args)) return false;
+  if (executableToken === "gh" && !isReadOnlyGh(args)) return false;
 
-  if (executable === "git") {
-    const subcommand = args.find((arg) => !arg.startsWith("-"));
-    if (!new Set(["status", "log", "diff", "show", "branch", "remote", "ls-files", "ls-tree", "rev-parse", "describe", "tag", "config"]).has(subcommand)) return false;
-    if (args.some((arg) => arg === "--output" || arg.startsWith("--output="))) return false;
-    if (args.some((arg) => ["add", "commit", "push", "pull", "fetch", "merge", "rebase", "reset", "checkout", "restore", "clean", "stash", "init", "clone", "cherry-pick", "revert", "worktree", "-a", "-A", "-d", "-D", "--delete", "--move", "-m", "--set-upstream", "--set", "--unset", "--unset-all"].includes(arg))) return false;
-    if (subcommand === "config" && !args.some((arg) => ["--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin"].includes(arg))) return false;
-    if (subcommand === "remote" && args.some((arg) => ["add", "remove", "rename", "set-url", "set-head", "prune", "update"].includes(arg))) return false;
-  }
-
-  if (["npm", "yarn", "pnpm"].includes(executable)) {
+  if (["npm", "yarn", "pnpm"].includes(executableToken)) {
     const subcommand = args.find((arg) => !arg.startsWith("-"));
     if (!new Set(["list", "ls", "view", "info", "search", "outdated", "audit", "why"]).has(subcommand)) return false;
   }
 
   return true;
+}
+
+function isSafeCommandShape(command) {
+  if (typeof command !== "string" || command.trim() === "") return false;
+  const segments = shellSegments(command);
+  return segments !== null && segments.every(isSafeSegment);
 }
 
 export function isReadOnlyCommand(command) {

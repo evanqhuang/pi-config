@@ -1386,7 +1386,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     if (event.toolName === "bash") {
       const command = (event.input as { command?: unknown })?.command;
       if (!isReadOnlyCommand(command)) {
-        return blockPlanTool("PLAN Bash only permits a single recognized read-only command; use ctx_execute for sandboxed derivation.");
+        return blockPlanTool("PLAN Bash only permits recognized read-only commands or compositions; use ctx_execute for sandboxed derivation.");
       }
       // Pin the sandboxing decision to this call now, at approval time. A
       // mid-run mode switch can flip state.mode before this call's execute()

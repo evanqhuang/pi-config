@@ -1,6 +1,6 @@
-import { existsSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 export type PullRequestRef = {
 	url: string;
@@ -156,6 +156,18 @@ function branchRef(branch: string): string {
 	return branch.startsWith("refs/") ? branch : `refs/heads/${branch}`;
 }
 
+/**
+ * Guard-created worktrees have both a stable branch prefix and a stable path
+ * prefix. Keep these checks deliberately anchored: a PR number appearing in
+ * the middle of an otherwise unrelated branch or path is not guard identity.
+ */
+export function isGuardWorktree(record: WorktreeRecord, prNumber: number): boolean {
+	return (
+		record.branch?.startsWith(`refs/heads/pr-guard/${prNumber}-`) === true ||
+		basename(record.path).startsWith(`pr-${prNumber}-`)
+	);
+}
+
 function isPrimary(record: WorktreeRecord, primaryPath: string): boolean {
 	return canonicalRepositoryPath(record.path) === canonicalRepositoryPath(primaryPath);
 }
@@ -164,33 +176,51 @@ function eligible(record: WorktreeRecord, primaryPath: string): boolean {
 	return !record.bare && !record.prunable && !record.detached && !isPrimary(record, primaryPath);
 }
 
+function uniqueMatch(
+	matches: readonly WorktreeRecord[],
+	reason: "branch" | "sha",
+): WorktreeSelection | undefined {
+	if (matches.length > 1) return { kind: "ambiguous", reason, paths: matches.map((record) => record.path) };
+	if (matches.length === 1) return { kind: "match", reason, worktree: matches[0] };
+	return undefined;
+}
+
 export function selectMatchingWorktree(
 	records: readonly WorktreeRecord[],
 	input: WorktreeMatchInput,
 ): WorktreeSelection {
 	const candidates = records.filter((record) => eligible(record, input.primaryPath));
 	const expectedBranch = branchRef(input.headBranch);
-	const branchMatches = candidates.filter((record) => record.branch === expectedBranch);
-	if (branchMatches.length > 1) {
-		return { kind: "ambiguous", reason: "branch", paths: branchMatches.map((record) => record.path) };
-	}
-	if (branchMatches.length === 1) {
-		return { kind: "match", reason: "branch", worktree: branchMatches[0] };
-	}
 
-	const shaMatches = candidates.filter((record) => record.head.toLowerCase() === input.headSha.toLowerCase());
-	if (shaMatches.length > 1) {
-		return { kind: "ambiguous", reason: "sha", paths: shaMatches.map((record) => record.path) };
-	}
-	if (shaMatches.length === 1) {
-		return { kind: "match", reason: "sha", worktree: shaMatches[0] };
-	}
+	const branchMatch = uniqueMatch(
+		candidates.filter((record) => record.branch === expectedBranch),
+		"branch",
+	);
+	if (branchMatch) return branchMatch;
+
+	const shaMatch = uniqueMatch(
+		candidates.filter((record) => record.head.toLowerCase() === input.headSha.toLowerCase()),
+		"sha",
+	);
+	if (shaMatch) return shaMatch;
 	return { kind: "none", reason: "no matching worktree" };
 }
 
-function splitShellCommands(command: string): string[] | undefined {
+type ShellSegment = {
+	text: string;
+	start: number;
+	end: number;
+};
+
+function trimShellSegment(command: string, start: number, end: number): ShellSegment | undefined {
+	while (start < end && /\s/.test(command[start] ?? "")) start += 1;
+	while (end > start && /\s/.test(command[end - 1] ?? "")) end -= 1;
+	return start < end ? { text: command.slice(start, end), start, end } : undefined;
+}
+
+function splitShellCommandParts(command: string): ShellSegment[] | undefined {
 	if (!command.trim()) return undefined;
-	const segments: string[] = [];
+	const segments: ShellSegment[] = [];
 	let start = 0;
 	let quote: "'" | '"' | undefined;
 	let escaped = false;
@@ -224,28 +254,152 @@ function splitShellCommands(command: string): string[] | undefined {
 			return undefined;
 		}
 		if (quote) continue;
+		if (character === "&" && command[index + 1] !== "&") return undefined;
 		if (character === ";" || character === "\n" || character === "\r" || character === "|" || character === "&") {
-			const segment = command.slice(start, index).trim();
+			const segment = trimShellSegment(command, start, index);
 			if (segment) segments.push(segment);
 			if ((character === "|" || character === "&") && command[index + 1] === character) index += 1;
 			start = index + 1;
 		}
 	}
 	if (quote || escaped) return undefined;
-	const finalSegment = command.slice(start).trim();
+	const finalSegment = trimShellSegment(command, start, command.length);
 	if (finalSegment) segments.push(finalSegment);
 	return segments.length > 0 ? segments : undefined;
 }
 
+function splitShellCommands(command: string): string[] | undefined {
+	return splitShellCommandParts(command)?.map((segment) => segment.text);
+}
+
 function commandWords(command: string): string[] | undefined {
-	const words = command.trim().match(/(?:"(?:\\.|[^"])*"|'(?:[^']|'\\'')*'|\S+)/g);
-	return words?.map((word) => {
-		if (word.startsWith("'") && word.endsWith("'")) return word.slice(1, -1);
-		if (word.startsWith('"') && word.endsWith('"')) {
-			return word.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
+	const words = literalShellWords(command);
+	if (!words || words.some((word) => word.escaped || word.dynamic)) return undefined;
+	return words.map((word) => word.value);
+}
+
+type ShellWord = {
+	raw: string;
+	value: string;
+	quoted: boolean;
+	escaped: boolean;
+	dynamic: boolean;
+};
+
+/**
+ * Parse just enough shell syntax for the deliberately narrow bash-script
+ * allowance. A word is accepted only when it is a single literal (possibly
+ * quoted) token; shell expansion and composition are retained as rejection
+ * signals instead of being interpreted.
+ */
+function literalShellWords(command: string): ShellWord[] | undefined {
+	const words: ShellWord[] = [];
+	let index = 0;
+	while (index < command.length) {
+		while (index < command.length && /\s/.test(command[index] ?? "")) index += 1;
+		if (index >= command.length) break;
+
+		const start = index;
+		let value = "";
+		let quoted = false;
+		let escaped = false;
+		let dynamic = false;
+		let quote: "'" | '"' | undefined;
+		while (index < command.length) {
+			const character = command[index] ?? "";
+			if (!quote && /\s/.test(character)) break;
+			if (quote === "'") {
+				if (character === "'") {
+					quote = undefined;
+					index += 1;
+					continue;
+				}
+				value += character;
+				index += 1;
+				continue;
+			}
+			if (quote === '"') {
+				if (character === '"') {
+					quote = undefined;
+					index += 1;
+					continue;
+				}
+				if (character === "\\") {
+					const next = command[index + 1];
+					if (next === undefined) return undefined;
+					escaped = true;
+					index += 2;
+					value += next;
+					continue;
+				}
+				if (character === "$" || character === "`") dynamic = true;
+				value += character;
+				index += 1;
+				continue;
+			}
+
+			if (character === "'") {
+				quoted = true;
+				quote = "'";
+				index += 1;
+				continue;
+			}
+			if (character === '"') {
+				quoted = true;
+				quote = '"';
+				index += 1;
+				continue;
+			}
+			if (character === "\\") {
+				const next = command[index + 1];
+				if (next === undefined) return undefined;
+				escaped = true;
+				index += 2;
+				value += next;
+				continue;
+			}
+			if (character === "$" || character === "`" || character === "(" || character === ")" || character === "{" || character === "}") {
+				dynamic = true;
+				index += 1;
+				value += character;
+				continue;
+			}
+			if (character === "*" || character === "?" || character === "[") dynamic = true;
+			if (character === "<" || character === ">" || character === ";" || character === "|" || character === "&") {
+				return undefined;
+			}
+			value += character;
+			index += 1;
 		}
-		return word.replace(/\\(.)/g, "$1");
-	});
+		if (quote) return undefined;
+		if (index === start) return undefined;
+		words.push({ raw: command.slice(start, index), value, quoted, escaped, dynamic });
+	}
+	return words.length > 0 ? words : undefined;
+}
+
+function isLiteralScriptWord(word: ShellWord | undefined, allowShellQuoteEscape = false): word is ShellWord {
+	if (!word || !word.value || word.dynamic) return false;
+	if (!word.escaped) return true;
+	return allowShellQuoteEscape && shellQuote(word.value) === word.raw;
+}
+
+function isBashInterpreter(word: ShellWord | undefined): word is ShellWord {
+	return word !== undefined && !word.quoted && !word.escaped && !word.dynamic && basename(word.value) === "bash";
+}
+
+function isLexicallyWithin(root: string, candidate: string): boolean {
+	const relativePath = relative(canonicalRepositoryPath(root), canonicalRepositoryPath(candidate));
+	return relativePath === "" || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+}
+
+function isAllowedBashSyntaxCheck(segment: string, allowedDirectory: string | undefined): boolean {
+	if (!allowedDirectory) return false;
+	const words = literalShellWords(segment);
+	if (!words || words.length < 3 || !isBashInterpreter(words[0]) || words[1]?.value !== "-n") return false;
+	return words.slice(2).every(
+		(word) => isLiteralScriptWord(word, true) && isAbsolute(word.value) && isLexicallyWithin(allowedDirectory, word.value),
+	);
 }
 
 function stripEnvironment(words: string[]): string[] {
@@ -401,6 +555,7 @@ function segmentHasForbiddenCommand(
 ): boolean {
 	const words = commandWords(segment);
 	if (!words) return true;
+	if (isAllowedBashSyntaxCheck(segment, allowedDirectory)) return false;
 	const firstCommand = stripEnvironment(words)[0]?.toLowerCase();
 	if (!firstCommand || UNSUPPORTED_SHELL_COMMANDS.has(firstCommand)) return true;
 	if (
@@ -531,12 +686,87 @@ function rewriteShellPath(value: string, options: PathRewriteOptions): string {
 	});
 }
 
+function rewriteBashScriptPath(word: ShellWord | undefined, options: PathRewriteOptions, executable: boolean): string {
+	if (!isLiteralScriptWord(word)) throw new Error("bash script path must be a literal token");
+	if (word.value.startsWith("-")) throw new Error("bash script options are not allowed");
+
+	const rewritten = rewriteShellPath(word.value, options);
+	if (!isAbsolute(rewritten) || !isWithin(options.targetRoot, rewritten)) {
+		throw new Error("bash script path escapes the locked worktree");
+	}
+	try {
+		if (!statSync(rewritten).isFile()) throw new Error("bash script path is not a regular file");
+		if (executable) accessSync(rewritten, constants.X_OK);
+	} catch {
+		throw new Error(executable ? "bash script must be an executable regular file" : "bash syntax-check path must be a regular file");
+	}
+	return rewritten;
+}
+
+function rewriteBashScriptSegment(segment: string, options: PathRewriteOptions, shell: "bash" | "powershell"): string | undefined {
+	const words = literalShellWords(segment);
+	if (!words || !isBashInterpreter(words[0])) return undefined;
+
+	const quote = shell === "powershell" ? powershellQuote : shellQuote;
+	if (words[1]?.value === "-n") {
+		if (words.length < 3 || words[1].quoted || words[1].escaped || words[1].dynamic) {
+			throw new Error("bash syntax check must use only the literal -n option");
+		}
+		const paths = words.slice(2).map((word) => quote(rewriteBashScriptPath(word, options, false)));
+		return `bash -n ${paths.join(" ")}`;
+	}
+	if (words.length !== 2) throw new Error("bash direct execution accepts exactly one script path");
+	return quote(rewriteBashScriptPath(words[1], options, true));
+}
+
+function hasPowerShellCallOperator(command: string): boolean {
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = quote === character ? undefined : quote ?? character;
+			continue;
+		}
+		if (!quote && character === "&") {
+			if (command[index + 1] === "&") {
+				index += 1;
+				continue;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+function rewriteBashScripts(command: string, options: PathRewriteOptions, shell: "bash" | "powershell"): string {
+	if (shell === "powershell" && hasPowerShellCallOperator(command)) return command;
+	const segments = splitShellCommandParts(command);
+	if (!segments) return command;
+	let rewritten = command;
+	for (const segment of [...segments].reverse()) {
+		const replacement = rewriteBashScriptSegment(segment.text, options, shell);
+		if (replacement === undefined || replacement === segment.text) continue;
+		rewritten = `${rewritten.slice(0, segment.start)}${replacement}${rewritten.slice(segment.end)}`;
+	}
+	return rewritten;
+}
+
 export function rewriteShellCommand(
 	command: string,
 	options: PathRewriteOptions,
 	shell: "bash" | "powershell",
 ): string {
 	const quote = shell === "powershell" ? powershellQuote : shellQuote;
+	const scriptRewritten = rewriteBashScripts(command, options, shell);
 	const separator = String.raw`(^|(?:&&|\|\||;|\n)\s*)`;
 	const pathToken = String.raw`("(?:\\.|[^"])*"|'[^']*'|[^\s;&|]+)`;
 	const directoryPattern = new RegExp(
@@ -545,7 +775,7 @@ export function rewriteShellCommand(
 	);
 	const gitCwdPattern = new RegExp(`${separator}((?:[^\\s;&|]+/)?git)\\s+-C(?:\\s+)?${pathToken}`, "gi");
 
-	const directoryRewritten = command.replace(directoryPattern, (match, prefix: string, executable: string, path: string) => {
+	const directoryRewritten = scriptRewritten.replace(directoryPattern, (match, prefix: string, executable: string, path: string) => {
 		const rewritten = rewriteShellPath(path, options);
 		const normalizedExecutable = shell === "powershell" && /^(set-location|sl)$/i.test(executable) ? "Set-Location -LiteralPath" : executable;
 		return `${prefix}${normalizedExecutable} ${quote(rewritten)}`;

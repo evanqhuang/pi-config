@@ -481,10 +481,29 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const blockedBatch = await pi.handlers.get("tool_call")({ toolName: "ctx_batch_execute", input: { commands: [{ command: "touch x" }] } });
   assert.equal(blockedBatch.block, true);
   assert.equal(blockedBatch.terminate, undefined);
-  assert.equal((await pi.handlers.get("tool_call")({ toolName: "ctx_batch_execute", input: { commands: [{ command: "git status" }] } })), undefined);
-  const blockedBash = await pi.handlers.get("tool_call")({ toolName: "bash", input: { command: "touch x" } });
-  assert.equal(blockedBash.block, true);
-  assert.equal(blockedBash.terminate, undefined);
+  assert.equal((await pi.handlers.get("tool_call")({
+    toolName: "ctx_batch_execute",
+    input: { commands: [{ command: "git status && git remote -v" }, { command: "gh pr view 554 --json title" }] },
+  })), undefined);
+  const mixedBatch = await pi.handlers.get("tool_call")({
+    toolName: "ctx_batch_execute",
+    input: { commands: [{ command: "git status" }, { command: "git log -1 | touch x" }] },
+  });
+  assert.equal(mixedBatch.block, true);
+  for (const command of [
+    "git worktree list --porcelain",
+    "git branch -a --no-color",
+    "git status --short --branch && git remote -v",
+    "gh pr view 554 --json number,title",
+  ]) {
+    assert.equal(await pi.handlers.get("tool_call")({ toolName: "bash", input: { command } }), undefined, command);
+  }
+  for (const command of ["touch x", "git status && touch x", "git status > marker", "echo $(touch x)"]) {
+    const blockedBash = await pi.handlers.get("tool_call")({ toolName: "bash", input: { command } });
+    assert.equal(blockedBash.block, true, command);
+    assert.equal(blockedBash.terminate, undefined);
+    assert.match(blockedBash.reason, /recognized read-only commands or compositions/);
+  }
 
   const worker = await pi.handlers.get("tool_call")({ toolName: "Agent", input: { subagent_type: "worker" } });
   assert.equal(worker.block, true);

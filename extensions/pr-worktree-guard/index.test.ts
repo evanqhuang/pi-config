@@ -17,6 +17,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 
 const {
 	default: prWorktreeGuard,
+	chooseLocalBranch,
+	chooseWorktreePath,
 	routeInputPaths,
 	synchronizeStaleWorktree,
 	toolTargetsCurrentRepository,
@@ -323,6 +325,81 @@ describe("persistent repository enablement", () => {
 			expect(store.isEnabled(primary)).toBe(false);
 			await command.handler("status", context);
 			expect(notices.at(-1)).toContain("enabled: false");
+		});
+	});
+});
+
+function gitOnlyExtension(): ExtensionAPI {
+	return {
+		exec: async (command: string, args: string[], options: { cwd: string }) => {
+			if (command !== "git") throw new Error(`unexpected command: ${command}`);
+			return runGit(options.cwd, args);
+		},
+	} as unknown as ExtensionAPI;
+}
+
+function targetFor(headRefName: string): Parameters<typeof chooseLocalBranch>[2] {
+	return {
+		ref: { url: "https://github.com/example/hostelhawk/pull/588", owner: "example", repository: "hostelhawk", number: 588 },
+		repository: "example/hostelhawk",
+		number: 588,
+		url: "https://github.com/example/hostelhawk/pull/588",
+		state: "OPEN",
+		isDraft: false,
+		headRefName,
+		headRefOid: "a".repeat(40),
+		headRepository: "example/hostelhawk",
+	};
+}
+
+describe("fail-closed worktree creation names", () => {
+	test("blocks an existing authoritative source branch without probing a suffix", async () => {
+		await withRepositoryFixture(async ({ primary }) => {
+			const target = targetFor("main");
+			await expect(chooseLocalBranch(gitOnlyExtension(), primary, target)).rejects.toThrow(
+				"authoritative source branch main",
+			);
+			expect(runGit(primary, ["show-ref", "--verify", "--quiet", "refs/heads/pr-guard/588-main-2"]).code).toBe(1);
+		});
+	});
+
+	test("blocks an existing prior guard-generated branch variant", async () => {
+		await withRepositoryFixture(async ({ primary }) => {
+			const target = targetFor("feature");
+			git(primary, "branch", "pr-guard/588-feature-2");
+			await expect(chooseLocalBranch(gitOnlyExtension(), primary, target)).rejects.toThrow(
+				"guard-generated branch pr-guard/588-feature-2",
+			);
+		});
+	});
+
+	test("blocks occupied and prior generated worktree paths without returning a suffix", async () => {
+		await withRepositoryFixture(async ({ primary }) => {
+			const target = targetFor("feature");
+			const base = join(primary, ".worktrees", "pr-588-feature");
+			const outside = join(primary, "..", "pr-588-feature-2");
+			await mkdir(outside, { recursive: true });
+			expect(chooseWorktreePath(primary, target, [])).toBe(base);
+
+			await mkdir(base, { recursive: true });
+			expect(() => chooseWorktreePath(primary, target, [])).toThrow(base);
+			await rm(base, { recursive: true, force: true });
+
+			const sibling = `${base}-2`;
+			await mkdir(sibling, { recursive: true });
+			expect(() => chooseWorktreePath(primary, target, [])).toThrow(sibling);
+			await rm(sibling, { recursive: true, force: true });
+
+			const staleRecord = {
+				path: base,
+				head: "b".repeat(40),
+				branch: "refs/heads/pr-guard/588-feature",
+				detached: false,
+				bare: false,
+				prunable: true,
+			};
+			expect(() => chooseWorktreePath(primary, target, [staleRecord])).toThrow(base);
+			await rm(outside, { recursive: true, force: true });
 		});
 	});
 });

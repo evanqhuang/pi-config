@@ -103,26 +103,115 @@ test("child PLAN explicitly blocks orchestration and parent-owned plan tools", (
   ]);
 });
 
-test("batch execution is automatically allowed only for read-only command shapes", () => {
-  for (const command of ["git status --short", "git diff --stat", "rg -n TODO src", "find src -type f", "npm ls --depth=0"]) {
+test("read-only commands include inspection-only Git and GitHub workflows", () => {
+  for (const command of [
+    "git status --short",
+    "git status --short --branch",
+    "git diff --stat",
+    "git worktree list --porcelain",
+    "git branch -a --no-color",
+    "git remote -v",
+    "gh pr view 554 --json number,title,state",
+    "gh pr checks 554 --json name,state --required",
+    "gh pr diff 554 --name-only",
+    "rg -n TODO src",
+    "find src -type f",
+    "npm ls --depth=0",
+  ]) {
     assert.equal(isReadOnlyCommand(command), true, command);
   }
+});
+
+test("read-only composition validates every segment and respects quoting", () => {
+  for (const command of [
+    "git status && git remote -v",
+    "git status || git log -1",
+    "git status; git branch -a --no-color",
+    "git log --oneline | head -n 5",
+    "printf '%s\\n' 'a;b' 'c|d' '$HOME'",
+    "echo a\\;b",
+  ]) {
+    assert.equal(isReadOnlyCommand(command), true, command);
+  }
+  assert.equal(isReadOnlyBatch({
+    commands: [
+      { label: "status", command: "git status && git remote -v" },
+      { label: "pr", command: "gh pr view 554 --json title" },
+    ],
+  }), true);
+});
+
+test("read-only command policy fails closed on mutation and shell escapes", () => {
   for (const command of [
     "rm -rf /",
     "git status && touch marker",
+    "git status || touch marker",
+    "git status; touch marker",
+    "git status | touch marker",
+    "git worktree add ../other",
+    "git worktree remove ../other",
+    "git branch -D old",
+    "git branch new-branch",
+    "git remote add origin example.invalid/repo",
+    "git tag release",
+    "gh pr checkout 554",
+    "gh pr edit 554 --title changed",
+    "gh pr close 554",
+    "gh pr view 554 --web",
+    "gh pr view 554 --json",
+    "gh pr view 554 --unknown",
     "find . -exec touch marker {} ;",
     "find . -fprint marker",
+    "find . -fls marker",
+    "rg --pre=touch needle README.md",
+    "rg --pre 'sh -c touch' needle README.md",
+    "rg --pre-glob '*.md' needle README.md",
+    "rg --hostname-bin=touch needle README.md",
     "sort -o marker input",
     "sort --output=marker input",
+    "sort --compress-program=touch input",
+    "sort --compress-program touch input",
     "git diff --output=marker",
+    "git diff --textconv",
+    "git show --textconv HEAD:file",
+    "git log --show-signature",
     "/tmp/cat package.json",
     "node -e 'require(\"fs\").writeFileSync(\"x\",\"x\")'",
-    "git commit -am x",
+    "bash -c 'git status'",
+    "env git status",
+    "MODE=read git status",
+    "git status > marker",
+    "git status 2> marker",
+    "git status < input",
+    "git status <<EOF",
+    "git status &",
+    "git status |& cat",
+    "git status &&",
+    "| git status",
+    "git status\nrm marker",
+    "echo $(git status)",
+    "echo ${HOME}",
+    "echo `git status`",
+    "echo *",
+    "echo ~/src",
+    "echo \"$HOME\"",
+    "git\u00a0status",
+    "git\fstatus",
+    "git 'status",
+    "git status \\",
   ]) {
     assert.equal(isReadOnlyCommand(command), false, command);
   }
+});
+
+test("batch execution requires a non-empty array of safe command objects", () => {
   assert.equal(isReadOnlyBatch({ commands: [{ label: "status", command: "git status" }] }), true);
   assert.equal(isReadOnlyBatch({ commands: [{ label: "status", command: "git status" }, { label: "write", command: "touch x" }] }), false);
+  assert.equal(isReadOnlyBatch({ commands: [{ label: "mixed", command: "git status && touch x" }] }), false);
+  assert.equal(isReadOnlyBatch({ commands: [] }), false);
+  assert.equal(isReadOnlyBatch({ commands: [null] }), false);
+  assert.equal(isReadOnlyBatch({ commands: [{ label: "missing" }] }), false);
+  assert.equal(isReadOnlyBatch(null), false);
 });
 
 test("mode persistence defaults to YOLO and restores only known modes", () => {

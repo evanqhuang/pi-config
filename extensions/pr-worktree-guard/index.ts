@@ -1,5 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import {
 	isToolCallEventType,
 	type ExtensionAPI,
@@ -16,6 +24,7 @@ import {
 	rewriteShellCommand,
 	routeCustomToolWorkingDirectory,
 	selectMatchingWorktree,
+	isGuardWorktree,
 	shellQuote,
 	type PullRequestRef,
 	type WorktreeRecord,
@@ -309,29 +318,124 @@ async function branchExists(pi: ExtensionAPI, root: string, branch: string, sign
 	throw resultError(result, `unable to inspect local branch ${branch}`);
 }
 
-async function chooseLocalBranch(
+function isGuardGeneratedVariant(value: string, base: string): boolean {
+	if (value === base) return true;
+	const prefix = `${base}-`;
+	if (!value.startsWith(prefix)) return false;
+	const suffix = value.slice(prefix.length);
+	return suffix.length > 0 && suffix[0] >= "2" && suffix[0] <= "9" && [...suffix].every((character) => character >= "0" && character <= "9");
+}
+
+async function guardBranchConflicts(
+	pi: ExtensionAPI,
+	root: string,
+	base: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const result = await run(
+		pi,
+		"git",
+		["for-each-ref", "--format=%(refname:short)", "refs/heads/pr-guard/"],
+		root,
+		COMMAND_TIMEOUT_MS,
+		signal,
+	);
+	if (result.code !== 0) throw resultError(result, "unable to inspect guard-generated local branches");
+	const matches = result.stdout
+		.split(/\r?\n/)
+		.map((branch) => branch.trim())
+		.filter(Boolean)
+		.filter((branch) => isGuardGeneratedVariant(branch, base));
+	return [...new Set(matches)];
+}
+
+export async function chooseLocalBranch(
 	pi: ExtensionAPI,
 	root: string,
 	target: PullRequestTarget,
 	signal?: AbortSignal,
 ): Promise<string> {
 	const base = `pr-guard/${target.number}-${sanitizeSegment(target.headRefName)}`;
-	for (let index = 0; index < 100; index += 1) {
-		const branch = index === 0 ? base : `${base}-${index + 1}`;
-		if (!(await branchExists(pi, root, branch, signal))) return branch;
+	const [sourceExists, generatedBranches] = await Promise.all([
+		branchExists(pi, root, target.headRefName, signal),
+		guardBranchConflicts(pi, root, base, signal),
+	]);
+	const conflicts = sourceExists
+		? [`authoritative source branch ${target.headRefName}`]
+		: [];
+	for (const branch of generatedBranches) conflicts.push(`guard-generated branch ${branch}`);
+	if (conflicts.length > 0) {
+		throw new Error(
+			`cannot create local guard branch ${base}: existing ${conflicts.join(", ")}; repair the existing branch, attach to its worktree, or choose explicitly before retrying`,
+		);
 	}
-	throw new Error(`could not find an unused local branch name for PR #${target.number}`);
+	return base;
 }
 
-function chooseWorktreePath(root: string, target: PullRequestTarget, records: readonly WorktreeRecord[]): string {
-	const parent = join(root, ".worktrees");
-	const base = join(parent, `pr-${target.number}-${sanitizeSegment(target.headRefName)}`);
-	const occupied = new Set(records.map((record) => resolve(record.path)));
-	for (let index = 0; index < 100; index += 1) {
-		const candidate = index === 0 ? base : `${base}-${index + 1}`;
-		if (!occupied.has(resolve(candidate)) && !existsSync(candidate)) return candidate;
+function isMissingPathError(error: unknown): boolean {
+	return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function assertWorktreeParentSafe(parent: string): void {
+	try {
+		const parentStat = lstatSync(parent);
+		if (parentStat.isSymbolicLink()) throw new Error(`refusing to use symlinked worktree directory ${parent}`);
+		if (!parentStat.isDirectory()) throw new Error(`expected worktree parent is not a directory: ${parent}`);
+	} catch (error) {
+		if (isMissingPathError(error)) return;
+		if (error instanceof Error && error.message.startsWith("refusing to use symlinked")) throw error;
+		if (error instanceof Error && error.message.startsWith("expected worktree parent")) throw error;
+		throw new Error(`unable to inspect worktree parent ${parent}: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	throw new Error(`could not find an unused worktree path under ${parent}`);
+}
+
+function pathEntryExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch (error) {
+		if (isMissingPathError(error)) return false;
+		throw new Error(`unable to inspect worktree path ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+function worktreeDirectoryEntries(parent: string): string[] {
+	try {
+		return readdirSync(parent);
+	} catch (error) {
+		if (isMissingPathError(error)) return [];
+		throw new Error(`unable to inspect worktree parent ${parent}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+export function chooseWorktreePath(root: string, target: PullRequestTarget, records: readonly WorktreeRecord[]): string {
+	const parent = resolve(root, ".worktrees");
+	assertWorktreeParentSafe(parent);
+	const base = join(parent, `pr-${target.number}-${sanitizeSegment(target.headRefName)}`);
+	const baseName = base.slice(parent.length + 1);
+	const canonicalBase = canonicalRepositoryPath(base);
+	const conflicts = new Set<string>();
+
+	if (pathEntryExists(base)) conflicts.add(base);
+	for (const entry of worktreeDirectoryEntries(parent)) {
+		if (isGuardGeneratedVariant(entry, baseName)) conflicts.add(join(parent, entry));
+	}
+
+	for (const record of records) {
+		const recordPath = resolve(record.path);
+		const recordName = recordPath.slice(parent.length + 1);
+		if (dirname(recordPath) !== parent) continue;
+		if (recordPath === resolve(base) || canonicalRepositoryPath(record.path) === canonicalBase || isGuardGeneratedVariant(recordName, baseName)) {
+			conflicts.add(record.path);
+		}
+	}
+
+	if (conflicts.size > 0) {
+		throw new Error(
+			`cannot create PR #${target.number} worktree at ${base}: existing generated or registered path(s) ${[...conflicts].join(", ")}; repair the existing checkout, attach to it, or choose explicitly before retrying`,
+		);
+	}
+	return base;
 }
 
 function remoteRefName(target: PullRequestTarget): string {
@@ -361,20 +465,13 @@ async function fetchHead(
 	return remoteRef;
 }
 
-function isGuardWorktree(record: WorktreeRecord, target: PullRequestTarget): boolean {
-	return (
-		record.branch?.startsWith(`refs/heads/pr-guard/${target.number}-`) === true ||
-		basename(record.path).startsWith(`pr-${target.number}-`)
-	);
-}
-
 function findStaleGuardMatch(records: readonly WorktreeRecord[], root: string, target: PullRequestTarget): WorktreeRecord[] {
 	return records.filter(
 		(record) =>
 			resolve(record.path) !== resolve(root) &&
 			!record.bare &&
 			!record.prunable &&
-			isGuardWorktree(record, target) &&
+			isGuardWorktree(record, target.number) &&
 			record.head.toLowerCase() !== target.headRefOid.toLowerCase(),
 	);
 }
@@ -397,7 +494,7 @@ function findPrunableMatch(records: readonly WorktreeRecord[], root: string, tar
 			record.prunable &&
 			!record.bare &&
 			resolve(record.path) !== resolve(root) &&
-			(isGuardWorktree(record, target) ||
+			(isGuardWorktree(record, target.number) ||
 				record.branch === expectedBranch ||
 				record.head.toLowerCase() === target.headRefOid.toLowerCase()),
 	);
@@ -410,10 +507,10 @@ async function createWorktree(
 	records: WorktreeRecord[],
 	signal?: AbortSignal,
 ): Promise<WorktreeRecord> {
-	await ensureWorktreesIgnored(pi, root, signal);
-	const remoteRef = await fetchHead(pi, root, target, signal);
 	const branch = await chooseLocalBranch(pi, root, target, signal);
 	const path = chooseWorktreePath(root, target, records);
+	await ensureWorktreesIgnored(pi, root, signal);
+	const remoteRef = await fetchHead(pi, root, target, signal);
 	mkdirSync(resolve(path, ".."), { recursive: true });
 
 	const result = await run(pi, "git", ["worktree", "add", "-b", branch, path, remoteRef], root, FETCH_TIMEOUT_MS, signal);
