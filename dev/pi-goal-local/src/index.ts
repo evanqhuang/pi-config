@@ -73,6 +73,19 @@ type DeferredResumeRequest = {
 
 type DeferredResumeOutcome = "none" | "blocked" | "consumed" | "cancelled";
 
+type DeferredCompactionRestore = {
+  sessionId: string;
+  selectionGeneration: number;
+  nativeRetryPending: boolean;
+  loopId: string;
+  generation: number;
+  contextEpoch: number;
+  cycle: number;
+  planHash?: string;
+  epochMarkerId?: string;
+  epochMarkerHash?: string;
+};
+
 export function agentRunWasAborted(messages: readonly unknown[]): boolean {
   return messages.some(message => {
     if (!message || typeof message !== "object") return false;
@@ -456,7 +469,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let deferredResume: DeferredResumeRequest | undefined;
   let deferredResumeClaimInFlight = false;
   let resumePublicationPending = false;
-  let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
+  let deferredCompactionRestore: DeferredCompactionRestore | undefined;
   let recoveredCompactionEntryId: string | undefined;
 
   const deferredResumeTarget = (
@@ -499,6 +512,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
       && marker.contextEpoch === target.contextEpoch
       && marker.cycle === target.cycle
       && marker.plan.snapshotHash === target.planHash;
+  };
+
+  const deferredCompactionRestoreMatches = (
+    pending: DeferredCompactionRestore,
+    context: ExtensionContext,
+    loop: GoalStateV2 | undefined,
+  ): boolean => {
+    const selection = selectionOf(context);
+    return selection?.sessionId === pending.sessionId
+      && selectionGeneration === pending.selectionGeneration
+      && loopStateIsActive(loop)
+      && loop.loopId === pending.loopId
+      && loop.generation === pending.generation
+      && loop.contextEpoch === pending.contextEpoch
+      && loop.cycle === pending.cycle
+      && loop.plan.snapshotHash === pending.planHash
+      && loop.epochMarker?.id === pending.epochMarkerId
+      && loop.epochMarker?.hash === pending.epochMarkerHash;
   };
 
   const cancelDeferredResume = (
@@ -587,7 +618,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   const consumeSelectedCompactionContext = (
     context: ExtensionContext,
   ): { messages: GoalContextMessage[]; summary: string } | undefined => {
-    if (deferredCompactionRestore) return undefined;
+    if (deferredCompactionRestore?.nativeRetryPending) return undefined;
     const branch = context.sessionManager.getBranch();
     let latestGoalIndex = -1;
     let latestCompactionIndex = -1;
@@ -711,10 +742,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // context handler cannot observe a half-published epoch.
     if (event.willRetry) {
       const selection = selectionOf(compactCtx);
-      if (selection) {
+      const loop = controller.refreshLoop(compactCtx);
+      if (selection && loopStateIsActive(loop)) {
         deferredCompactionRestore = {
           sessionId: selection.sessionId,
           selectionGeneration,
+          nativeRetryPending: true,
+          loopId: loop.loopId,
+          generation: loop.generation,
+          contextEpoch: loop.contextEpoch,
+          cycle: loop.cycle,
+          planHash: loop.plan.snapshotHash,
+          epochMarkerId: loop.epochMarker?.id,
+          epochMarkerHash: loop.epochMarker?.hash,
         };
       }
       controller.restoreAfterCompaction(compactCtx, true);
@@ -745,14 +785,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // capture. Do not filter or return a fallback without a bounded proof.
     if (!lifecycleGuard) return { messages: [] };
     if (deferredCompactionRestore) {
-      const selection = selectionOf(activeCtx);
-      if (selection?.sessionId === deferredCompactionRestore.sessionId
-        && selectionGeneration === deferredCompactionRestore.selectionGeneration) {
+      if (!deferredCompactionRestoreMatches(deferredCompactionRestore, activeCtx, loop)) {
+        deferredCompactionRestore = undefined;
+      } else if (deferredCompactionRestore.nativeRetryPending) {
         // Native overflow recovery owns its immediate retry. Filtering its
         // transient context here can abort the retry before it settles.
         return;
       }
-      deferredCompactionRestore = undefined;
     }
     try {
       // The immediate post-compaction context callback can still carry the
@@ -998,15 +1037,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
     const pendingCompaction = deferredCompactionRestore;
     if (pendingCompaction) {
-      const selection = selectionOf(settledCtx);
-      const stillSelected = selection?.sessionId === pendingCompaction.sessionId
-        && selectionGeneration === pendingCompaction.selectionGeneration;
+      const loop = controller.refreshLoop(settledCtx);
+      const stillSelected = deferredCompactionRestoreMatches(pendingCompaction, settledCtx, loop);
       if (!stillSelected || aborted) {
         deferredCompactionRestore = undefined;
       } else {
-        // The native retry is settled, but a queued user message may still own
-        // the next turn. Keep the restoration pending until the runtime is
-        // idle, rather than publishing another follow-up into that turn.
+        // The native retry is settled, so later queued turns must use ordinary
+        // context filtering even if marker restoration must wait for idle.
+        pendingCompaction.nativeRetryPending = false;
         if (!settledCtx.isIdle() || settledCtx.hasPendingMessages()) return;
         deferredCompactionRestore = undefined;
         controller.restoreAfterCompaction(settledCtx);

@@ -906,6 +906,74 @@ describe("goal extension provider integration", () => {
     }
   });
 
+  it("ends overflow context bypass at settlement while idle restoration remains deferred", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-overflow-settled-"));
+
+    try {
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      await mkdir(join(root, "goal-loops", state.loopId), { recursive: true });
+      await writeFile(state.plan.snapshotPath!, "# Approved plan\nImplement the feature.\n", "utf8");
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      await harness.handlers.get("session_compact")!({
+        type: "session_compact",
+        reason: "overflow",
+        willRetry: true,
+      }, harness.ctx);
+      harness.setIdle(false);
+      harness.setPendingMessages(true);
+      await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
+
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "compactionSummary", content: "unsafe later summary" }],
+      }, harness.ctx) as { messages: Message[] };
+
+      expect(result.messages).toEqual([]);
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused" } });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bypass context filtering when overflow loop identity changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-overflow-identity-"));
+
+    try {
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      await mkdir(join(root, "goal-loops", state.loopId), { recursive: true });
+      await writeFile(state.plan.snapshotPath!, "# Approved plan\nImplement the feature.\n", "utf8");
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+
+      await harness.handlers.get("session_compact")!({
+        type: "session_compact",
+        reason: "overflow",
+        willRetry: true,
+      }, harness.ctx);
+      harness.branch.push({
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: { ...state, generation: state.generation + 1 },
+      });
+
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "compactionSummary", content: "unsafe transient summary" }],
+      }, harness.ctx) as { messages: Message[] };
+
+      expect(result.messages).toEqual([]);
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused" } });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reanchors after compaction when a queued continuation advances the leaf", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-integration-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
