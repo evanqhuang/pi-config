@@ -282,6 +282,24 @@ describe("durable goal context epochs", () => {
     expect(trusted.messages[1]).toEqual(summary);
   });
 
+  it("prefers a trusted compaction summary over an autonomous-only suffix", () => {
+    const current = state();
+    const summary = compaction("trusted current compacted context");
+    const tail = assistant("current autonomous work");
+
+    const ordinary = filterContextWithDisposition([summary, tail], current, {
+      bootstrap: bootstrap(current),
+    });
+    expect(ordinary.messages.slice(1)).toEqual([tail]);
+
+    const trusted = filterContextWithDisposition([summary, tail], current, {
+      bootstrap: bootstrap(current),
+      trustedCompactionSummary: "trusted current compacted context",
+    });
+    expect(trusted.disposition).toBe("fallback-safe");
+    expect(trusted.messages.slice(1)).toEqual([summary, tail]);
+  });
+
   it("keeps trusted compaction summaries subject to fallback size limits", () => {
     const current = state();
     const result = filterContextWithDisposition([compaction("x".repeat(1_000))], current, {

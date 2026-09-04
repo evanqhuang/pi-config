@@ -110,11 +110,13 @@ function integrationHarness(options: IntegrationHarnessOptions = {}) {
   const waitForIdle = vi.fn(() => idleBarrier.promise);
   let leafId = "integration-leaf";
   let sessionId = "integration-session";
+  let sessionEntries: any[] | undefined;
   let idle = true;
   let pendingMessages = false;
   let aborts = 0;
   const sessionManager = {
     getBranch: () => branch,
+    getEntries: () => sessionEntries ?? branch,
     buildContextEntries: () => branch,
     getSessionId: () => sessionId,
     getLeafId: () => leafId,
@@ -220,6 +222,7 @@ function integrationHarness(options: IntegrationHarnessOptions = {}) {
     sessionManager,
     setLeaf(next: string) { leafId = next; },
     setSessionId(next: string) { sessionId = next; },
+    setSessionEntries(next: any[]) { sessionEntries = next; },
     setIdle(next: boolean) { idle = next; },
     setPendingMessages(next: boolean) { pendingMessages = next; },
     get aborts() { return aborts; },
@@ -607,7 +610,7 @@ describe("goal extension provider integration", () => {
     }
   });
 
-  it("uses a one-shot successful-compaction handoff before idle marker publication", async () => {
+  it("uses a one-shot selected-branch compaction proof before idle marker publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-"));
     const artifactDir = join(root, "goal-loops", "loop-integration");
     const summary = "Current compacted implementation context.";
@@ -623,50 +626,84 @@ describe("goal extension provider integration", () => {
       state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
       const expectedMarker = controllerEpochMarker(state);
       state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
-      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+      harness.branch.push({
+        id: "integration-leaf",
+        parentId: null,
+        timestamp: new Date(0).toISOString(),
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: state,
+      });
       harness.setIdle(false);
-      await harness.handlers.get("session_before_compact")!({
-        type: "session_before_compact",
-        reason: "threshold",
-        willRetry: false,
-      }, harness.ctx);
+      const preservedAssistant = {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "preserved-call", name: "read", arguments: {} }],
+      };
+      const preservedResult = {
+        role: "toolResult",
+        toolCallId: "preserved-call",
+        content: [{ type: "text", text: "done" }],
+      };
+      const preservedFinal = {
+        role: "assistant",
+        content: [{ type: "text", text: "retry after compaction" }],
+        stopReason: "error",
+      };
+      harness.branch.push(
+        { id: "preserved-assistant", parentId: "integration-leaf", timestamp: new Date(1).toISOString(), type: "message", message: preservedAssistant },
+        { id: "preserved-result", parentId: "preserved-assistant", timestamp: new Date(2).toISOString(), type: "message", message: preservedResult },
+        { id: "preserved-final", parentId: "preserved-result", timestamp: new Date(3).toISOString(), type: "message", message: preservedFinal },
+      );
       const compactionEntry = {
         id: "compact-entry",
-        parentId: "integration-leaf",
+        parentId: "preserved-final",
         type: "compaction",
         summary,
+        firstKeptEntryId: "preserved-assistant",
         tokensBefore: 100_000,
-        timestamp: new Date(1).toISOString(),
+        timestamp: new Date(4).toISOString(),
       };
       harness.branch.push(compactionEntry);
       harness.setLeaf("compact-entry");
 
-      await harness.handlers.get("session_compact")!({
-        type: "session_compact",
-        reason: "threshold",
-        willRetry: false,
-        compactionEntry,
-      }, harness.ctx);
-      // Goal-owned follow-up publication may advance the selected leaf before
-      // the immediate provider context hook; ancestry, not leaf equality,
-      // proves that the successful compaction remains selected.
-      harness.branch.push({ id: "post-compact-child", parentId: "compact-entry", type: "custom_message" });
+      // Recovery is derived from durable selected-branch history and does not
+      // depend on either compaction lifecycle callback reaching the extension.
+      // Goal-owned follow-up traffic may also advance the selected leaf.
+      harness.branch.push({
+        id: "post-compact-child",
+        parentId: "compact-entry",
+        timestamp: new Date(5).toISOString(),
+        type: "custom",
+        customType: "post-compact-state",
+        data: {},
+      });
       harness.setLeaf("post-compact-child");
       expect(harness.sentMessages).toEqual([]);
 
+      const compactedMessages = [
+        { role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 4 },
+        preservedAssistant,
+        preservedResult,
+        preservedFinal,
+      ];
+      const staleMessages = [
+        { role: "compactionSummary", summary: "previous compacted context", tokensBefore: 80_000, timestamp: 0 },
+        expectedMarker,
+        ...Array.from({ length: 65 }, (_, index) => ({ role: "assistant", content: `stale pre-compaction message ${index}` })),
+      ];
       const result = await harness.handlers.get("context")!({
         type: "context",
-        messages: [{ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 }],
+        messages: staleMessages,
       }, harness.ctx) as { messages: Message[] };
 
-      expect(result.messages).toHaveLength(2);
+      expect(result.messages).toHaveLength(5);
       expect(result.messages[0]).toMatchObject({ customType: GOAL_CONTEXT_EPOCH_TYPE, details: state.epochMarker });
-      expect(result.messages[1]).toEqual({ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 });
+      expect(result.messages.slice(1)).toEqual(compactedMessages);
       expect(harness.aborts).toBe(0);
       expect(harness.branch.filter(entry => entry.customType === GOAL_STATE_V2_TYPE).at(-1))
         .toMatchObject({ data: { phase: "implementing" } });
 
-      // The handoff is consumed exactly once; it cannot bless a later markerless request.
+      // The branch proof is consumed exactly once; it cannot bless a later markerless request.
       await harness.handlers.get("context")!({
         type: "context",
         messages: [{ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 }],
@@ -680,8 +717,8 @@ describe("goal extension provider integration", () => {
     }
   });
 
-  it("does not use a stale handoff after compaction failure", async () => {
-    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-mismatch-"));
+  it("does not trust a compaction that predates the latest goal state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-old-compaction-"));
     const artifactDir = join(root, "goal-loops", "loop-integration");
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = root;
@@ -695,39 +732,16 @@ describe("goal extension provider integration", () => {
       state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
       const expectedMarker = controllerEpochMarker(state);
       state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
-      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
-      harness.setIdle(false);
-      await harness.handlers.get("session_before_compact")!({
-        type: "session_before_compact",
-        reason: "threshold",
-        willRetry: false,
-      }, harness.ctx);
-      await harness.handlers.get("session_compact_failed")!({
-        type: "session_compact_failed",
-        reason: "threshold",
-        willRetry: false,
-        aborted: true,
-      }, harness.ctx);
-      const compactionEntry = {
-        id: "compact-entry",
-        parentId: "integration-leaf",
+      harness.branch.push({
+        id: "old-compaction",
         type: "compaction",
-        summary: "trusted summary",
-        tokensBefore: 100_000,
-        timestamp: new Date(1).toISOString(),
-      };
-      harness.branch.push(compactionEntry);
-      harness.setLeaf("compact-entry");
+        summary: "old summary",
+      });
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
 
-      await harness.handlers.get("session_compact")!({
-        type: "session_compact",
-        reason: "threshold",
-        willRetry: false,
-        compactionEntry,
-      }, harness.ctx);
       await harness.handlers.get("context")!({
         type: "context",
-        messages: [{ role: "compactionSummary", summary: "trusted summary", tokensBefore: 100_000, timestamp: 1 }],
+        messages: [{ role: "compactionSummary", summary: "old summary", tokensBefore: 100_000, timestamp: 1 }],
       }, harness.ctx);
 
       expect(harness.aborts).toBe(1);
@@ -738,6 +752,71 @@ describe("goal extension provider integration", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["mismatched rebuilt summary", "failed later compaction"] as const)(
+    "does not use selected compaction proof after %s",
+    async mode => {
+      const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compaction-proof-reject-"));
+      const artifactDir = join(root, "goal-loops", "loop-integration");
+      const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = root;
+
+      try {
+        await mkdir(artifactDir, { recursive: true });
+        await writeFile(join(artifactDir, "original-plan.md"), "# Approved plan\nImplement the feature.\n", "utf8");
+        const harness = integrationHarness();
+        await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+        const state = loopState(root);
+        state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+        const expectedMarker = controllerEpochMarker(state);
+        state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
+        const stateEntry = {
+          id: "proof-state",
+          parentId: null,
+          timestamp: new Date(0).toISOString(),
+          type: "custom",
+          customType: GOAL_STATE_V2_TYPE,
+          data: state,
+        };
+        const compactionEntry = {
+          id: "proof-compaction",
+          parentId: "proof-state",
+          timestamp: new Date(1).toISOString(),
+          type: "compaction",
+          summary: "selected summary",
+          tokensBefore: 100_000,
+        };
+        harness.branch.push(stateEntry, compactionEntry);
+        harness.setLeaf("proof-compaction");
+
+        if (mode === "mismatched rebuilt summary") {
+          harness.setSessionEntries([
+            stateEntry,
+            { ...compactionEntry, summary: "different rebuilt summary" },
+          ]);
+        } else {
+          await harness.handlers.get("session_compact_failed")!({
+            type: "session_compact_failed",
+            reason: "threshold",
+            willRetry: false,
+            aborted: true,
+          }, harness.ctx);
+        }
+
+        await harness.handlers.get("context")!({
+          type: "context",
+          messages: [{ role: "compactionSummary", summary: "selected summary", tokensBefore: 100_000, timestamp: 1 }],
+        }, harness.ctx);
+
+        expect(harness.aborts).toBe(1);
+        expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused" } });
+      } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("reanchors pending verification with matching no-edit fallback guidance", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verify-reanchor-"));
@@ -808,17 +887,14 @@ describe("goal extension provider integration", () => {
 
       const result = await harness.handlers.get("context")!({
         type: "context",
-        messages: [
-          { role: "compactionSummary", content: "recovered summary" },
-          { role: "assistant", content: [{ type: "text", text: "ready to continue" }] },
-        ],
-      }, harness.ctx) as { messages: Message[] };
-      expect(result.messages.filter(message => (message as { role?: string }).role === "custom")).toHaveLength(1);
+        messages: [{ role: "compactionSummary", content: "unsafe transient summary" }],
+      }, harness.ctx);
+      expect(result).toBeUndefined();
       expect(harness.aborts).toBe(0);
 
       harness.setIdle(true);
       await harness.handlers.get("agent_settled")!({ type: "agent_settled" }, harness.ctx);
-      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(1));
       await vi.waitFor(() => expect(
         harness.sentMessages.filter(message => message.customType === GOAL_CONTEXT_EPOCH_TYPE),
       ).toHaveLength(1));

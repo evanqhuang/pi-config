@@ -1,7 +1,8 @@
-import type {
-  AutocompleteProviderFactory,
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  buildSessionContext,
+  type AutocompleteProviderFactory,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { parseGoalCommand, formatGoalStatus } from "./commands.js";
 import { GoalController, type GoalLoopStartOptions } from "./controller.js";
@@ -22,6 +23,7 @@ import {
   type PlanBridge,
 } from "./plan-bridge.js";
 import {
+  GOAL_STATE_V2_TYPE,
   type GoalLoopEntry,
   type GoalLoopPhase,
   type GoalStateV1,
@@ -70,25 +72,6 @@ type DeferredResumeRequest = {
 };
 
 type DeferredResumeOutcome = "none" | "blocked" | "consumed" | "cancelled";
-
-type CompactionAttempt = {
-  sessionId: string;
-  parentLeafId: string;
-  selectionGeneration: number;
-  reason: "manual" | "threshold";
-  loopId: string;
-  generation: number;
-  contextEpoch: number;
-  cycle: number;
-  planHash: string;
-  epochMarkerId: string;
-  epochMarkerHash: string;
-};
-
-type SuccessfulCompactionHandoff = Omit<CompactionAttempt, "parentLeafId" | "reason"> & {
-  compactionEntryId: string;
-  summary: string;
-};
 
 export function agentRunWasAborted(messages: readonly unknown[]): boolean {
   return messages.some(message => {
@@ -474,8 +457,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let deferredResumeClaimInFlight = false;
   let resumePublicationPending = false;
   let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
-  let compactionAttempt: CompactionAttempt | undefined;
-  let successfulCompactionHandoff: SuccessfulCompactionHandoff | undefined;
+  let recoveredCompactionEntryId: string | undefined;
 
   const deferredResumeTarget = (
     marker: GoalStateV1 | GoalStateV2 | undefined,
@@ -539,8 +521,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     cancelDeferredResume(reason, notifyCtx);
     resumePublicationPending = false;
     deferredCompactionRestore = undefined;
-    compactionAttempt = undefined;
-    successfulCompactionHandoff = undefined;
+    recoveredCompactionEntryId = undefined;
   };
 
   const consumeDeferredResume = async (
@@ -603,36 +584,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
     }
   };
 
-  const consumeSuccessfulCompactionHandoff = (
+  const consumeSelectedCompactionContext = (
     context: ExtensionContext,
-    loop: GoalStateV2,
-    incomingMessages: readonly GoalContextMessage[],
-  ): SuccessfulCompactionHandoff | undefined => {
-    const pending = successfulCompactionHandoff;
-    if (!pending) return undefined;
-    successfulCompactionHandoff = undefined;
-    const selection = selectionOf(context);
-    const compactionStillSelected = context.sessionManager.getBranch().some(entry =>
-      entry.id === pending.compactionEntryId
-    );
-    const summaryPresent = incomingMessages.some(message => {
-      const candidate = message as { role?: unknown; summary?: unknown };
-      return candidate.role === "compactionSummary" && candidate.summary === pending.summary;
-    });
-    const marker = loop.epochMarker;
-    return selection?.sessionId === pending.sessionId
-      && compactionStillSelected
-      && selectionGeneration === pending.selectionGeneration
-      && loop.loopId === pending.loopId
-      && loop.generation === pending.generation
-      && loop.contextEpoch === pending.contextEpoch
-      && loop.cycle === pending.cycle
-      && loop.plan.snapshotHash === pending.planHash
-      && marker?.id === pending.epochMarkerId
-      && marker.hash === pending.epochMarkerHash
-      && summaryPresent
-      ? pending
-      : undefined;
+  ): { messages: GoalContextMessage[]; summary: string } | undefined => {
+    if (deferredCompactionRestore) return undefined;
+    const branch = context.sessionManager.getBranch();
+    let latestGoalIndex = -1;
+    let latestCompactionIndex = -1;
+    for (let index = branch.length - 1; index >= 0; index -= 1) {
+      const entry = branch[index] as { type?: unknown; customType?: unknown };
+      if (latestCompactionIndex < 0 && entry.type === "compaction") latestCompactionIndex = index;
+      if (latestGoalIndex < 0 && entry.type === "custom" && entry.customType === GOAL_STATE_V2_TYPE) {
+        latestGoalIndex = index;
+      }
+      if (latestGoalIndex >= 0 && latestCompactionIndex >= 0) break;
+    }
+    if (latestCompactionIndex < 0 || latestCompactionIndex <= latestGoalIndex) return undefined;
+    const compaction = branch[latestCompactionIndex] as { id?: unknown; summary?: unknown };
+    if (typeof compaction.id !== "string"
+      || typeof compaction.summary !== "string"
+      || compaction.id === recoveredCompactionEntryId) return undefined;
+    const rebuiltMessages = buildSessionContext(
+      context.sessionManager.getEntries(),
+      context.sessionManager.getLeafId(),
+    ).messages as GoalContextMessage[];
+    let rebuiltSummary: string | undefined;
+    for (let index = rebuiltMessages.length - 1; index >= 0; index -= 1) {
+      const message = rebuiltMessages[index] as { role?: unknown; summary?: unknown };
+      if (message.role !== "compactionSummary") continue;
+      rebuiltSummary = typeof message.summary === "string" ? message.summary : undefined;
+      break;
+    }
+    if (rebuiltSummary !== compaction.summary) return undefined;
+    recoveredCompactionEntryId = compaction.id;
+    return { messages: [...rebuiltMessages], summary: compaction.summary };
   };
 
   const eventUnsubscribers: Array<() => void> = [];
@@ -693,31 +678,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.prepareForTreeNavigation(treeCtx);
   });
 
-  pi.on("session_before_compact", (event, compactCtx) => {
+  pi.on("session_before_compact", () => {
     deferredCompactionRestore = undefined;
-    compactionAttempt = undefined;
-    successfulCompactionHandoff = undefined;
-    if (event.willRetry || event.reason === "overflow") return;
-    const selection = selectionOf(compactCtx);
-    const loop = controller.refreshLoop(compactCtx);
-    if (selection?.leafId
-      && loopStateIsActive(loop)
-      && loop.epochMarker
-      && typeof loop.plan.snapshotHash === "string") {
-      compactionAttempt = {
-        sessionId: selection.sessionId,
-        parentLeafId: selection.leafId,
-        selectionGeneration,
-        reason: event.reason,
-        loopId: loop.loopId,
-        generation: loop.generation,
-        contextEpoch: loop.contextEpoch,
-        cycle: loop.cycle,
-        planHash: loop.plan.snapshotHash,
-        epochMarkerId: loop.epochMarker.id,
-        epochMarkerHash: loop.epochMarker.hash,
-      };
-    }
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -731,10 +693,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
       handler: (event: unknown, context: ExtensionContext) => void,
     ): void;
   };
-  compactionFailureEvents.on("session_compact_failed", () => {
+  compactionFailureEvents.on("session_compact_failed", (_event, failedCtx) => {
     deferredCompactionRestore = undefined;
-    compactionAttempt = undefined;
-    successfulCompactionHandoff = undefined;
+    const latestCompaction = failedCtx.sessionManager.getBranch()
+      .filter(entry => entry.type === "compaction")
+      .at(-1);
+    if (typeof latestCompaction?.id === "string") {
+      recoveredCompactionEntryId = latestCompaction.id;
+    }
   });
 
   pi.on("session_compact", (event, compactCtx) => {
@@ -743,10 +709,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // Native overflow recovery retries immediately after this event. Defer
     // goal-owned marker/continuation delivery until that retry settles so the
     // context handler cannot observe a half-published epoch.
-    const attempt = compactionAttempt;
-    compactionAttempt = undefined;
     if (event.willRetry) {
-      successfulCompactionHandoff = undefined;
       const selection = selectionOf(compactCtx);
       if (selection) {
         deferredCompactionRestore = {
@@ -756,38 +719,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
       }
       controller.restoreAfterCompaction(compactCtx, true);
       return;
-    }
-    // Capture the authoritative context rebuilt by Pi before this successful
-    // compaction event. While the current run is still streaming, the normal
-    // idle-only marker publication cannot run before the next context hook.
-    // This one-shot handoff lets only that immediate request retain the exact
-    // current compaction summary under the existing epoch bootstrap.
-    successfulCompactionHandoff = undefined;
-    const selection = selectionOf(compactCtx);
-    const compactionEntry = event.compactionEntry;
-    const compactionSummary = typeof compactionEntry?.summary === "string"
-      ? compactionEntry.summary
-      : undefined;
-    if (attempt
-      && compactionEntry
-      && selection?.sessionId === attempt.sessionId
-      && selectionGeneration === attempt.selectionGeneration
-      && event.reason === attempt.reason
-      && compactionEntry.parentId === attempt.parentLeafId
-      && compactionSummary !== undefined) {
-      successfulCompactionHandoff = {
-        sessionId: attempt.sessionId,
-        selectionGeneration: attempt.selectionGeneration,
-        loopId: attempt.loopId,
-        generation: attempt.generation,
-        contextEpoch: attempt.contextEpoch,
-        cycle: attempt.cycle,
-        planHash: attempt.planHash,
-        epochMarkerId: attempt.epochMarkerId,
-        epochMarkerHash: attempt.epochMarkerHash,
-        compactionEntryId: compactionEntry.id,
-        summary: compactionSummary,
-      };
     }
     // Compaction is a valid context boundary, but it is not tree navigation.
     // Keep its existing active-loop rebootstrap behavior without granting the
@@ -813,14 +744,25 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // Navigation may have selected this loop between refreshLoop and guard
     // capture. Do not filter or return a fallback without a bounded proof.
     if (!lifecycleGuard) return { messages: [] };
-    try {
-      const anchored = filterContextWithDisposition(event.messages, loop);
-      if (anchored.disposition === "matched") {
-        successfulCompactionHandoff = undefined;
-        return { messages: anchored.messages };
+    if (deferredCompactionRestore) {
+      const selection = selectionOf(activeCtx);
+      if (selection?.sessionId === deferredCompactionRestore.sessionId
+        && selectionGeneration === deferredCompactionRestore.selectionGeneration) {
+        // Native overflow recovery owns its immediate retry. Filtering its
+        // transient context here can abort the retry before it settles.
+        return;
       }
+      deferredCompactionRestore = undefined;
+    }
+    try {
+      // The immediate post-compaction context callback can still carry the
+      // pre-compaction payload. Prefer the selected session's rebuilt context
+      // whenever its durable branch proves a newer active-loop compaction.
+      const selectedCompaction = consumeSelectedCompactionContext(activeCtx);
+      const sourceMessages = selectedCompaction?.messages ?? event.messages;
+      const anchored = filterContextWithDisposition(sourceMessages, loop);
+      if (anchored.disposition === "matched") return { messages: anchored.messages };
       if (anchored.disposition === "rejected") {
-        successfulCompactionHandoff = undefined;
         // Integrity failures are not evidence that an explicit tree branch may
         // safely adopt a fresh epoch. Keep this path fail-closed.
         controller.invalidateLoopReanchorEligibility();
@@ -836,30 +778,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
       const bootstrap = await contextBootstrap(activeCtx, loop, lifecycleGuard);
       requireCurrentContextBootstrap(lifecycleGuard);
       const settings = loadGoalLoopSettings(activeCtx.cwd);
-      let fallback = filterContextWithDisposition(event.messages, loop, {
+      const fallback = filterContextWithDisposition(sourceMessages, loop, {
         bootstrap,
         maxBootstrapBytes: settings.maxBootstrapBytes,
+        trustedCompactionSummary: selectedCompaction?.summary,
       });
-      if (fallback.disposition === "fallback-safe") {
-        successfulCompactionHandoff = undefined;
-        return { messages: fallback.messages };
-      }
-      if (fallback.disposition === "fallback-unsafe"
-        && fallback.reason === MISSING_SAFE_SUFFIX_REASON) {
-        const handoff = consumeSuccessfulCompactionHandoff(activeCtx, loop, event.messages);
-        if (handoff) {
-          const recovered = filterContextWithDisposition(event.messages, loop, {
-            bootstrap,
-            maxBootstrapBytes: settings.maxBootstrapBytes,
-            trustedCompactionSummary: handoff.summary,
-          });
-          if (recovered.disposition === "fallback-safe" || recovered.disposition === "matched") {
-            return { messages: recovered.messages };
-          }
-          fallback = recovered;
-        }
-      }
-      successfulCompactionHandoff = undefined;
+      if (fallback.disposition === "fallback-safe") return { messages: fallback.messages };
       if (fallback.disposition === "fallback-unsafe"
         && fallback.reason === MISSING_SAFE_SUFFIX_REASON) {
         // This is the one expected gap after explicit tree navigation: the

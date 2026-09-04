@@ -802,10 +802,10 @@ export function filterContextWithDisposition(
   const parsedMarker = parseContextEpochMarker(marker, state, maxBootstrapBytes);
   const suffix = !markerIssue && !hasForeignOrStaleWithoutCurrent
     ? safeSuffix(messages, maxFallbackMessages, maxFallbackBytes)
-      ?? safeAutonomousSuffix(messages, maxFallbackMessages, maxFallbackBytes)
       ?? (typeof filterOptions?.trustedCompactionSummary === "string"
         ? safeCompactionSuffix(messages, filterOptions.trustedCompactionSummary, maxFallbackMessages, maxFallbackBytes)
         : undefined)
+      ?? safeAutonomousSuffix(messages, maxFallbackMessages, maxFallbackBytes)
     : undefined;
   if (suffix) {
     return {
