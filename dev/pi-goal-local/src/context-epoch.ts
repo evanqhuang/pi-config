@@ -104,6 +104,8 @@ export interface ContextFilterOptions {
   maxFallbackMessages?: number;
   maxFallbackBytes?: number;
   timestamp?: number;
+  /** Exact current compaction summary authorized by a lifecycle-bound handoff. */
+  trustedCompactionSummary?: string;
 }
 
 type ContextFilterArgument = ContextFilterOptions | ContextEpochBootstrap | ContextEpochBootstrapInput;
@@ -635,6 +637,37 @@ function safeAutonomousSuffix(
   }
 }
 
+function safeCompactionSuffix(
+  messages: readonly GoalContextMessage[],
+  trustedSummary: string,
+  maxMessages: number,
+  maxBytes: number,
+): GoalContextMessage[] | undefined {
+  let boundary = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isRecord(message) && message.role === "compactionSummary") {
+      boundary = index;
+      break;
+    }
+  }
+  if (boundary < 0) return undefined;
+  const boundaryMessage = messages[boundary];
+  if (!isRecord(boundaryMessage) || boundaryMessage.summary !== trustedSummary) return undefined;
+  const suffix = messages.slice(boundary);
+  if (suffix.length > maxMessages) return undefined;
+  const allowed = suffix.every((message, index) => isRecord(message)
+    && (index === 0
+      ? message.role === "compactionSummary"
+      : message.role === "user" || message.role === "assistant" || message.role === "toolResult"));
+  if (!allowed || !hasCompleteToolTraffic(suffix.slice(1))) return undefined;
+  try {
+    return Buffer.byteLength(canonicalJson(suffix), "utf8") <= maxBytes ? [...suffix] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeFilterOptions(options: ContextFilterArgument | undefined): ContextFilterOptions | undefined {
   if (options === undefined) return undefined;
   if (isRecord(options) && "originalPlan" in options) {
@@ -770,6 +803,9 @@ export function filterContextWithDisposition(
   const suffix = !markerIssue && !hasForeignOrStaleWithoutCurrent
     ? safeSuffix(messages, maxFallbackMessages, maxFallbackBytes)
       ?? safeAutonomousSuffix(messages, maxFallbackMessages, maxFallbackBytes)
+      ?? (typeof filterOptions?.trustedCompactionSummary === "string"
+        ? safeCompactionSuffix(messages, filterOptions.trustedCompactionSummary, maxFallbackMessages, maxFallbackBytes)
+        : undefined)
     : undefined;
   if (suffix) {
     return {

@@ -263,6 +263,53 @@ describe("durable goal context epochs", () => {
     expect(JSON.stringify(result.messages)).not.toContain("orphaned old assistant");
   });
 
+  it("retains a lifecycle-trusted current compaction summary but never trusts it by default", () => {
+    const current = state();
+    const currentBootstrap = bootstrap(current);
+    const summary = compaction("trusted current compacted context");
+
+    const ordinary = filterContextWithDisposition([summary], current, { bootstrap: currentBootstrap });
+    expect(ordinary.disposition).toBe("fallback-unsafe");
+    expect(ordinary.messages).toHaveLength(1);
+
+    const trusted = filterContextWithDisposition([summary], current, {
+      bootstrap: currentBootstrap,
+      trustedCompactionSummary: "trusted current compacted context",
+    });
+    expect(trusted.disposition).toBe("fallback-safe");
+    expect(trusted.safeSuffixIncluded).toBe(true);
+    expect(trusted.messages).toHaveLength(2);
+    expect(trusted.messages[1]).toEqual(summary);
+  });
+
+  it("keeps trusted compaction summaries subject to fallback size limits", () => {
+    const current = state();
+    const result = filterContextWithDisposition([compaction("x".repeat(1_000))], current, {
+      bootstrap: bootstrap(current),
+      trustedCompactionSummary: "x".repeat(1_000),
+      maxFallbackBytes: 100,
+    });
+
+    expect(result.disposition).toBe("fallback-unsafe");
+    expect(result.safeSuffixIncluded).toBe(false);
+    expect(result.messages).toHaveLength(1);
+  });
+
+  it("rejects a later compaction summary that does not match the lifecycle handoff", () => {
+    const current = state();
+    const result = filterContextWithDisposition([
+      compaction("trusted current summary"),
+      compaction("later unrelated summary"),
+    ], current, {
+      bootstrap: bootstrap(current),
+      trustedCompactionSummary: "trusted current summary",
+    });
+
+    expect(result.disposition).toBe("fallback-unsafe");
+    expect(result.safeSuffixIncluded).toBe(false);
+    expect(result.messages).toHaveLength(1);
+  });
+
   it("binds pending verification metadata into bootstrap hashes and roundtrips it", () => {
     const legacy = state();
     const pending = state({ pendingVerificationEntry: true });

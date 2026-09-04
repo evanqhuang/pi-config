@@ -14,6 +14,7 @@ import {
   createContextEpochBootstrap,
   filterContextWithDisposition,
   type ContextEpochBootstrap,
+  type GoalContextMessage,
 } from "./context-epoch.js";
 import {
   createPlanBridge,
@@ -33,6 +34,7 @@ const GOAL_PLAN_FLAG = "goal-plan";
 const GOAL_MAX_CYCLES_FLAG = "goal-max-cycles";
 const GOAL_VERIFY_FLAG = "verify";
 const GOAL_IMPLEMENT_FLAG = "implement";
+const MISSING_SAFE_SUFFIX_REASON = "No safe complete user-led turn suffix was established; automatic continuation must pause.";
 
 /** The provider type is re-exported structurally by the coding-agent package. */
 type AutocompleteProvider = Parameters<AutocompleteProviderFactory>[0];
@@ -68,6 +70,20 @@ type DeferredResumeRequest = {
 };
 
 type DeferredResumeOutcome = "none" | "blocked" | "consumed" | "cancelled";
+
+type SuccessfulCompactionHandoff = {
+  sessionId: string;
+  leafId: string;
+  selectionGeneration: number;
+  loopId: string;
+  generation: number;
+  contextEpoch: number;
+  cycle: number;
+  planHash: string;
+  epochMarkerId: string;
+  epochMarkerHash: string;
+  summary: string;
+};
 
 export function agentRunWasAborted(messages: readonly unknown[]): boolean {
   return messages.some(message => {
@@ -453,6 +469,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let deferredResumeClaimInFlight = false;
   let resumePublicationPending = false;
   let deferredCompactionRestore: { sessionId: string; selectionGeneration: number } | undefined;
+  let successfulCompactionHandoff: SuccessfulCompactionHandoff | undefined;
 
   const deferredResumeTarget = (
     marker: GoalStateV1 | GoalStateV2 | undefined,
@@ -516,6 +533,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     cancelDeferredResume(reason, notifyCtx);
     resumePublicationPending = false;
     deferredCompactionRestore = undefined;
+    successfulCompactionHandoff = undefined;
   };
 
   const consumeDeferredResume = async (
@@ -578,6 +596,35 @@ export default function goalExtension(pi: ExtensionAPI): void {
     }
   };
 
+  const consumeSuccessfulCompactionHandoff = (
+    context: ExtensionContext,
+    loop: GoalStateV2,
+    incomingMessages: readonly GoalContextMessage[],
+  ): SuccessfulCompactionHandoff | undefined => {
+    const pending = successfulCompactionHandoff;
+    if (!pending) return undefined;
+    successfulCompactionHandoff = undefined;
+    const selection = selectionOf(context);
+    const summaryPresent = incomingMessages.some(message => {
+      const candidate = message as { role?: unknown; summary?: unknown };
+      return candidate.role === "compactionSummary" && candidate.summary === pending.summary;
+    });
+    const marker = loop.epochMarker;
+    return selection?.sessionId === pending.sessionId
+      && selection.leafId === pending.leafId
+      && selectionGeneration === pending.selectionGeneration
+      && loop.loopId === pending.loopId
+      && loop.generation === pending.generation
+      && loop.contextEpoch === pending.contextEpoch
+      && loop.cycle === pending.cycle
+      && loop.plan.snapshotHash === pending.planHash
+      && marker?.id === pending.epochMarkerId
+      && marker.hash === pending.epochMarkerHash
+      && summaryPresent
+      ? pending
+      : undefined;
+  };
+
   const eventUnsubscribers: Array<() => void> = [];
 
   pi.on("session_start", (_event, nextCtx) => {
@@ -638,6 +685,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
   pi.on("session_before_compact", () => {
     deferredCompactionRestore = undefined;
+    successfulCompactionHandoff = undefined;
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -652,6 +700,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     // goal-owned marker/continuation delivery until that retry settles so the
     // context handler cannot observe a half-published epoch.
     if (event.willRetry) {
+      successfulCompactionHandoff = undefined;
       const selection = selectionOf(compactCtx);
       if (selection) {
         deferredCompactionRestore = {
@@ -661,6 +710,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
       }
       controller.restoreAfterCompaction(compactCtx, true);
       return;
+    }
+    // Capture the authoritative context rebuilt by Pi before this successful
+    // compaction event. While the current run is still streaming, the normal
+    // idle-only marker publication cannot run before the next context hook.
+    // This one-shot handoff lets only that immediate request retain the exact
+    // current compaction summary under the existing epoch bootstrap.
+    successfulCompactionHandoff = undefined;
+    const selection = selectionOf(compactCtx);
+    const loop = controller.refreshLoop(compactCtx);
+    const compactionEntry = event.compactionEntry;
+    const compactionSummary = typeof compactionEntry?.summary === "string"
+      ? compactionEntry.summary
+      : undefined;
+    if (compactionEntry
+      && selection?.leafId
+      && selection.leafId === compactionEntry.id
+      && loopStateIsActive(loop)
+      && loop.epochMarker
+      && typeof loop.plan.snapshotHash === "string"
+      && compactionSummary !== undefined) {
+      successfulCompactionHandoff = {
+        sessionId: selection.sessionId,
+        leafId: selection.leafId,
+        selectionGeneration,
+        loopId: loop.loopId,
+        generation: loop.generation,
+        contextEpoch: loop.contextEpoch,
+        cycle: loop.cycle,
+        planHash: loop.plan.snapshotHash,
+        epochMarkerId: loop.epochMarker.id,
+        epochMarkerHash: loop.epochMarker.hash,
+        summary: compactionSummary,
+      };
     }
     // Compaction is a valid context boundary, but it is not tree navigation.
     // Keep its existing active-loop rebootstrap behavior without granting the
@@ -688,8 +770,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
     if (!lifecycleGuard) return { messages: [] };
     try {
       const anchored = filterContextWithDisposition(event.messages, loop);
-      if (anchored.disposition === "matched") return { messages: anchored.messages };
+      if (anchored.disposition === "matched") {
+        successfulCompactionHandoff = undefined;
+        return { messages: anchored.messages };
+      }
       if (anchored.disposition === "rejected") {
+        successfulCompactionHandoff = undefined;
         // Integrity failures are not evidence that an explicit tree branch may
         // safely adopt a fresh epoch. Keep this path fail-closed.
         controller.invalidateLoopReanchorEligibility();
@@ -705,13 +791,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
       const bootstrap = await contextBootstrap(activeCtx, loop, lifecycleGuard);
       requireCurrentContextBootstrap(lifecycleGuard);
       const settings = loadGoalLoopSettings(activeCtx.cwd);
-      const fallback = filterContextWithDisposition(event.messages, loop, {
+      let fallback = filterContextWithDisposition(event.messages, loop, {
         bootstrap,
         maxBootstrapBytes: settings.maxBootstrapBytes,
       });
-      if (fallback.disposition === "fallback-safe") return { messages: fallback.messages };
+      if (fallback.disposition === "fallback-safe") {
+        successfulCompactionHandoff = undefined;
+        return { messages: fallback.messages };
+      }
       if (fallback.disposition === "fallback-unsafe"
-        && fallback.reason === "No safe complete user-led turn suffix was established; automatic continuation must pause.") {
+        && fallback.reason === MISSING_SAFE_SUFFIX_REASON) {
+        const handoff = consumeSuccessfulCompactionHandoff(activeCtx, loop, event.messages);
+        if (handoff) {
+          const recovered = filterContextWithDisposition(event.messages, loop, {
+            bootstrap,
+            maxBootstrapBytes: settings.maxBootstrapBytes,
+            trustedCompactionSummary: handoff.summary,
+          });
+          if (recovered.disposition === "fallback-safe" || recovered.disposition === "matched") {
+            return { messages: recovered.messages };
+          }
+          fallback = recovered;
+        }
+      }
+      successfulCompactionHandoff = undefined;
+      if (fallback.disposition === "fallback-unsafe"
+        && fallback.reason === MISSING_SAFE_SUFFIX_REASON) {
         // This is the one expected gap after explicit tree navigation: the
         // branch has no current marker and no complete user-led suffix yet.
         // pause() retains eligibility only when its tree carry proof matches.

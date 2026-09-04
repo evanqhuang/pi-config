@@ -607,6 +607,96 @@ describe("goal extension provider integration", () => {
     }
   });
 
+  it("uses a one-shot successful-compaction handoff before idle marker publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-"));
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const summary = "Current compacted implementation context.";
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), "# Approved plan\nImplement the feature.\n", "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const expectedMarker = controllerEpochMarker(state);
+      state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+      harness.setIdle(false);
+
+      await harness.handlers.get("session_compact")!({
+        type: "session_compact",
+        reason: "threshold",
+        willRetry: false,
+        compactionEntry: { id: "integration-leaf", summary, tokensBefore: 100_000, timestamp: 1 },
+      }, harness.ctx);
+      expect(harness.sentMessages).toEqual([]);
+
+      const result = await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 }],
+      }, harness.ctx) as { messages: Message[] };
+
+      expect(result.messages).toHaveLength(2);
+      expect(result.messages[0]).toMatchObject({ customType: GOAL_CONTEXT_EPOCH_TYPE, details: state.epochMarker });
+      expect(result.messages[1]).toEqual({ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 });
+      expect(harness.aborts).toBe(0);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "implementing" } });
+
+      // The handoff is consumed exactly once; it cannot bless a later markerless request.
+      await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "compactionSummary", summary, tokensBefore: 100_000, timestamp: 1 }],
+      }, harness.ctx);
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused" } });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not use a compaction handoff for a mismatched transient summary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-mismatch-"));
+    const artifactDir = join(root, "goal-loops", "loop-integration");
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+
+    try {
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "original-plan.md"), "# Approved plan\nImplement the feature.\n", "utf8");
+      const harness = integrationHarness();
+      await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+      const state = loopState(root);
+      state.plan.snapshotPath = join(await realpath(artifactDir), "original-plan.md");
+      const expectedMarker = controllerEpochMarker(state);
+      state.epochMarker = { id: expectedMarker.details.id, hash: expectedMarker.details.hash };
+      harness.branch.push({ type: "custom", customType: GOAL_STATE_V2_TYPE, data: state });
+      harness.setIdle(false);
+
+      await harness.handlers.get("session_compact")!({
+        type: "session_compact",
+        reason: "threshold",
+        willRetry: false,
+        compactionEntry: { id: "integration-leaf", summary: "trusted summary", tokensBefore: 100_000, timestamp: 1 },
+      }, harness.ctx);
+      await harness.handlers.get("context")!({
+        type: "context",
+        messages: [{ role: "compactionSummary", summary: "different summary", tokensBefore: 100_000, timestamp: 1 }],
+      }, harness.ctx);
+
+      expect(harness.aborts).toBe(1);
+      expect(harness.branch.at(-1)).toMatchObject({ data: { phase: "paused" } });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reanchors pending verification with matching no-edit fallback guidance", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-verify-reanchor-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
