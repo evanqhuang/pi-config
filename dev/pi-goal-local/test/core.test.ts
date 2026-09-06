@@ -357,8 +357,10 @@ describe("evaluator parsing", () => {
     expect(diagnostic.fingerprint).toBe(expectedHash);
     expect(diagnostic.bracesFound).toBe(true);
     expect(diagnostic.jsonObjectFound).toBe(true);
-    expect(diagnostic.topLevelKeys).toEqual(["$safe", "evidence", "outcome", "reason", "safeKey"]);
+    expect(diagnostic.topLevelKeys).toEqual(["evidence", "outcome", "reason"]);
+    expect(diagnostic.validationErrors).toEqual(["unknown-fields"]);
     expect(diagnostic.summary.length).toBeLessThanOrEqual(500);
+    expect(diagnostic.summary).toContain("validationErrors=unknown-fields");
     expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_REASON_VALUE");
     expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_EVIDENCE_VALUE");
     expect(diagnostic.summary).not.toContain("DO_NOT_PERSIST_THIS_KEY_VALUE");

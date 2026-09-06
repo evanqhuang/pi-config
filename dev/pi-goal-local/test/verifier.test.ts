@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildVerifierPrompt, parseVerifierVerdict } from "../src/verifier.js";
+import {
+  buildVerifierPrompt,
+  buildVerifierRetryPrompt,
+  diagnoseVerifierOutput,
+  parseVerifierVerdict,
+  type GoalVerifierOutputDiagnostic,
+} from "../src/verifier.js";
 
 describe("fixed-point GoalVerifier protocol", () => {
   it("parses every structured outcome without treating non-pass as success", () => {
@@ -49,5 +55,112 @@ describe("fixed-point GoalVerifier protocol", () => {
     expect(prompt).toContain("corrective plan");
     expect(prompt).toContain("evidence-3");
     expect(prompt).toContain('"outcome":"pass"|"replan"|"blocked"|"inconclusive"');
+    expect(prompt).toContain("at most 4000 characters");
+    expect(prompt).toContain("at most 32 non-empty trimmed single-line strings");
+    expect(prompt).toContain("at most 2000 characters");
+    expect(prompt).toContain("at most 256 characters");
+    expect(prompt).toContain("at most 131072 characters");
+    expect(prompt).toContain("permitted iff outcome is replan");
+    expect(prompt).toContain("never emit null");
+  });
+
+  it("rejects corrections for pass while retaining valid replan corrections", () => {
+    const base = {
+      reason: "verification needs another cycle",
+      repositoryFingerprint: "repo",
+      evidenceFingerprint: "evidence",
+      correction: "Inspect the failing check.\nRun the focused test.\n",
+    };
+    expect(parseVerifierVerdict(JSON.stringify({ ...base, outcome: "pass" }))).toBeUndefined();
+    expect(parseVerifierVerdict(JSON.stringify({ ...base, outcome: "replan" }))).toMatchObject({
+      outcome: "replan",
+      correction: base.correction,
+    });
+    expect(parseVerifierVerdict(JSON.stringify({
+      ...base,
+      outcome: "replan",
+      correction: undefined,
+    }))).toMatchObject({ outcome: "replan" });
+  });
+
+  it("enforces the parser's single-line and exact size bounds", () => {
+    const valid = (overrides: Record<string, unknown> = {}) => JSON.stringify({
+      outcome: "pass",
+      reason: "verified",
+      repositoryFingerprint: "repo",
+      evidenceFingerprint: "evidence",
+      ...overrides,
+    });
+
+    expect(parseVerifierVerdict(valid({ reason: `x\ny` }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ reason: "r".repeat(4001) }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ reason: "r".repeat(4000) }))).toMatchObject({ reason: "r".repeat(4000) });
+
+    expect(parseVerifierVerdict(valid({ evidence: ["x\ny"] }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ evidence: ["e".repeat(2001)] }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ evidence: Array.from({ length: 33 }, () => "e") }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ evidence: ["e".repeat(2000)] }))).toMatchObject({ evidence: ["e".repeat(2000)] });
+
+    expect(parseVerifierVerdict(valid({ repositoryFingerprint: "f".repeat(257) }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ evidenceFingerprint: "f\ng" }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ repositoryFingerprint: "f".repeat(256), evidenceFingerprint: "e".repeat(256) }))).toMatchObject({
+      repositoryFingerprint: "f".repeat(256),
+      evidenceFingerprint: "e".repeat(256),
+    });
+
+    expect(parseVerifierVerdict(valid({ outcome: "replan", correction: "c".repeat(131073) }))).toBeUndefined();
+    expect(parseVerifierVerdict(valid({ outcome: "replan", correction: "contains\u0000nul" }))).toBeUndefined();
+  });
+
+  it("reports bounded structural errors and keeps retry feedback private", () => {
+    const sentinel = "DO_NOT_LEAK_VERIFIER_SENTINEL";
+    const diagnostic = diagnoseVerifierOutput(JSON.stringify({
+      outcome: "pass",
+      reason: "line\nbreak",
+      evidence: ["evidence\nline"],
+      repositoryFingerprint: "f".repeat(257),
+      evidenceFingerprint: "evidence\nfingerprint",
+      correction: "a permitted-looking correction",
+      strategy: sentinel,
+      prewalk: { required: false },
+      snapshot: { unknown: sentinel },
+      [sentinel]: "raw content",
+    }));
+
+    expect(diagnostic.validationErrors).toEqual(expect.arrayContaining([
+      "invalid-reason",
+      "invalid-evidence",
+      "invalid-fingerprint",
+      "correction-not-allowed",
+      "invalid-strategy",
+      "invalid-prewalk",
+      "invalid-snapshot",
+      "unknown-fields",
+    ]));
+    expect(diagnostic.summary.length).toBeLessThanOrEqual(500);
+    expect(diagnostic.summary.indexOf("validationErrors=")).toBeLessThan(diagnostic.summary.indexOf("keys="));
+    expect(diagnostic.summary).toContain("invalid-reason");
+    expect(diagnostic.summary).not.toContain(sentinel);
+
+    const forged = {
+      category: sentinel,
+      charLength: 10,
+      byteLength: 10,
+      sha256: sentinel,
+      fingerprint: sentinel,
+      bracesFound: true,
+      jsonObjectFound: true,
+      topLevelKeys: [sentinel, "reason"],
+      validationErrors: [sentinel, "invalid-evidence"],
+      summary: sentinel,
+    } as unknown as GoalVerifierOutputDiagnostic;
+    const basePrompt = "base V2 prompt";
+    const retry = buildVerifierRetryPrompt(basePrompt, forged, "controller-fingerprint");
+    expect(retry).not.toContain(sentinel);
+    expect(retry).toContain("validationErrors=invalid-evidence");
+    expect(retry).toContain("at most 4000 characters");
+    expect(retry).toContain("permitted iff outcome is replan");
+    expect(retry).toContain("Echo the exact controller evidence fingerprint already present in the base prompt: controller-fingerprint.");
+    expect(retry.length).toBeLessThan(basePrompt.length + 5_000);
   });
 });

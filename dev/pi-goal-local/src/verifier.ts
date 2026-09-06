@@ -4,13 +4,19 @@ import type { GoalVerifierVerdict, GoalLoopStrategy } from "./types.js";
 const MAX_REASON_LENGTH = 4000;
 const MAX_DIAGNOSTIC_LENGTH = 500;
 const MAX_DIAGNOSTIC_KEYS = 8;
-const MAX_DIAGNOSTIC_KEY_LENGTH = 24;
-const SAFE_DIAGNOSTIC_KEY = /^[A-Za-z_$][A-Za-z0-9_$]{0,23}$/u;
+const MAX_RETRY_SUFFIX_LENGTH = 4096;
 const SAFE_FINGERPRINT = /^[A-Za-z0-9._:-]{1,256}$/u;
 const MAX_EVIDENCE_ITEMS = 32;
 const MAX_EVIDENCE_LENGTH = 2000;
 const MAX_FINGERPRINT_LENGTH = 256;
 const MAX_CORRECTION_LENGTH = 128 * 1024;
+
+const V2_ALLOWED_KEYS = [
+  "outcome", "reason", "evidence", "repositoryFingerprint", "evidenceFingerprint",
+  "correction", "correctionPlan", "strategy", "prewalk", "snapshot",
+] as const;
+const V2_ALLOWED_KEY_SET = new Set<string>(V2_ALLOWED_KEYS);
+const DIAGNOSTIC_TOP_LEVEL_KEYS = new Set<string>(["ok", ...V2_ALLOWED_KEYS]);
 
 /** The fixed-point protocol used by a version-2 goal loop. */
 export type GoalLoopVerifierOutcome = "pass" | "replan" | "blocked" | "inconclusive";
@@ -48,6 +54,22 @@ export type GoalVerifierOutputDiagnosticCategory =
   | "legacy-v1-shape"
   | "invalid-v2-schema";
 
+/** Structural, source-authored validation codes; raw field names and values are never retained. */
+export const GOAL_VERIFIER_VALIDATION_ERRORS = Object.freeze([
+  "invalid-outcome",
+  "invalid-reason",
+  "invalid-evidence",
+  "invalid-fingerprint",
+  "invalid-correction",
+  "correction-not-allowed",
+  "invalid-strategy",
+  "invalid-prewalk",
+  "invalid-snapshot",
+  "unknown-fields",
+] as const);
+export type GoalVerifierValidationError = typeof GOAL_VERIFIER_VALIDATION_ERRORS[number];
+const GOAL_VERIFIER_VALIDATION_ERROR_SET = new Set<string>(GOAL_VERIFIER_VALIDATION_ERRORS);
+
 export interface GoalVerifierOutputDiagnostic {
   category: GoalVerifierOutputDiagnosticCategory;
   charLength: number;
@@ -58,31 +80,62 @@ export interface GoalVerifierOutputDiagnostic {
   fingerprint: string;
   bracesFound: boolean;
   jsonObjectFound: boolean;
+  /** Only recognized schema keys are retained; unknown/offending names are discarded. */
   topLevelKeys: string[];
+  /** Structural schema errors from a finite source-authored allowlist. */
+  validationErrors: GoalVerifierValidationError[];
   /** A bounded, sanitized rendering suitable for a persisted reason or prompt. */
   summary: string;
 }
 
-function diagnosticSummary(diagnostic: Pick<GoalVerifierOutputDiagnostic, "category" | "charLength" | "byteLength" | "sha256" | "bracesFound" | "jsonObjectFound" | "topLevelKeys">): string {
-  const category = diagnostic.category;
+const DIAGNOSTIC_CATEGORIES = [
+  "no-object", "invalid-json", "legacy-v1-shape", "invalid-v2-schema",
+] as const;
+
+function sanitizeDiagnosticCategory(value: unknown): GoalVerifierOutputDiagnosticCategory {
+  return typeof value === "string" && (DIAGNOSTIC_CATEGORIES as readonly string[]).includes(value)
+    ? value as GoalVerifierOutputDiagnosticCategory
+    : "invalid-v2-schema";
+}
+
+function sanitizeValidationErrors(value: unknown): GoalVerifierValidationError[] {
+  if (!Array.isArray(value)) return [];
+  return GOAL_VERIFIER_VALIDATION_ERRORS.filter(code => value.includes(code));
+}
+
+function sanitizeDiagnosticKeys(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((key): key is string => typeof key === "string" && DIAGNOSTIC_TOP_LEVEL_KEYS.has(key))
+    .filter((key, index, keys) => keys.indexOf(key) === index)
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .slice(0, MAX_DIAGNOSTIC_KEYS);
+}
+
+type DiagnosticSummaryInput = Pick<GoalVerifierOutputDiagnostic, "category" | "charLength" | "byteLength" | "sha256" | "bracesFound" | "jsonObjectFound" | "topLevelKeys">
+  & { validationErrors?: unknown };
+
+function diagnosticSummary(diagnostic: DiagnosticSummaryInput): string {
+  const category = sanitizeDiagnosticCategory(diagnostic.category);
   const charLength = Number.isSafeInteger(diagnostic.charLength) && diagnostic.charLength >= 0
     ? diagnostic.charLength
     : 0;
   const byteLength = Number.isSafeInteger(diagnostic.byteLength) && diagnostic.byteLength >= 0
     ? diagnostic.byteLength
     : 0;
-  const sha256 = /^[a-f0-9]{64}$/u.test(diagnostic.sha256) ? diagnostic.sha256 : "invalid";
-  const keys = diagnostic.topLevelKeys
-    .filter(key => SAFE_DIAGNOSTIC_KEY.test(key))
-    .slice(0, MAX_DIAGNOSTIC_KEYS)
-    .join(",") || "none";
+  const sha256 = typeof diagnostic.sha256 === "string" && /^[a-f0-9]{64}$/u.test(diagnostic.sha256)
+    ? diagnostic.sha256
+    : "invalid";
+  const validationErrors = sanitizeValidationErrors(diagnostic.validationErrors);
+  const keys = sanitizeDiagnosticKeys(diagnostic.topLevelKeys).join(",") || "none";
   const summary = [
+    `validationErrors=${validationErrors.length ? validationErrors.join(",") : "none"}`,
     `category=${category}`,
     `chars=${charLength}`,
     `bytes=${byteLength}`,
     `sha256=${sha256}`,
-    `braces=${diagnostic.bracesFound ? "yes" : "no"}`,
-    `jsonObject=${diagnostic.jsonObjectFound ? "yes" : "no"}`,
+    `braces=${diagnostic.bracesFound === true ? "yes" : "no"}`,
+    `jsonObject=${diagnostic.jsonObjectFound === true ? "yes" : "no"}`,
     `keys=${keys}`,
   ].join("; ");
   return summary.slice(0, MAX_DIAGNOSTIC_LENGTH);
@@ -119,11 +172,15 @@ export function diagnoseVerifierOutput(raw: string): GoalVerifierOutputDiagnosti
     }
   }
 
-  const topLevelKeys = jsonObjectFound && isRecord(parsed)
-    ? Object.keys(parsed)
-      .filter(key => key.length <= MAX_DIAGNOSTIC_KEY_LENGTH && SAFE_DIAGNOSTIC_KEY.test(key))
+  const object = jsonObjectFound && isRecord(parsed) ? parsed : undefined;
+  const topLevelKeys = object
+    ? Object.keys(object)
+      .filter(key => DIAGNOSTIC_TOP_LEVEL_KEYS.has(key))
       .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
       .slice(0, MAX_DIAGNOSTIC_KEYS)
+    : [];
+  const validationErrors = object && !Object.hasOwn(object, "ok")
+    ? validateV2Shape(object)
     : [];
   const diagnostic = {
     category,
@@ -134,6 +191,7 @@ export function diagnoseVerifierOutput(raw: string): GoalVerifierOutputDiagnosti
     bracesFound,
     jsonObjectFound,
     topLevelKeys,
+    validationErrors,
   } satisfies Omit<GoalVerifierOutputDiagnostic, "summary">;
   return { ...diagnostic, summary: diagnosticSummary(diagnostic) };
 }
@@ -196,6 +254,51 @@ function snapshot(value: unknown): GoalLoopVerifierSnapshot | undefined {
   return { repositoryFingerprint, evidenceFingerprint, originalPlanHash, correctionHash };
 }
 
+function validateV2Shape(value: Record<string, unknown>): GoalVerifierValidationError[] {
+  const errors = new Set<GoalVerifierValidationError>();
+  const add = (error: GoalVerifierValidationError): void => {
+    if (GOAL_VERIFIER_VALIDATION_ERROR_SET.has(error)) errors.add(error);
+  };
+
+  if (Object.keys(value).some(key => !V2_ALLOWED_KEY_SET.has(key))) add("unknown-fields");
+  if (!outcome(value.outcome)) add("invalid-outcome");
+  if (!boundedText(value.reason, MAX_REASON_LENGTH)) add("invalid-reason");
+  if (value.evidence !== undefined && !evidence(value.evidence)) add("invalid-evidence");
+
+  const parsedSnapshot = value.snapshot === undefined ? undefined : snapshot(value.snapshot);
+  if (value.snapshot !== undefined && !parsedSnapshot) add("invalid-snapshot");
+  if (value.snapshot !== undefined && isRecord(value.snapshot)) {
+    for (const key of ["repositoryFingerprint", "evidenceFingerprint", "originalPlanHash", "correctionHash"] as const) {
+      if (value.snapshot[key] !== undefined && !boundedText(value.snapshot[key], MAX_FINGERPRINT_LENGTH)) {
+        add("invalid-fingerprint");
+      }
+    }
+  }
+  if (value.repositoryFingerprint !== undefined
+    && !boundedText(value.repositoryFingerprint, MAX_FINGERPRINT_LENGTH)) add("invalid-fingerprint");
+  if (value.evidenceFingerprint !== undefined
+    && !boundedText(value.evidenceFingerprint, MAX_FINGERPRINT_LENGTH)) add("invalid-fingerprint");
+
+  const correctionValue = value.correction ?? value.correctionPlan;
+  const correctionContent = isRecord(correctionValue) ? correctionValue.content : correctionValue;
+  const correction = correctionValue === undefined
+    ? undefined
+    : boundedMultilineText(correctionContent, MAX_CORRECTION_LENGTH);
+  if (correctionValue !== undefined && !correction) add("invalid-correction");
+  else if (correction !== undefined && value.outcome !== "replan") add("correction-not-allowed");
+
+  if (value.strategy !== undefined && !strategy(value.strategy)) add("invalid-strategy");
+  if (value.prewalk !== undefined) {
+    const parsedPrewalk = isRecord(value.prewalk) && value.prewalk.required === true
+      && Object.keys(value.prewalk).every(key => key === "required")
+      ? { required: true as const }
+      : undefined;
+    if (!parsedPrewalk) add("invalid-prewalk");
+  }
+
+  return GOAL_VERIFIER_VALIDATION_ERRORS.filter(error => errors.has(error));
+}
+
 /**
  * Parse the legacy `{ok, reason}` verifier response and the strict fixed-point
  * `{outcome, reason}` response. Legacy responses intentionally retain their
@@ -230,11 +333,7 @@ export function parseVerifierVerdict(raw: string): GoalVerifierVerdict | GoalLoo
     return { ok: value.ok, reason: failureReason.slice(0, MAX_REASON_LENGTH), evidence: parsedEvidence };
   }
 
-  const allowedKeys = new Set([
-    "outcome", "reason", "evidence", "repositoryFingerprint", "evidenceFingerprint",
-    "correction", "correctionPlan", "strategy", "prewalk", "snapshot",
-  ]);
-  if (Object.keys(value).some(key => !allowedKeys.has(key))) return undefined;
+  if (validateV2Shape(value).length) return undefined;
   if (!outcome(value.outcome)) return undefined;
   const reason = boundedText(value.reason, MAX_REASON_LENGTH);
   if (!reason) return undefined;
@@ -320,6 +419,21 @@ export interface VerifierPromptInput {
   previousRepositoryFingerprint?: string;
 }
 
+const V2_SCHEMA_GUIDANCE = [
+  "Fixed-point V2 JSON schema and bounds (apply exactly):",
+  "Return exactly one JSON object with this schema: {\"outcome\":\"pass\"|\"replan\"|\"blocked\"|\"inconclusive\",\"reason\":string,\"evidence\"?:string[],\"repositoryFingerprint\":string,\"evidenceFingerprint\":string,\"correction\"?:string,\"strategy\"?:\"YOLO\"|\"ORCHESTRATOR\"|\"PREWALK\",\"prewalk\"?:{\"required\":true},\"snapshot\"?:object}.",
+  "Canonical response shape: {\"outcome\":\"pass\"|\"replan\"|\"blocked\"|\"inconclusive\",\"reason\":string,\"evidence\"?:string[],\"repositoryFingerprint\":string,\"evidenceFingerprint\":string,\"correction\"?:string,\"strategy\"?:\"YOLO\"|\"ORCHESTRATOR\"|\"PREWALK\",\"prewalk\"?:{\"required\":true}}.",
+  "Return one JSON object with no markdown and no unknown top-level fields. Allowed top-level fields are outcome, reason, evidence, repositoryFingerprint, evidenceFingerprint, correction (or compatibility alias correctionPlan), strategy, prewalk, and snapshot.",
+  "outcome must be exactly pass, replan, blocked, or inconclusive.",
+  "reason must be a non-empty trimmed single-line string of at most 4000 characters; it must not contain NUL, CR, or LF.",
+  "evidence is optional; when present it is an array of at most 32 non-empty trimmed single-line strings, each at most 2000 characters, with no NUL, CR, or LF.",
+  "repositoryFingerprint and evidenceFingerprint must be non-empty trimmed single-line strings of at most 256 characters, with no NUL, CR, or LF. Echo the controller evidence fingerprint exactly.",
+  "correction is a non-empty multiline string of at most 131072 characters, with no NUL. It is permitted iff outcome is replan: include one concrete correction for replan and omit correction/correctionPlan for pass, blocked, and inconclusive.",
+  "strategy, when present, must be exactly YOLO, ORCHESTRATOR, or PREWALK. prewalk, when present, must be exactly {\"required\":true}.",
+  "snapshot, when present, may contain only repositoryFingerprint, evidenceFingerprint, originalPlanHash, and correctionHash; each present value has the same non-empty trimmed single-line 256-character bound.",
+  "Omit every optional field that is absent; never emit null. Do not include raw excerpts or other fields.",
+].join("\n");
+
 /**
  * Build either the original V1 acceptance prompt or the self-contained V2
  * verifier prompt. V2 includes only immutable plan/correction contents and
@@ -382,7 +496,7 @@ export function buildVerifierPrompt(input: VerifierPromptInput): string {
       : "No previous repository snapshot exists; establish one now.",
     "Inspect the repository yourself and run focused checks where useful. Do not edit source, delegate, start Pi, or invoke code_review.",
     "For PASS, all criteria must be independently observed. For REPLAN, provide one concrete corrective plan in `correction`. BLOCKED means the goal cannot safely continue. INCONCLUSIVE means required evidence is unavailable; it is not a pass.",
-    "Return exactly one JSON object with this schema: {\"outcome\":\"pass\"|\"replan\"|\"blocked\"|\"inconclusive\",\"reason\":string,\"evidence\"?:string[],\"repositoryFingerprint\":string,\"evidenceFingerprint\":string,\"correction\"?:string,\"strategy\"?:\"YOLO\"|\"ORCHESTRATOR\"|\"PREWALK\",\"prewalk\"?:{\"required\":true}}.",
+    V2_SCHEMA_GUIDANCE,
     "The repositoryFingerprint must identify the exact repository state you inspected. The evidenceFingerprint must exactly equal the controller fingerprint above. Keep correction bounded and actionable. Never claim PASS from GoalJudge's assertion alone.",
   ].filter(Boolean).join("\n\n");
 }
@@ -396,17 +510,25 @@ export function buildVerifierRetryPrompt(
   diagnostic: GoalVerifierOutputDiagnostic,
   evidenceFingerprint: string,
 ): string {
-  const safeFingerprint = SAFE_FINGERPRINT.test(evidenceFingerprint) ? evidenceFingerprint : undefined;
+  const safeFingerprint = typeof evidenceFingerprint === "string" && SAFE_FINGERPRINT.test(evidenceFingerprint)
+    ? evidenceFingerprint
+    : undefined;
   const evidenceInstruction = safeFingerprint
     ? `Echo the exact controller evidence fingerprint already present in the base prompt: ${safeFingerprint}.`
     : "Echo the exact controller evidence fingerprint already present in the base prompt; do not invent or alter it.";
-  return [
-    basePrompt,
+  const retrySuffix = [
     "Schema correction (one retry only): the prior GoalVerifier response was rejected with this sanitized diagnostic:",
+    V2_SCHEMA_GUIDANCE,
     diagnosticSummary(diagnostic),
     "Return exactly one JSON object using the existing V2 schema above. Do not return the legacy {\"ok\":...} shape.",
     evidenceInstruction,
-  ].join("\n\n").slice(0, basePrompt.length + MAX_DIAGNOSTIC_LENGTH + 600);
+  ].join("\n\n");
+  // All variable retry inputs are independently bounded; retain the complete
+  // corrective guidance and fingerprint instruction within a fixed suffix.
+  const boundedSuffix = retrySuffix.length <= MAX_RETRY_SUFFIX_LENGTH
+    ? retrySuffix
+    : retrySuffix.slice(0, MAX_RETRY_SUFFIX_LENGTH);
+  return `${basePrompt}\n\n${boundedSuffix}`;
 }
 
 export const buildGoalVerifierRetryPrompt = buildVerifierRetryPrompt;

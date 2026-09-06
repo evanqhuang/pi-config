@@ -40,6 +40,16 @@ For a fixed-point V2 prompt, return exactly one JSON object with `outcome` set t
 {"outcome":"pass","reason":"concise verification result","evidence":["concrete observed evidence"],"repositoryFingerprint":"exact inspected repository snapshot","evidenceFingerprint":"the controller fingerprint"}
 ```
 
+V2 response constraints:
+
+- Use only the fields `outcome`, `reason`, `evidence`, `repositoryFingerprint`, `evidenceFingerprint`, `correction` (or compatibility alias `correctionPlan`), `strategy`, `prewalk`, and `snapshot`; omit absent optional fields rather than emitting `null`.
+- `reason` is a non-empty trimmed single-line string, at most 4,000 characters, with no NUL, CR, or LF.
+- `evidence`, when present, has at most 32 non-empty trimmed single-line strings; each is at most 2,000 characters and has no NUL, CR, or LF.
+- `repositoryFingerprint` and `evidenceFingerprint` are non-empty trimmed single-line strings, at most 256 characters, with no NUL, CR, or LF; echo the controller fingerprint exactly.
+- `correction` is a non-empty multiline string at most 131,072 characters with no NUL. It is allowed iff `outcome` is `replan`: include one concrete correction for `replan` and omit it for `pass`, `blocked`, and `inconclusive`.
+- `strategy`, when present, is `YOLO`, `ORCHESTRATOR`, or `PREWALK`; `prewalk`, when present, is an object containing only the `required` field set to `true`. `snapshot`, when present, contains only the four fingerprint/hash fields, with the same 256-character bound.
+- Return one JSON object with no markdown or unknown fields. Never include raw excerpts or `null` optional values.
+
 - `pass` requires every criterion to be independently observed.
 - `replan` requires one bounded, concrete `correction` plan plus both fingerprints. Preserve the requested execution strategy; never silently change YOLO, ORCHESTRATOR, or PREWALK.
 - `blocked` means safe continuation is impossible.
