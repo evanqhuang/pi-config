@@ -178,3 +178,13 @@ verifier policy.
 This is a local fork, not an independently maintained implementation. Rebase
 onto the installed upstream `@tintinweb/pi-subagents@0.18.2` before carrying
 forward future upstream changes; do not merge unrelated local edits.
+
+## Selective orchestration and completion delivery
+
+ORCHESTRATOR implementation uses `ImplementationWorker` only for units with stable inputs, exclusive ownership, independently checkable output, and enough work to justify briefing and integration. The parent can implement coupled changes and small integration repairs directly. Explore, Plan, and dedicated verifiers keep their own role contracts.
+
+Fresh background ORCHESTRATOR implementation calls default to grouped completions for the same parent tool batch. Explicit `defaultJoinMode` settings (`async`, `smart`, or `group`) remain authoritative. The existing 100 ms debounce also supports programmatic calls without lifecycle events; preflighted sibling launches stay together even when launch timing spans that window. Foreground execution remains available and does not hold background batches open.
+
+Groups deliver once when all members settle, or partially 30 seconds after the first completion; later stragglers re-batch with the existing 15-second timeout. Consumed results count as settled but are omitted at delivery. Cancelling a result wait leaves the worker running and eligible for eventual notification. Shutdown clears batch, group, and pending notification timers. Direct usage accounting remains separate from inclusive descendant totals and is unchanged by grouping or retrieval.
+
+Use completion summaries when sufficient, retrieve full output only for missing evidence, and avoid polling while useful independent work remains. Workers run focused checks; repeat passing checks only after relevant changes or a concrete evidence gap. Run affected integration checks after dependent workers settle. Corrections should address only the unresolved delta using existing evidence. Independent verification remains conditional and follows stable integration. Productive workers may continue through checkpoints and compaction; blockers request parent attention without automatic respawn. No new token ceilings, worker quotas, default turn caps, or concurrency reductions are introduced.

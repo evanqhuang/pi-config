@@ -150,7 +150,6 @@ test("full parent reminder preserves clarification and submit-only approval cont
     "classic two-phase flow",
     "at most three independent, non-overlapping Explore workers",
     "verify and aggregate their evidence",
-    "one fresh, one-shot Plan worker",
     "objective, search focus, known paths or symbols, and thoroughness",
     "requirements, constraints, verified file or symbol findings, non-goals, and open questions",
     "Plan must not repeat broad discovery",
@@ -178,7 +177,6 @@ test("sparse and re-entry parent reminders keep ambiguity active without replaci
     assert.match(reminder, /use ask_user_question/);
     assert.match(reminder, /up to three non-overlapping Explore responsibilities/);
     assert.match(reminder, /verify and aggregate evidence|parent verification and aggregation/);
-    assert.match(reminder, /one fresh Plan worker/);
     assert.match(reminder, /without broad rediscovery/);
     assert.match(reminder, /Do not make large assumptions/);
     assert.match(reminder, /fold resolved answers into the managed plan/i);

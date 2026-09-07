@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentInvocationConfig } from "../src/invocation-config.js";
+import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
 import type { AgentConfig } from "../src/types.js";
 
 const card = (overrides: Partial<AgentConfig> = {}): AgentConfig => ({
@@ -66,5 +66,16 @@ describe("resolveAgentInvocationConfig model and thinking precedence", () => {
     expect(resolved.modelFromParams).toBe(false);
     expect(resolved.thinking).toBeUndefined();
     expect("overridden" in resolved).toBe(false);
+  });
+});
+
+
+describe("background completion defaults", () => {
+  it("groups owned implementation while preserving explicit preferences and foreground", () => {
+    expect(resolveJoinMode("smart", true, { orchestratorOwned: true })).toBe("group");
+    expect(resolveJoinMode("async", true, { orchestratorOwned: true, explicitDefault: true })).toBe("async");
+    expect(resolveJoinMode("smart", true, { orchestratorOwned: true, explicitDefault: true })).toBe("smart");
+    expect(resolveJoinMode("group", false, { orchestratorOwned: true })).toBeUndefined();
+    expect(resolveJoinMode("smart", true)).toBe("smart");
   });
 });

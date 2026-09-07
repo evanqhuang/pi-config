@@ -560,6 +560,7 @@ export default function (pi: ExtensionAPI) {
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
+  let shuttingDown = false;
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
   // A queued result wait must observe completion before its held notification
@@ -567,6 +568,7 @@ export default function (pi: ExtensionAPI) {
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    if (shuttingDown) return;
     cancelNudge(key);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
@@ -629,7 +631,7 @@ export default function (pi: ExtensionAPI) {
 
         pi.sendMessage<NotificationDetails>({
           customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse this summary when sufficient; fetch full output with get_subagent_result only for missing evidence.`,
           display: true,
           details,
         }, { deliverAs: "followUp", triggerTurn: true });
@@ -705,6 +707,15 @@ export default function (pi: ExtensionAPI) {
       usage: buildUsageAttribution(record),
       ...buildWorktreeMetadata(record),
     });
+
+    if (shuttingDown) return;
+    // Count consumed terminal records toward group settlement; delivery filters
+    // their content again at send time.
+    if (groupJoin.isGrouped(record.id)) {
+      groupJoin.onAgentComplete(record);
+      widget.update();
+      return;
+    }
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -1299,6 +1310,12 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
+    pendingBatchCalls.clear();
+    groupJoin.dispose();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1358,7 +1375,8 @@ export default function (pi: ExtensionAPI) {
   // ---- Join mode configuration ----
   let defaultJoinMode: JoinMode = 'smart';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
-  function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
+  let explicitJoinDefault = false;
+  function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; explicitJoinDefault = true; }
 
   // What an unqualified top-level spawn means. Defaults to background,
   // following Claude Code; `backgroundByDefault: false` restores the previous
@@ -1398,17 +1416,18 @@ export default function (pi: ExtensionAPI) {
   function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
   // ---- Batch tracking for smart join mode ----
-  // Collects background agent IDs spawned in the current turn for smart grouping.
-  // Uses a debounced timer: each new agent resets the 100ms window so that all
-  // parallel tool calls (which may be dispatched across multiple microtasks by the
-  // framework) are captured in the same batch.
+  // Preflight marks sibling Agent calls before execution; their launch completions
+  // close the batch. A 100ms debounce covers programmatic calls without hooks,
+  // but cannot split a preflighted batch or merge consecutive completed batches.
   let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
+  const pendingBatchCalls = new Set<string>();
 
   /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
   function finalizeBatch() {
     batchFinalizeTimer = undefined;
+    if (pendingBatchCalls.size > 0) return;
     const batchAgents = [...currentBatchAgents];
     currentBatchAgents = [];
 
@@ -1424,7 +1443,7 @@ export default function (pi: ExtensionAPI) {
         const record = manager.getRecord(id);
         if (!record) continue;
         record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
+        if (record.completedAt != null) {
           groupJoin.onAgentComplete(record);
         }
       }
@@ -1542,10 +1561,23 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
-  pi.on("tool_execution_start", async (_event, ctx) => {
+  pi.on("tool_execution_start", async (event, ctx) => {
+    if (event.toolName === "Agent") pendingBatchCalls.add(event.toolCallId);
     widget.setUICtx(ctx.ui as UICtx);
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     widget.onTurnStart();
+  });
+
+  function finishBatchCall(toolCallId: string) {
+    const wasPending = pendingBatchCalls.delete(toolCallId);
+    if (wasPending && pendingBatchCalls.size === 0 && currentBatchAgents.length > 0) {
+      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+      finalizeBatch();
+    }
+  }
+
+  pi.on("tool_execution_end", (event) => {
+    if (event.toolName === "Agent") finishBatchCall(event.toolCallId);
   });
 
   /** Build the full type list text dynamically from available agents only. */
@@ -2105,6 +2137,9 @@ Terse command-style prompts produce shallow, generic work.
         };
       };
 
+      // Foreground execution (including resume) does not delay sibling launch batching.
+      if (!runInBackground) finishBatchCall(toolCallId);
+
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
@@ -2259,7 +2294,10 @@ Terse command-style prompts produce shallow, generic work.
 
         // Set output file + join mode synchronously after spawn, before the
         // event loop yields — onSessionCreated is async so this is safe.
-        const joinMode = resolveJoinMode(defaultJoinMode, true);
+        const joinMode = resolveJoinMode(defaultJoinMode, true, {
+          orchestratorOwned: subagentType === "ImplementationWorker" && params.orchestrator_owned === true,
+          explicitDefault: explicitJoinDefault,
+        });
         const record = manager.getRecord(id);
         if (record && joinMode) {
           record.joinMode = joinMode;

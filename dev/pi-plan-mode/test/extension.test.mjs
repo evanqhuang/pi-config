@@ -13,6 +13,7 @@ const {
   default: registerPlanMode,
   PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL,
   PLAN_MODE_BRIDGE_VERSION,
+  derivePlanRecommendation,
 } = await jiti.import(join(planModeRoot, "index.ts"));
 
 function mockPi() {
@@ -334,7 +335,6 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.match(planStart.systemPrompt, /objective, searchFocus, knownPaths and knownSymbols when available, and thoroughness/);
   assert.match(planStart.systemPrompt, /quick, medium, or very_thorough/);
   assert.match(planStart.systemPrompt, /Phase 2 — Aggregate and Plan/);
-  assert.match(planStart.systemPrompt, /normally one read-only Plan worker/);
   assert.match(planStart.systemPrompt, /requirements, constraints, explorationFindings/);
   assert.match(planStart.systemPrompt, /perspective, nonGoals, and openQuestions/);
   assert.match(planStart.systemPrompt, /must not repeat broad repository discovery/);
@@ -586,11 +586,11 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const malformedAgent = await pi.handlers.get("tool_call")({ toolName: "Agent", input: null });
   assert.equal(malformedAgent.block, true);
   assert.equal(malformedAgent.terminate, undefined);
-  const orchestratedAgent = { subagent_type: "general-purpose", model: "other/model", thinking: "low" };
+  const orchestratedAgent = { subagent_type: "ImplementationWorker", model: "other/model", thinking: "low" };
   assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: orchestratedAgent }), undefined);
   assert.equal(orchestratedAgent.subagent_type, "ImplementationWorker");
   assert.equal(orchestratedAgent.orchestrator_owned, true);
-  assert.equal(orchestratedAgent.model, "openai-codex/gpt-5.6-luna");
+  assert.equal(orchestratedAgent.model, "other/model");
   assert.equal(orchestratedAgent.thinking, "high");
   for (const thinking of [undefined, "high", "xhigh", "max"]) {
     const worker = { subagent_type: "ImplementationWorker", thinking };
@@ -606,8 +606,6 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   }
   const orchestratorStart = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
   assert.match(orchestratorStart.systemPrompt, /ORCHESTRATOR MODE IS ACTIVE/);
-  assert.match(orchestratorStart.systemPrompt, /Each delegated implementation unit must fit comfortably in one fresh worker context without compaction/);
-  assert.match(orchestratorStart.systemPrompt, /normally one objective, one subsystem boundary, no more than 3-5 closely related implementation files plus focused tests, and one focused verification command/);
   assert.match(orchestratorStart.systemPrompt, /Do not bundle discovery, design, implementation, testing, and review into one worker/);
   assert.match(orchestratorStart.systemPrompt, /Dependent units run sequentially only after the prerequisite handoff is inspected and its contract\/tests pass/);
   assert.match(orchestratorStart.systemPrompt, /Parallelize only truly independent units with disjoint files and no dependency edge/);
@@ -1443,4 +1441,78 @@ test("versioned bridge exposes only approved canonical plans without activating 
   assert.equal((await queryBridge(pi, "revised-query")).result, null);
   await pi.handlers.get("session_shutdown")({}, ctx);
   assert.equal(pi.eventListeners.get(PLAN_MODE_APPROVED_PLAN_QUERY_CHANNEL)?.size ?? 0, 0);
+});
+
+
+test("recommendations require unambiguous explicit execution intent", () => {
+  for (const plan of ["# Multi-file change", "# Cross-subsystem update", "# Delegation considerations", "# Parallel work", "# ORCHESTRATOR tradeoffs", "# Guided exploration", "Recommendation: ORCHESTRATOR\nRecommended mode: YOLO", "Use ORCHESTRATOR\nExecute in YOLO mode"]) {
+    assert.equal(derivePlanRecommendation(plan).recommendedMode, "YOLO", plan);
+    assert.ok(derivePlanRecommendation(plan).signals.includes("default:yolo"), plan);
+  }
+  for (const [plan, mode] of [
+    ["Parent recommendation: ORCHESTRATOR", "ORCHESTRATOR"],
+    ["The plan recommends PREWALK", "PREWALK"],
+    ["Use ORCHESTRATOR", "ORCHESTRATOR"],
+    ["Execute in PREWALK mode", "PREWALK"],
+    ["Implement with ORCHESTRATOR", "ORCHESTRATOR"],
+    ["Recommendation: ORCHESTRATOR\nUse ORCHESTRATOR", "ORCHESTRATOR"],
+  ]) assert.equal(derivePlanRecommendation(plan).recommendedMode, mode, plan);
+});
+
+test("ORCHESTRATOR preserves research roles and rejects unsupported roles before dispatch", async (t) => {
+  isolatedEnvironment(t);
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+  await pi.commands.get("orchestrator").handler(undefined, ctx);
+  for (const subagent_type of ["general-purpose", "missing", "", "GoalVerifier"]) {
+    const input = { subagent_type };
+    const result = await pi.handlers.get("tool_call")({ toolName: "Agent", input });
+    assert.equal(result?.block, true, subagent_type);
+    assert.match(result.reason, /ImplementationWorker.*Explore.*Plan.*LunaCompliance.*LunaTestVerifier/);
+    assert.deepEqual(input, { subagent_type });
+  }
+  for (const [role, ceiling] of [["Explore", 24], ["Plan", 16]]) {
+    const input = { subagent_type: role.toLowerCase(), max_turns: 999, orchestrator_owned: true };
+    assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input }), undefined);
+    assert.equal(input.subagent_type, role);
+    assert.equal(input.max_turns, ceiling);
+    assert.equal(input.readOnly, true);
+    assert.equal(input.mode, "PLAN");
+    assert.equal(input.orchestrator_owned, undefined);
+    assert.equal(input.model, undefined);
+    assert.equal(input.thinking, undefined);
+    for (const extra of [{ resume: "old" }, { schedule: "later" }, { max_turns: 0 }]) {
+      assert.equal((await pi.handlers.get("tool_call")({ toolName: "Agent", input: { subagent_type: role, ...extra } })).block, true);
+    }
+    const bounded = { subagent_type: role, max_turns: 3, thinking: "max" };
+    await pi.handlers.get("tool_call")({ toolName: "Agent", input: bounded });
+    assert.equal(bounded.max_turns, 3);
+    assert.equal(bounded.thinking, "max");
+  }
+});
+
+
+test("explicit recommendation fields and legacy drafts remain advisory through approval", async (t) => {
+  isolatedEnvironment(t);
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+  await pi.commands.get("plan").handler(undefined, ctx);
+  const tool = pi.tools.get("manage_plan_draft");
+  const created = await tool.execute("draft", {
+    action: "create", plan: "Recommendation: ORCHESTRATOR\nUse YOLO", recommendedMode: "ORCHESTRATOR",
+  }, undefined, undefined, ctx);
+  assert.equal(created.details.recommendedMode, "ORCHESTRATOR");
+  assert.equal(pi.active.includes("write"), false);
+  const planPath = created.details.planPath;
+  // Legacy metadata is not an approval or a substitute for an explicit body signal.
+  writeFileSync(planPath, '---\n{"parentRecommendation":"ORCHESTRATOR","recommendation":"ORCHESTRATOR"}\n---\n# Multi-file change\n\nImplement the change.');
+  ctx.selections.push("Keep planning");
+  await pi.tools.get("submit_plan_for_approval").execute("legacy", { planPath }, undefined, undefined, ctx);
+  assert.equal(ctx.selectCalls.at(-1).options[0], "Implement with YOLO (Recommended)");
+  assert.equal(pi.active.includes("write"), false);
+  assert.equal(pi.entries.some(entry => entry.data?.status === "approved-pending"), false);
 });

@@ -143,8 +143,8 @@ test("hidden transient reminders deduplicate without mutating input", () => {
 
 test("verification reminders target changed-slice evidence and approved scope", () => {
   const needed = renderOrchestratorReminder({ phase: ORCHESTRATOR_PHASES.VERIFICATION_NEEDED, agents: [] });
-  assert.match(needed, /focused checks for each changed slice/);
-  assert.match(needed, /only affected integration checks/);
+  assert.match(needed, /focused worker evidence where sufficient/);
+  assert.match(needed, /affected integration checks after dependent workers settle/);
   assert.match(needed, /approved criteria and treat non-goals as out of scope/);
 
   const verifying = renderOrchestratorReminder({ phase: ORCHESTRATOR_PHASES.VERIFYING, agents: [] });

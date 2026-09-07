@@ -50,10 +50,10 @@ const PHASE_TEXT = Object.freeze({
   ].join("\n"),
   [ORCHESTRATOR_PHASES.IMPLEMENTING]: [
     "ORCHESTRATOR implementation is in progress. Do not infer completion from this reminder or from an agent's claimed output.",
-    "Let the tracked implementation workers settle, then inspect the actual changed files before starting or trusting verification.",
+    "Continue useful independent parent work without polling. Use completion summaries directly when sufficient and fetch full results only for missing evidence. Let dependent workers settle before affected integration checks, then inspect the actual changed files before sign-off.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFICATION_NEEDED]: [
-    "ORCHESTRATOR verification is needed after implementation work. Inspect the actual diff, run focused checks for each changed slice, and run only affected integration checks.",
+    "ORCHESTRATOR verification is needed after implementation work. Inspect the actual diff and use focused worker evidence where sufficient. Repeat passing checks only after relevant changes or a concrete evidence gap; run affected integration checks after dependent workers settle.",
     "Do not launch either dedicated verifier by default. Use only the verifier justified by concrete plan criteria or unusually broad, high-risk, coverage-sensitive, or difficult test evidence. The parent owns integration and final sign-off; keep any scope gap within approved criteria and treat non-goals as out of scope. The parent may verify routine work directly and sign off without launching either verifier.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFYING]: [
@@ -62,7 +62,7 @@ const PHASE_TEXT = Object.freeze({
   ].join("\n"),
   [ORCHESTRATOR_PHASES.VERIFICATION_FAILED]: [
     "ORCHESTRATOR verification failed or tracked implementation work failed.",
-    "Inspect the actual repository state, remediate every actionable gap within approved criteria, and rerun only the necessary delta/affected checks before sign-off. Treat non-goals and other suggestions as out of scope; do not claim success from raw agent output.",
+    "Inspect the actual repository state, remediate every actionable gap within approved criteria, and rerun only the necessary delta/affected checks before sign-off. Assign only the unresolved correction with existing evidence; finish small integration repairs directly. Treat non-goals and other suggestions as out of scope; do not claim success from raw agent output.",
   ].join("\n"),
   [ORCHESTRATOR_PHASES.SIGNOFF_READY]: [
     "The selected ORCHESTRATOR verifier agents have completed for the tracked implementation cycle.",

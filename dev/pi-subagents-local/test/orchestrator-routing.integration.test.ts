@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   buildAgentRegistry,
@@ -16,6 +16,14 @@ import {
   setFallbackSubagent,
 } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { resolveAgentInvocationConfig } from "../src/invocation-config.js";
+import registerSubagents from "../src/index.js";
+import { fakePi as subagentHarness, context as subagentContext } from "./helpers/extension-harness.js";
+
+const runner = vi.hoisted(() => ({ run: vi.fn() }));
+vi.mock("../src/agent-runner.js", async original => ({
+  ...(await original<typeof import("../src/agent-runner.js")>()), runAgent: runner.run,
+}));
 
 // pi-plan-mode is intentionally imported as an extension, not reimplemented or
 // mocked. Jiti is a dependency of pi-coding-agent and lets this test load the
@@ -134,6 +142,7 @@ describe("cross-extension ORCHESTRATOR routing", () => {
     const isolatedProjectDir = join(root, "project");
     const isolatedCard = join(isolatedAgentDir, "agents", "ImplementationWorker.md");
     let pi: PlanModePi | undefined;
+    let shutdownSubagents: (() => Promise<void>) | undefined;
 
     try {
       // Read the real global card before replacing the global root, then parse
@@ -141,6 +150,9 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       const liveCard = join(getAgentDir(), "agents", "ImplementationWorker.md");
       await mkdir(dirname(isolatedCard), { recursive: true });
       await copyFile(liveCard, isolatedCard);
+      for (const role of ["Explore", "Plan", "LunaCompliance", "LunaTestVerifier"]) {
+        await copyFile(join(dirname(liveCard), role + ".md"), join(dirname(isolatedCard), role + ".md"));
+      }
       await mkdir(isolatedProjectDir, { recursive: true });
 
       process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
@@ -155,7 +167,7 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       await pi.commands.get("orchestrator")!.handler(undefined, ctx);
 
       const request = {
-        subagent_type: "general-purpose",
+        subagent_type: "ImplementationWorker",
         model: "other/provider-model",
         thinking: "low",
       };
@@ -163,7 +175,7 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       expect(toolCallResult).toBeUndefined();
       expect(request).toMatchObject({
         subagent_type: "ImplementationWorker",
-        model: "openai-codex/gpt-5.6-luna",
+        model: "other/provider-model",
         thinking: "high",
         orchestrator_owned: true,
       });
@@ -186,6 +198,63 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       expect(resolvedCard?.allowedSubagents).toBeUndefined();
       expect(resolvedCard?.extSelectors).toBeUndefined();
 
+      const harness = subagentHarness();
+      registerSubagents(harness.pi as any);
+      const runtimeCtx = subagentContext(isolatedProjectDir, harness.ui);
+      const models = [
+        { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna" },
+        { provider: "other", id: "provider-model", name: "Explicit implementation model" },
+      ];
+      runtimeCtx.modelRegistry = {
+        getAll: () => models,
+        find: (provider: string, id: string) => models.find(m => m.provider === provider && m.id === id),
+      };
+      shutdownSubagents = async () => {
+        for (const handler of harness.handlers.get("session_shutdown") ?? []) await handler({}, runtimeCtx);
+      };
+      runner.run.mockImplementation(async () => ({ responseText: "offline handoff", aborted: false, steered: false }));
+      const agentTool = harness.tools.get("Agent");
+      const dispatchRequest = async (input: Record<string, unknown>) => {
+        const blocked = await pi!.handlers.get("tool_call")!({ toolName: "Agent", input }) as any;
+        if (blocked?.block) return blocked;
+        return agentTool.execute("dispatch", { prompt: "bounded unit", description: "offline dispatch", run_in_background: false, ...input }, undefined, undefined, runtimeCtx);
+      };
+      for (const [role, thinking, maxTurns] of [["Explore", "high", 24], ["Plan", "xhigh", 16]] as const) {
+        const result = await dispatchRequest({ subagent_type: role });
+        expect(result.details.status).toBe("completed");
+        const call = runner.run.mock.calls.at(-1)!;
+        expect(call[1]).toBe(role);
+        expect(call[3]).toMatchObject({ thinkingLevel: thinking, maxTurns, orchestratorOwned: false });
+        const card = getAgentConfigIn(registry, role)!;
+        expect(card.builtinToolNames).toEqual(["read", "bash", "grep", "find", "ls"]);
+        expect(card.allowedSubagents).toBeUndefined();
+      }
+      for (const input of [
+        { subagent_type: "ImplementationWorker" },
+        { subagent_type: "ImplementationWorker", model: "other/provider-model", thinking: "max" },
+      ]) {
+        const explicit = "model" in input;
+        const result = await dispatchRequest(input);
+        expect(result.details.status).toBe("completed");
+        const options = runner.run.mock.calls.at(-1)![3];
+        expect(options.model).toMatchObject(explicit ? models[1] : models[0]);
+        expect(options.thinkingLevel).toBe(explicit ? "max" : "high");
+        expect(options.orchestratorOwned).toBe(true);
+        expect(options.maxTurns).toBeUndefined();
+      }
+      const beforeUnknown = runner.run.mock.calls.length;
+      expect((await dispatchRequest({ subagent_type: "missing" })).block).toBe(true);
+      expect(runner.run.mock.calls).toHaveLength(beforeUnknown);
+      for (const role of ["LunaCompliance", "LunaTestVerifier"]) {
+        const input = { subagent_type: role, model: "other/provider-model", thinking: "max", isolation: "off", snapshot_source: false };
+        await pi.handlers.get("tool_call")!({ toolName: "Agent", input });
+        const config = resolveAgentInvocationConfig(getAgentConfigIn(registry, role), input);
+        expect(config.modelInput).toBe("openai-codex/gpt-5.6-luna");
+        expect(config.thinking).toBe("high");
+        if (role === "LunaCompliance") expect(config.disallowedTools).toContain("bash");
+        else expect(config).toMatchObject({ isolation: "worktree", snapshotSource: true, worktreeDisposition: "discard" });
+      }
+
       const missingCardResolution = resolveSpawnTypeIn(
         buildAgentRegistry(new Map()),
         request.subagent_type,
@@ -198,6 +267,8 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       expect(unknownResolution.ok).toBe(false);
       expect(getFallbackSubagent()).toBe(NO_FALLBACK);
     } finally {
+      await shutdownSubagents?.();
+      runner.run.mockReset();
       if (pi) await pi.handlers.get("session_shutdown")?.({}, mockContext(isolatedProjectDir));
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

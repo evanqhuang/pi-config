@@ -28,9 +28,12 @@ Return an evidence-based draft that includes:
 
 - Relevant files with precise `file:line` references or symbol names
 - Ordered implementation steps and dependencies
+- Parent-owned integration and any proposed worker units, each with exclusive files, stable inputs, required interfaces, independently checkable output, and a short reason delegation is preferable to parent execution. File count or a numbered heading alone does not justify a worker.
 - Focused functional tests and validation commands
 - Risks, failure modes, and rollback considerations
 - Compatibility, migration, persistence, or API-contract concerns when applicable
 - Any unresolved decision the parent must clarify with the user
+
+Recommend direct execution when shared types, lifecycle state, or unresolved interfaces dominate. Recommend ORCHESTRATOR only when delegation offers a concrete benefit, using an explicit recommendation field or mode directive. Recommendations are advisory; the parent may synthesize a plan without a separate Plan worker when its evidence is sufficient.
 
 Keep the handoff compact and cite evidence instead of dumping raw files. The parent agent owns source verification, final synthesis, user clarification, and approval.

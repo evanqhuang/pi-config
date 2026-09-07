@@ -60,12 +60,13 @@ const CHILD_RESTRICTIONS = [
 const PARENT_FULL_WORKFLOW = [
   "Parent planning workflow:",
   "Investigate the repository before proposing changes and keep the managed plan authoritative.",
-  "Use the classic two-phase flow: direct inspection or at most three independent, non-overlapping Explore workers; then verify and aggregate their evidence before normally launching one fresh, one-shot Plan worker.",
+  "Use the classic two-phase flow: direct inspection or at most three independent, non-overlapping Explore workers; then verify and aggregate their evidence and plan directly when sufficient. Use a fresh, one-shot Plan worker only for a distinct design question worth independent analysis.",
   "Give Explore a self-contained objective, search focus, known paths or symbols, and thoroughness. Give Plan user intent, requirements, constraints, verified file or symbol findings, non-goals, and open questions; Plan must not repeat broad discovery.",
   "Use ask_user_question during initial understanding or review whenever requirements, scope, risk, or a critical implementation choice is ambiguous.",
   "Ask focused questions only after enough repository investigation to present meaningful options and a recommendation.",
   "Do not make large assumptions merely to finish the plan.",
   "Fold each resolved answer into the managed plan before submission.",
+  "Substantial plans identify parent-owned integration, proposed workers with exclusive files, required interfaces, dependency order, and focused verification. State why each worker is preferable to parent execution; file count and numbered headings are insufficient. Recommend direct execution when shared types, lifecycle state, or unresolved interfaces dominate; recommend ORCHESTRATOR only for a concrete delegation benefit. Recommendations remain advisory.",
   "Use ask_user_question only for clarification or approach selection, never for ‘is this plan okay?’ or implementation approval.",
   "Approval is submit-only: call submit_plan_for_approval for implementation approval; do not use a generic question as approval.",
   "Finish an implementation-planning turn only by asking a necessary clarification or calling submit_plan_for_approval.",
@@ -73,14 +74,14 @@ const PARENT_FULL_WORKFLOW = [
 
 const PARENT_SPARSE_WORKFLOW = [
   "Parent clarification reminder: when requirements, scope, risk, or a critical implementation choice remains unresolved, investigate enough to offer meaningful options and use ask_user_question.",
-  "Keep delegation phased and bounded: up to three non-overlapping Explore responsibilities, parent verification and aggregation, then normally one fresh Plan worker that designs from the supplied evidence without broad rediscovery.",
+  "Keep delegation phased and bounded: up to three non-overlapping Explore responsibilities, parent verification and aggregation, then parent synthesis; a fresh Plan worker is optional for a distinct design gap, without broad rediscovery.",
   "Do not make large assumptions; fold resolved answers into the managed plan before submission.",
   "ask_user_question is for clarification or approach selection only, never plan approval; approval is submit-only via submit_plan_for_approval.",
 ].join("\n");
 
 const PARENT_REENTRY_WORKFLOW = [
   "Parent PLAN re-entry: re-establish repository context before acting on the plan.",
-  "Resume the bounded two-phase flow: use direct inspection or up to three non-overlapping Explore responsibilities, verify and aggregate evidence, then normally use one fresh Plan worker without broad rediscovery.",
+  "Resume the bounded two-phase flow: use direct inspection or up to three non-overlapping Explore responsibilities, verify and aggregate evidence, then synthesize directly when sufficient; delegate only a distinct design gap without broad rediscovery.",
   "If requirements, scope, risk, or a critical implementation choice is unresolved, investigate enough to offer meaningful options, then use ask_user_question; Do not make large assumptions.",
   "Fold resolved answers into the managed plan. ask_user_question is never approval; implementation approval is submit-only via submit_plan_for_approval.",
 ].join("\n");

@@ -197,6 +197,11 @@ export function resolveAgentInvocationConfig(
   };
 }
 
-export function resolveJoinMode(defaultJoinMode: JoinMode, runInBackground: boolean): JoinMode | undefined {
-  return runInBackground ? defaultJoinMode : undefined;
+export function resolveJoinMode(
+  defaultJoinMode: JoinMode,
+  runInBackground: boolean,
+  options: { orchestratorOwned?: boolean; explicitDefault?: boolean } = {},
+): JoinMode | undefined {
+  if (!runInBackground) return undefined;
+  return options.orchestratorOwned && !options.explicitDefault ? "group" : defaultJoinMode;
 }
