@@ -141,6 +141,23 @@ test("hidden transient reminders deduplicate without mutating input", () => {
   assert.equal(replacement.display, false);
 });
 
+test("verification reminders target changed-slice evidence and approved scope", () => {
+  const needed = renderOrchestratorReminder({ phase: ORCHESTRATOR_PHASES.VERIFICATION_NEEDED, agents: [] });
+  assert.match(needed, /focused checks for each changed slice/);
+  assert.match(needed, /only affected integration checks/);
+  assert.match(needed, /approved criteria and treat non-goals as out of scope/);
+
+  const verifying = renderOrchestratorReminder({ phase: ORCHESTRATOR_PHASES.VERIFYING, agents: [] });
+  assert.match(verifying, /delta\/affected checks/);
+  assert.match(verifying, /not covered by that evidence/);
+  assert.match(verifying, /do not repeat an identical full suite/);
+
+  const signoff = renderOrchestratorReminder({ phase: ORCHESTRATOR_PHASES.SIGNOFF_READY, agents: [] });
+  assert.match(signoff, /After verifier evidence/);
+  assert.match(signoff, /changed or uncovered delta\/affected checks/);
+  assert.match(signoff, /Scope any gap only to approved criteria/);
+});
+
 test("event-bus overload accepts a plain channel and payload", () => {
   let state = reduceOrchestratorState(createOrchestratorState(), "subagents:started", {
     id: "worker-1", type: "ImplementationWorker", description: "worker",

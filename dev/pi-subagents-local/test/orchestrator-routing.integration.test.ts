@@ -164,7 +164,8 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       expect(request).toMatchObject({
         subagent_type: "ImplementationWorker",
         model: "openai-codex/gpt-5.6-luna",
-        thinking: "xhigh",
+        thinking: "high",
+        orchestrator_owned: true,
       });
 
       const cards = loadCustomAgents(isolatedProjectDir);
@@ -176,7 +177,7 @@ describe("cross-extension ORCHESTRATOR routing", () => {
       expect(resolvedCard).toMatchObject({
         name: "ImplementationWorker",
         model: "openai-codex/gpt-5.6-luna",
-        thinking: "xhigh",
+        thinking: "high",
         extensions: false,
         skills: false,
         source: "global",

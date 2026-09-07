@@ -20,14 +20,40 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import {
+  resolveDefaultModel,
+  resumeAgent,
+  runAgent,
+  setProgressRuntimeActive,
+  type ToolActivity,
+} from "./agent-runner.js";
 import { getAgentSafetyPolicy } from "./agent-safety-policy.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { assignHandle, handleBase } from "./mention.js";
-import { registerAgents, resolveSpawnType } from "./agent-types.js";
+import { getAgentConfig, registerAgents, resolveSpawnType } from "./agent-types.js";
+import { getLocalModelPolicyError, isLocalModeEnabled } from "./model-scope.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
-import { addUsage, type LifetimeUsage } from "./usage.js";
+import type {
+  AgentInvocation,
+  AgentRecord,
+  AgentTombstone,
+  IsolationMode,
+  MentionResolution,
+  SubagentType,
+  ThinkingLevel,
+} from "./types.js";
+import type { ProgressCheckpointAttentionEffect, ProgressCheckpointSnapshot } from "./progress-checkpoint.js";
+import type { ProgressRuntime } from "./progress-runtime.js";
+import {
+  addUsage,
+  createUsageLedger,
+  getDirectUsageTotals,
+  recordUsageContribution,
+  type LifetimeUsage,
+  type UsageLedger,
+  type UsageMessageContribution,
+  type UsageProviderModelTotal,
+} from "./usage.js";
 import {
   cleanupWorktree,
   createWorktree,
@@ -49,7 +75,14 @@ export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void
  * accounting above all.
  */
 export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
+/** Bounded parent-attention handoff; observers must not abort or respawn. */
+export type OnProgressAttention = (record: AgentRecord, effect: ProgressCheckpointAttentionEffect) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
+
+function deactivateProgressRuntime(runtime: ProgressRuntime): void {
+  // Older test doubles/extensions may not expose the optional runner helper.
+  if (typeof setProgressRuntimeActive === "function") setProgressRuntimeActive(runtime, false);
+}
 
 /**
  * Default max concurrent background agents.
@@ -88,6 +121,11 @@ const MAX_TOMBSTONES = 100;
  * directory — curated errors instead of TypeErrors from path/fs internals
  * (RPC callers send arbitrary JSON: null, numbers, file paths).
  */
+function isNativeGoalType(type: string): boolean {
+  const normalized = type.toLowerCase();
+  return normalized === "goaljudge" || normalized === "goalverifier";
+}
+
 function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | null {
   if (cwd == null) return;
   if (typeof cwd !== "string" || !isAbsolute(cwd)) {
@@ -137,6 +175,17 @@ function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgen
  */
 function occupiesForegroundSlot(record: Pick<AgentRecord, "blocking" | "parentAgentId">): boolean {
   return !!record.blocking && record.parentAgentId === undefined;
+}
+
+function hasLifetimeUsageData(usage: LifetimeUsage): boolean {
+  return usage.input !== 0
+    || usage.output !== 0
+    || usage.cacheWrite !== 0
+    || (usage.cacheRead !== undefined && usage.cacheRead !== 0)
+    || (usage.cost !== undefined && usage.cost !== 0)
+    || usage.costComponents !== undefined
+    || usage.costStatus !== undefined
+    || usage.costProvenance !== undefined;
 }
 
 /**
@@ -195,8 +244,14 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions {
   description: string;
+  /** Explicit orchestrator ownership is required to activate checkpoints. */
+  orchestratorOwned?: boolean;
+  /** Native goal execution is never activated by the orchestrator policy. */
+  nativeGoal?: boolean;
+  /** Bounded state restored when reopening an evicted resumable record. */
+  progressCheckpointSnapshot?: ProgressCheckpointSnapshot;
   /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
@@ -290,10 +345,14 @@ interface SpawnOptions {
   onSessionCreated?: (session: AgentSession) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
+  /** Called once per assistant message with bounded identity/pricing attribution. */
+  onUsageContribution?: (contribution: UsageMessageContribution) => void;
   /** Called once per assistant message_end with that message's usage delta. */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** Optional per-spawn parent-attention observer. */
+  onProgressAttention?: (record: AgentRecord, effect: ProgressCheckpointAttentionEffect) => void;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
@@ -306,7 +365,7 @@ interface SpawnOptions {
   rootSessionId?: string;
 }
 
-interface ResumeOptions {
+export interface ResumeOptions {
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -317,10 +376,16 @@ interface ResumeOptions {
   isBackground?: boolean;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
+  /** Called once per assistant message with bounded identity/pricing attribution. */
+  onUsageContribution?: (contribution: UsageMessageContribution) => void;
   /** Called once per assistant message_end with that message's usage delta. */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** Explicit parent reentry; ordinary resume does not clear checkpoint attention. */
+  continueFromParent?: boolean;
+  /** Optional per-resume parent-attention observer. */
+  onProgressAttention?: (record: AgentRecord, effect: ProgressCheckpointAttentionEffect) => void;
   /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
@@ -376,6 +441,11 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
+  private onProgressAttention?: OnProgressAttention;
+  /** Adapter retained by resumable records; it owns only bounded checkpoint state. */
+  private progressRuntimes = new WeakMap<AgentRecord, ProgressRuntime>();
+  /** Direct worker usage for this manager's current run, independent of records. */
+  private currentRunUsageLedger: UsageLedger = createUsageLedger();
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -464,6 +534,46 @@ export class AgentManager {
     return this.maxConcurrentForeground;
   }
 
+  /** Install the optional lifecycle hook used by later marker/notification UI. */
+  setOnProgressAttention(callback: OnProgressAttention | undefined): void {
+    this.onProgressAttention = callback;
+  }
+
+  /** Return the live adapter for an explicit parent continuation, if present. */
+  getProgressRuntime(id: string): ProgressRuntime | undefined {
+    const record = this.agents.get(id);
+    return record ? this.progressRuntimes.get(record) : undefined;
+  }
+
+  /**
+   * Update the status-only checkpoint projection on a record. Snapshots never
+   * include model output or report bodies beyond the controller's bounded
+   * report fields.
+   */
+  private updateProgressSnapshot(record: AgentRecord, snapshot: ProgressCheckpointSnapshot): void {
+    // Disabled/default policy controllers report `settled` without ever being
+    // active. Do not surface that as a checkpoint status on every worker row.
+    if (snapshot.lifecycle === "settled" && record.checkpointSnapshot === undefined) return;
+    record.checkpointSnapshot = snapshot;
+    record.checkpointStatus = snapshot.lifecycle;
+  }
+
+  /**
+   * Forward one latched attention effect. The runtime itself owns the once
+   * latch; this seam only notifies observers and never aborts or respawns.
+   */
+  private notifyProgressAttention(
+    record: AgentRecord,
+    effect: ProgressCheckpointAttentionEffect,
+    perSpawn?: (record: AgentRecord, effect: ProgressCheckpointAttentionEffect) => void,
+  ): void {
+    const lifecycle = this.onProgressAttention;
+    try { lifecycle?.(record, effect); } catch { /* observers are best effort */ }
+    if (perSpawn && perSpawn !== lifecycle) {
+      try { perSpawn(record, effect); } catch { /* observers are best effort */ }
+    }
+  }
+
   /**
    * Which pool a spawn is charged to, or undefined for one that is charged to
    * neither (nested children, detached non-background spawns).
@@ -520,6 +630,43 @@ export class AgentManager {
       // must receive LunaCompliance's denylist rather than being treated as an
       // ordinary caller-supplied name.
       options = applySafetyPolicy(type, options);
+      // Native goal workers are never activated by the orchestrator policy,
+      // even if an upstream caller forwards an ownership flag.
+      options = {
+        ...options,
+        nativeGoal: options.nativeGoal === true || isNativeGoalType(type),
+      };
+
+      // This is the last shared fresh-spawn boundary. Enforce local mode here
+      // as well as in the Agent tool so RPC, mentions, schedules, and direct
+      // manager callers cannot bypass the policy. Resolve card defaults before
+      // checking: cards with `extensions: false` never load local-mode's child
+      // hooks, so this boundary is what protects them.
+      if (isLocalModeEnabled()) {
+        const effectiveModel = options.model ?? resolveDefaultModel(
+          ctx.model,
+          ctx.modelRegistry,
+          getAgentConfig(type)?.model,
+        );
+        const localModelPolicyError = getLocalModelPolicyError(
+          effectiveModel,
+          getAgentConfig(type)?.model,
+        );
+        if (localModelPolicyError) throw new Error(localModelPolicyError);
+      }
+    } else {
+      // The mention dispatcher supplies only the historical session file. Recover
+      // the bounded policy state from the matching tombstone without trusting
+      // caller-supplied activation flags.
+      const tombstone = [...this.tombstones.values()].find(entry => entry.sessionFile === options.resumeSessionFile);
+      if (tombstone) {
+        options = {
+          ...options,
+          orchestratorOwned: tombstone.orchestratorOwned,
+          nativeGoal: tombstone.nativeGoal,
+          progressCheckpointSnapshot: tombstone.checkpointSnapshot,
+        };
+      }
     }
     // Validate before the queue branch — a queued spawn should fail at the
     // call, not minutes later at drain. Throw (not warn): programmatic callers
@@ -552,7 +699,12 @@ export class AgentManager {
       startedAt: Date.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+      directUsageLedger: createUsageLedger(),
       compactionCount: 0,
+      checkpointStatus: options.progressCheckpointSnapshot?.lifecycle,
+      checkpointSnapshot: options.progressCheckpointSnapshot,
+      orchestratorOwned: options.orchestratorOwned,
+      nativeGoal: options.nativeGoal,
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
       // declared it (e.g. a cross-extension RPC spawn). The widget's background-
@@ -827,6 +979,8 @@ export class AgentManager {
       pi,
       agentId: id,
       model: options.model,
+      orchestratorOwned: options.orchestratorOwned,
+      nativeGoal: options.nativeGoal,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
@@ -851,7 +1005,18 @@ export class AgentManager {
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
+      onProgressSnapshot: (snapshot) => this.updateProgressSnapshot(record, snapshot),
+      onProgressAttention: (effect) => this.notifyProgressAttention(record, effect, options.onProgressAttention),
+      onProgressRuntime: (runtime) => this.progressRuntimes.set(record, runtime),
+      progressCheckpointSnapshot: record.checkpointSnapshot,
+      onUsageContribution: (contribution) => {
+        if (this.acceptUsageContribution(record, contribution)) {
+          options.onUsageContribution?.(contribution);
+        }
+      },
       onAssistantUsage: (usage) => {
+        // Legacy usage remains the sole source for lifetime folding and
+        // PendingUsagePool notifications; direct attribution is above.
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
@@ -934,7 +1099,9 @@ export class AgentManager {
     }
 
     const promise = runPromise
-      .then(({ responseText, session, aborted, steered, failure }) => {
+      .then(({ responseText, session, aborted, steered, failure, checkpointSnapshot, progressRuntime }) => {
+        if (checkpointSnapshot) this.updateProgressSnapshot(record, checkpointSnapshot);
+        if (progressRuntime) this.progressRuntimes.set(record, progressRuntime);
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -1275,6 +1442,12 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
+    // Resuming does not pass through the fresh-spawn model checks, so inspect
+    // the session's actual current model here. This also protects callers such
+    // as @mentions that resume directly through the manager.
+    const localResumePolicyError = getLocalModelPolicyError(record.session.model);
+    if (localResumePolicyError) return undefined;
+
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
     // "running" — or "queued" when at the concurrency limit. Previously
@@ -1317,12 +1490,26 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    const resumeAbortController = new AbortController();
+    const onResumeAbort = () => resumeAbortController.abort();
+    if (signal?.aborted) resumeAbortController.abort();
+    else signal?.addEventListener("abort", onResumeAbort, { once: true });
+    record.abortController = resumeAbortController;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const progressRuntime = this.progressRuntimes.get(record);
+      const { text, failure, checkpointSnapshot } = await resumeAgent(record.session, prompt, {
+        progressRuntime,
+        continueFromParent: options?.continueFromParent === true,
+        onProgressSnapshot: snapshot => this.updateProgressSnapshot(record, snapshot),
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
+        },
+        onUsageContribution: (contribution) => {
+          if (this.acceptUsageContribution(record, contribution)) {
+            options?.onUsageContribution?.(contribution);
+          }
         },
         onAssistantUsage: (usage) => {
           addUsage(record.lifetimeUsage, usage);
@@ -1334,18 +1521,25 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: resumeAbortController.signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      if (checkpointSnapshot) this.updateProgressSnapshot(record, checkpointSnapshot);
+      if ((record as AgentRecord).status !== "stopped") {
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+      }
       record.result = text;
       record.completedAt = Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
+      if ((record as AgentRecord).status !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
       record.completedAt = Date.now();
+    } finally {
+      signal?.removeEventListener("abort", onResumeAbort);
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1410,10 +1604,19 @@ export class AgentManager {
       this.drainQueue();
     };
 
+    const progressRuntime = this.progressRuntimes.get(record);
     const promise = resumeAgent(record.session, prompt, {
+      progressRuntime,
+      continueFromParent: options.continueFromParent === true,
+      onProgressSnapshot: snapshot => this.updateProgressSnapshot(record, snapshot),
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
+      },
+      onUsageContribution: (contribution) => {
+        if (this.acceptUsageContribution(record, contribution)) {
+          options.onUsageContribution?.(contribution);
+        }
       },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
@@ -1427,7 +1630,8 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, checkpointSnapshot }) => {
+        if (checkpointSnapshot) this.updateProgressSnapshot(record, checkpointSnapshot);
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
@@ -1474,8 +1678,50 @@ export class AgentManager {
     return true;
   }
 
+  /**
+   * Restore the direct ledger on a record produced by an older runtime. Legacy
+   * lifetime totals may include descendants, so preserve them only in
+   * lifetimeUsage and mark the attribution gap without importing historical
+   * amounts into direct or current-run totals.
+   */
+  private ensureDirectUsageLedger(record: AgentRecord): UsageLedger {
+    if (record.directUsageLedger) return record.directUsageLedger;
+    const ledger = createUsageLedger();
+    if (hasLifetimeUsageData(record.lifetimeUsage)) {
+      // There is no message identity with which to attribute a legacy total.
+      // Keep the direct ledger empty: lifetimeUsage remains the inclusive
+      // display value, while this gap prevents it from being counted twice.
+      ledger.gapDetails.unknownIdentity += 1;
+      ledger.attributionGaps += 1;
+    }
+    record.directUsageLedger = ledger;
+    return ledger;
+  }
+
+  /** Accept a new direct message once in the record and manager ledgers. */
+  private acceptUsageContribution(record: AgentRecord, contribution: UsageMessageContribution): boolean {
+    const direct = recordUsageContribution(this.ensureDirectUsageLedger(record), contribution);
+    record.directUsageLedger = direct.ledger;
+    if (!direct.accepted) return false;
+    const aggregate = recordUsageContribution(this.currentRunUsageLedger, contribution);
+    if (aggregate.accepted) this.currentRunUsageLedger = aggregate.ledger;
+    return true;
+  }
+
+  /** Bounded direct worker usage for this manager's current run. */
+  getCurrentRunUsageLedger(): UsageLedger {
+    return this.currentRunUsageLedger;
+  }
+
+  /** Provider/model totals from the current run, independent of live records. */
+  getCurrentRunUsageTotals(): readonly UsageProviderModelTotal[] {
+    return getDirectUsageTotals(this.currentRunUsageLedger);
+  }
+
   getRecord(id: string): AgentRecord | undefined {
-    return this.agents.get(id);
+    const record = this.agents.get(id);
+    if (record) this.ensureDirectUsageLedger(record);
+    return record;
   }
 
   /** Handles already in use, so a fresh spawn can pick an unclaimed one. */
@@ -1544,7 +1790,9 @@ export class AgentManager {
   }
 
   listAgents(): AgentRecord[] {
-    return [...this.agents.values()].sort(
+    const records = [...this.agents.values()];
+    for (const record of records) this.ensureDirectUsageLedger(record);
+    return records.sort(
       (a, b) => b.startedAt - a.startedAt,
     );
   }
@@ -1565,6 +1813,12 @@ export class AgentManager {
 
     if (record.status !== "running") return false;
     record.abortController?.abort();
+    const progressRuntime = this.progressRuntimes.get(record);
+    if (progressRuntime) {
+      progressRuntime.cancel();
+      this.updateProgressSnapshot(record, progressRuntime.snapshot());
+      deactivateProgressRuntime(progressRuntime);
+    }
     record.status = "stopped";
     record.completedAt = Date.now();
     this.scheduleDisposableCleanup(record);
@@ -1646,10 +1900,17 @@ export class AgentManager {
     }
     this.tombstone(record);
     const session = record.session;
+    const progressRuntime = this.progressRuntimes.get(record);
+    if (progressRuntime) {
+      progressRuntime.settle();
+      this.updateProgressSnapshot(record, progressRuntime.snapshot());
+      deactivateProgressRuntime(progressRuntime);
+    }
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
     record.session = undefined;
     this.agents.delete(id);
+    this.progressRuntimes.delete(record);
     this.detachedWaiters.delete(id);
     this.spawnOrder.delete(id);
     // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
@@ -1674,6 +1935,10 @@ export class AgentManager {
       description: record.description,
       sessionFile: record.sessionFile,
       completedAt: record.completedAt ?? Date.now(),
+      ...(record.checkpointStatus !== undefined ? { checkpointStatus: record.checkpointStatus } : {}),
+      ...(record.checkpointSnapshot !== undefined ? { checkpointSnapshot: record.checkpointSnapshot } : {}),
+      ...(record.orchestratorOwned !== undefined ? { orchestratorOwned: record.orchestratorOwned } : {}),
+      ...(record.nativeGoal !== undefined ? { nativeGoal: record.nativeGoal } : {}),
     };
     // Keep partial worktree test doubles/older builds compatible: metadata
     // reporting is additive and must not make tombstoning itself fail.
@@ -1807,7 +2072,16 @@ export class AgentManager {
     for (const record of records) this.cleanupDisposableRecord(record);
     await Promise.allSettled([...this.disposableCleanupPromises.values()]);
 
-    // No active record can retain a disposable worktree past this point.
+    // No active record can retain a disposable worktree or live checkpoint
+    // adapter past this point.
+    for (const record of records) {
+      const progressRuntime = this.progressRuntimes.get(record);
+      if (progressRuntime) {
+        progressRuntime.settle();
+        this.updateProgressSnapshot(record, progressRuntime.snapshot());
+        deactivateProgressRuntime(progressRuntime);
+      }
+    }
     this.agents.clear();
     this.detachedWaiters.clear();
     this.spawnOrder.clear();

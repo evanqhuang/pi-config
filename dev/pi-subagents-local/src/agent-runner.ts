@@ -2,6 +2,7 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -24,10 +25,22 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { getLocalModelPolicyError } from "./model-scope.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createToolLoopGuard, type ToolLoopGuard } from "./tool-loop-guard.js";
+import { loadSettings, resolveProgressCheckpointSettings } from "./settings.js";
+import {
+  createProgressCheckpointController,
+  type ProgressCheckpointAttentionEffect,
+  type ProgressCheckpointSnapshot,
+} from "./progress-checkpoint.js";
+import {
+  createProgressRuntime,
+  PROGRESS_REPORT_TOOL_NAME,
+  type ProgressRuntime,
+} from "./progress-runtime.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
-import type { LifetimeUsage } from "./usage.js";
+import type { LifetimeUsage, UsageMessageContribution } from "./usage.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -484,9 +497,118 @@ export interface ToolActivity {
   toolName: string;
 }
 
+const USAGE_COST_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * A zeroed SDK cost is ambiguous: pi emits that shape both for a genuinely
+ * free model and for a model whose catalog has no pricing. Only the latter
+ * must be reported as unavailable, never as a zero subscription charge.
+ */
+function hasConfiguredNonzeroPricing(model: unknown): boolean {
+  const cost = (model as { cost?: Record<string, unknown> } | undefined)?.cost;
+  if (!cost) return false;
+  const rates = USAGE_COST_KEYS.some(key => (finiteNumber(cost[key]) ?? 0) > 0);
+  const tiers = Array.isArray(cost.tiers) && cost.tiers.some(tier =>
+    !!tier && typeof tier === "object" && USAGE_COST_KEYS.some(key =>
+      (finiteNumber((tier as Record<string, unknown>)[key]) ?? 0) > 0,
+    ),
+  );
+  return rates || tiers;
+}
+
+function assistantLifetimeUsage(message: any, effectiveModel: unknown): LifetimeUsage {
+  const sdkUsage = message?.usage ?? {};
+  const cost = sdkUsage.cost && typeof sdkUsage.cost === "object" ? sdkUsage.cost : undefined;
+  const costComponents = cost
+    ? Object.fromEntries(
+        USAGE_COST_KEYS.flatMap(key => {
+          const value = finiteNumber(cost[key]);
+          return value === undefined ? [] : [[key, value]];
+        }),
+      )
+    : undefined;
+  const reportedCostValues = costComponents ? Object.values(costComponents) : [];
+  const sdkHasNonzeroCost = reportedCostValues.some(value => value !== 0)
+    || (finiteNumber(cost?.total) ?? 0) !== 0;
+  const messageProvider = nonEmptyString(message?.provider);
+  const messageModel = nonEmptyString(message?.model);
+  const effectiveProvider = nonEmptyString((effectiveModel as any)?.provider);
+  const effectiveModelId = nonEmptyString((effectiveModel as any)?.id);
+  // A session model's catalog rates are usable only when the assistant did
+  // not identify a different model. A mixed-model transcript must not inherit
+  // the session model's pricing merely because its SDK cost is zero.
+  const sameEffectiveModel = (!messageProvider || messageProvider === effectiveProvider)
+    && (!messageModel || messageModel === effectiveModelId);
+  const reliablePricing = sdkHasNonzeroCost
+    || (sameEffectiveModel && hasConfiguredNonzeroPricing(effectiveModel));
+  const usage: LifetimeUsage = {
+    input: finiteNumber(sdkUsage.input) ?? 0,
+    output: finiteNumber(sdkUsage.output) ?? 0,
+    cacheWrite: finiteNumber(sdkUsage.cacheWrite) ?? 0,
+    cacheRead: finiteNumber(sdkUsage.cacheRead) ?? 0,
+  };
+
+  if (!reliablePricing) {
+    usage.costStatus = "unavailable";
+    usage.costProvenance = "unknown";
+    return usage;
+  }
+
+  if (costComponents && Object.keys(costComponents).length > 0) {
+    usage.costComponents = costComponents;
+  }
+  const total = finiteNumber(cost?.total);
+  if (total !== undefined) usage.cost = total;
+  const completeComponents = USAGE_COST_KEYS.every(key => finiteNumber(cost?.[key]) !== undefined);
+  usage.costStatus = completeComponents || total !== undefined ? "model-priced" : "partial";
+  usage.costProvenance = "model-pricing-estimate";
+  return usage;
+}
+
+/** Create one bounded identity stream for one spawn or resume invocation. */
+function createAssistantUsageReporter(
+  session: AgentSession,
+  fallbackModel: unknown,
+  onUsageContribution: ((contribution: UsageMessageContribution) => void) | undefined,
+  onAssistantUsage: ((usage: LifetimeUsage) => void) | undefined,
+): (message: any) => void {
+  const attemptId = randomUUID();
+  let messageOrdinal = 0;
+  return (message: any) => {
+    // Older pi test doubles sometimes omit usage. Preserve the legacy callback
+    // contract in that case; normal SDK assistant messages always carry usage.
+    if (!message?.usage) return;
+    const effectiveModel = session.model ?? fallbackModel;
+    const usage = assistantLifetimeUsage(message, effectiveModel);
+    const contribution: UsageMessageContribution = {
+      provider: nonEmptyString(message.provider) ?? nonEmptyString((effectiveModel as any)?.provider),
+      model: nonEmptyString(message.model) ?? nonEmptyString((effectiveModel as any)?.id),
+      attemptId,
+      // The ordinal is intentionally local to this invocation; retaining the
+      // transcript to recover IDs would defeat the bounded runtime contract.
+      messageId: String(++messageOrdinal),
+      usage,
+    };
+    onUsageContribution?.(contribution);
+    onAssistantUsage?.(usage);
+  };
+}
+
 export interface RunOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
+  /** Explicit orchestrator ownership is required to activate checkpoints. */
+  orchestratorOwned?: boolean;
+  /** Native goal execution never receives the orchestrator checkpoint policy. */
+  nativeGoal?: boolean;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
   model?: Model<any>;
@@ -494,6 +616,12 @@ export interface RunOptions {
   signal?: AbortSignal;
   isolated?: boolean;
   inheritContext?: boolean;
+  /**
+   * Internal pi-goal evaluator capability: GoalJudge/GoalVerifier may use their
+   * configured Luna model while local mode keeps ordinary subagents local-only.
+   * The runner accepts this only for those two canonical evaluator types.
+   */
+  allowCloudModelInLocalMode?: boolean;
   thinkingLevel?: ThinkingLevel;
   /**
    * Reopen this pi session file rather than starting an empty conversation.
@@ -540,18 +668,30 @@ export interface RunOptions {
   onSessionCreated?: (session: AgentSession) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
+  /** Called once for a bounded parent-attention handoff request. */
+  onProgressAttention?: (effect: ProgressCheckpointAttentionEffect) => void;
+  /** Receives bounded checkpoint snapshots as lifecycle events advance. */
+  onProgressSnapshot?: (snapshot: ProgressCheckpointSnapshot) => void;
+  /** Retains the adapter so a later explicit resume can continue the same policy. */
+  onProgressRuntime?: (runtime: ProgressRuntime) => void;
+  /** Restored state from the previous invocation of this agent. */
+  progressCheckpointSnapshot?: ProgressCheckpointSnapshot;
+  /** Explicit parent reentry; never inferred from an ordinary resume. */
+  continueFromParent?: boolean;
   /**
    * Called once per assistant message_end with that message's usage delta.
    * Lets callers maintain a lifetime accumulator that survives compaction
    * (which replaces session.state.messages and resets stats-derived sums).
    *
-   * `cost` is pi's own `usage.cost.total` for that message — priced from the
-   * model's rates, so it is 0 (not missing) for a model pi has no pricing for.
-   * We never price anything ourselves; every dollar figure this extension shows
-   * or reports traces back to this field.
+   * Cost components come from pi's SDK pricing. Zeroed SDK components are
+   * marked unavailable unless the effective model has configured nonzero rates;
+   * this extension never treats an unavailable estimate as a subscription charge.
    */
   /** Additional tools denied by the resolved invocation policy. */
   disallowedTools?: readonly string[];
+  /** Called once per assistant message with bounded identity and pricing attribution. */
+  onUsageContribution?: (contribution: UsageMessageContribution) => void;
+  /** Legacy per-message callback retained for ancestor folding and PendingUsagePool. */
   onAssistantUsage?: (usage: LifetimeUsage) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
@@ -570,6 +710,10 @@ export interface RunOptions {
 export interface RunResult {
   responseText: string;
   session: AgentSession;
+  /** Bounded checkpoint state for an explicit future resume. */
+  checkpointSnapshot?: ProgressCheckpointSnapshot;
+  /** Adapter retained by the manager while the record remains resumable. */
+  progressRuntime?: ProgressRuntime;
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
@@ -657,6 +801,41 @@ export function toolLoopFailureSince(
   checkpoint: number,
 ): string | undefined {
   return guard && guard.failureVersion > checkpoint ? guard.failureMessage : undefined;
+}
+
+/** Progress adapters live for the record lifetime, but only an active run may steer. */
+const progressRuntimeActive = new WeakMap<ProgressRuntime, {
+  active: boolean;
+  resetAttention?: () => void;
+}>();
+
+export function setProgressRuntimeActive(runtime: ProgressRuntime, active: boolean): void {
+  const state = progressRuntimeActive.get(runtime);
+  if (state) state.active = active;
+}
+
+/** Re-arm the once-per-continuation attention callback on explicit parent reentry. */
+export function resetProgressRuntimeAttention(runtime: ProgressRuntime): void {
+  progressRuntimeActive.get(runtime)?.resetAttention?.();
+}
+
+function isNativeGoalType(type: string): boolean {
+  const normalized = type.toLowerCase();
+  return normalized === "goaljudge" || normalized === "goalverifier";
+}
+
+function conciseProgressHandoff(effect: ProgressCheckpointAttentionEffect): string {
+  const report = effect.report;
+  const field = (value: string): string => value.slice(0, 256);
+  return [
+    "INCOMPLETE HANDOFF REQUEST",
+    `Reason: ${effect.reason}`,
+    `Progress: ${field(report.progress)}`,
+    `Evidence: ${field(report.evidence)}`,
+    `Blocker: ${field(report.blocker || "none")}`,
+    `Next action: ${field(report.nextAction)}`,
+    "Do not stop or ask the parent to resume; continue the assigned work after this handoff.",
+  ].join("\n");
 }
 
 /**
@@ -904,6 +1083,36 @@ export async function runAgent(
   const model = options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
+  const isAllowedGoalEvaluatorCloudModel = options.allowCloudModelInLocalMode === true
+    && (type === "GoalJudge" || type === "GoalVerifier")
+    && model?.provider === "openai-codex"
+    && model.id.toLowerCase().includes("luna");
+  const localModelPolicyError = isAllowedGoalEvaluatorCloudModel
+    ? undefined
+    : getLocalModelPolicyError(model, agentConfig?.model);
+  if (localModelPolicyError) throw new Error(localModelPolicyError);
+
+  // Progress checkpoints are opt-in and explicitly orchestrator-owned. Native
+  // goal evaluators remain outside this policy even when a caller accidentally
+  // forwards the ownership flag.
+  const nativeGoal = options.nativeGoal === true || isNativeGoalType(type);
+  const orchestratorOwned = options.orchestratorOwned === true;
+  const progressActivation = {
+    explicit: orchestratorOwned,
+    orchestratorOwned,
+    ...(nativeGoal ? { nativeGoal: true } : {}),
+  } as const;
+  const progressOverride = resolveProgressCheckpointSettings(
+    loadSettings(configCwd),
+    model?.provider,
+    model?.id,
+  );
+  const progressController = createProgressCheckpointController({
+    ...(progressOverride ?? {}),
+    provider: model?.provider,
+    model: model?.id,
+    activation: progressActivation,
+  }, options.progressCheckpointSnapshot);
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
@@ -938,6 +1147,44 @@ export async function runAgent(
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+  const scopedCustomToolNames = new Set(nestedToolNames);
+  if (progressController.isEnabled && !disallowedSet?.has(PROGRESS_REPORT_TOOL_NAME)) {
+    scopedCustomToolNames.add(PROGRESS_REPORT_TOOL_NAME);
+  }
+
+  // The report tool is part of the session's immutable custom-tool set. Keep
+  // one adapter with the session so a later resume reuses its controller and
+  // report-tool closure rather than creating a stale second session runtime.
+  let progressSession: AgentSession | undefined;
+  let attentionDelivered = false;
+  const progressState = {
+    active: true,
+    resetAttention: () => { attentionDelivered = false; },
+  };
+  let progressRuntime!: ProgressRuntime;
+  progressRuntime = createProgressRuntime({
+    controller: progressController,
+    steer: message => {
+      if (!progressState.active || !progressSession) return;
+      return progressSession.steer(message);
+    },
+    onAttention: effect => {
+      if (!progressState.active || !progressSession || attentionDelivered) return;
+      attentionDelivered = true;
+      try { options.onProgressAttention?.(effect); } catch { /* lifecycle observers are best effort */ }
+      if (!progressState.active) return;
+      try {
+        void progressSession.steer(conciseProgressHandoff(effect)).catch(() => {});
+      } catch { /* a completed/aborted session cannot accept a handoff */ }
+    },
+  });
+  progressRuntimeActive.set(progressRuntime, progressState);
+  const reportProgressSnapshot = () => {
+    if (!progressController.isEnabled) return;
+    try { options.onProgressSnapshot?.(progressRuntime.snapshot()); } catch { /* best effort */ }
+  };
+  options.onProgressRuntime?.(progressRuntime);
+  reportProgressSnapshot();
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
   //
@@ -978,6 +1225,9 @@ export async function runAgent(
         (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
       ),
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
+      ...(progressController.isEnabled && !disallowedSet?.has(PROGRESS_REPORT_TOOL_NAME)
+        ? [PROGRESS_REPORT_TOOL_NAME]
+        : []),
     ];
   } else {
     // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
@@ -1043,7 +1293,9 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: nestedTools,
+    customTools: progressController.isEnabled && !disallowedSet?.has(PROGRESS_REPORT_TOOL_NAME)
+      ? [...nestedTools, progressRuntime.reportTool]
+      : nestedTools,
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
@@ -1054,6 +1306,12 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  progressSession = session;
+  const sessionLocalModelPolicyError = getLocalModelPolicyError(session.model);
+  if (sessionLocalModelPolicyError) {
+    session.dispose();
+    throw new Error(sessionLocalModelPolicyError);
+  }
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1086,7 +1344,7 @@ export async function runAgent(
       disallowedSet,
       extNames,
       narrowing,
-      nestedToolNames,
+      nestedToolNames: scopedCustomToolNames,
     });
   }
   const toolLoopGuard = installLocalModelToolLoopGuard(
@@ -1104,7 +1362,18 @@ export async function runAgent(
   let aborted = false;
 
   let currentMessageText = "";
+  const reportAssistantUsage = createAssistantUsageReporter(
+    session,
+    options.model,
+    options.onUsageContribution,
+    options.onAssistantUsage,
+  );
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+    // Observe every installed-SDK event through the bounded adapter. Its only
+    // worker steering point is a completed tool-use turn_end; final turns are
+    // intentionally never steered.
+    progressRuntime.observe(event);
+    reportProgressSnapshot();
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
@@ -1132,14 +1401,7 @@ export async function runAgent(
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
-      const u = (event.message as any).usage;
-      if (u) options.onAssistantUsage?.({
-        input: u.input ?? 0,
-        output: u.output ?? 0,
-        cacheWrite: u.cacheWrite ?? 0,
-        cacheRead: u.cacheRead ?? 0,
-        cost: u.cost?.total ?? 0,
-      });
+      reportAssistantUsage(event.message);
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
@@ -1167,12 +1429,20 @@ export async function runAgent(
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
+    // A stopped/aborted invocation must close the controller immediately. A
+    // clean completion intentionally remains alive for explicit parent resume;
+    // the manager settles it when the resumable record is evicted/disposed.
+    if (options.signal?.aborted || aborted) progressRuntime.cancel();
+    progressState.active = false;
+    reportProgressSnapshot();
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
   return {
     responseText,
     session,
+    checkpointSnapshot: progressRuntime.snapshot(),
+    progressRuntime,
     aborted,
     steered: softLimitReached,
     failure: toolLoopFailureSince(toolLoopGuard, toolLoopFailureCheckpoint)
@@ -1188,11 +1458,25 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
+    onUsageContribution?: (contribution: UsageMessageContribution) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    /** Existing adapter retained by the manager across explicit resumes. */
+    progressRuntime?: ProgressRuntime;
+    /** Parent reentry is explicit; ordinary resume preserves the prior latch. */
+    continueFromParent?: boolean;
+    onProgressSnapshot?: (snapshot: ProgressCheckpointSnapshot) => void;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; checkpointSnapshot?: ProgressCheckpointSnapshot }> {
+  if (options.progressRuntime) {
+    setProgressRuntimeActive(options.progressRuntime, true);
+    if (options.continueFromParent) {
+      resetProgressRuntimeAttention(options.progressRuntime);
+      options.progressRuntime.continueFromParent();
+    }
+    try { options.onProgressSnapshot?.(options.progressRuntime.snapshot()); } catch { /* best effort */ }
+  }
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1201,20 +1485,23 @@ export async function resumeAgent(
   const toolLoopFailureCheckpoint = toolLoopGuard?.failureVersion ?? 0;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  const reportAssistantUsage = createAssistantUsageReporter(
+    session,
+    session.model,
+    options.onUsageContribution,
+    options.onAssistantUsage,
+  );
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  const unsubEvents = (options.onToolActivity || options.onUsageContribution || options.onAssistantUsage || options.onCompaction || options.progressRuntime)
     ? session.subscribe((event: AgentSessionEvent) => {
+        options.progressRuntime?.observe(event);
+        if (options.progressRuntime) {
+          try { options.onProgressSnapshot?.(options.progressRuntime.snapshot()); } catch { /* best effort */ }
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
+          reportAssistantUsage(event.message);
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
@@ -1228,10 +1515,16 @@ export async function resumeAgent(
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
+    if (options.progressRuntime) {
+      if (options.signal?.aborted) options.progressRuntime.cancel();
+      setProgressRuntimeActive(options.progressRuntime, false);
+      try { options.onProgressSnapshot?.(options.progressRuntime.snapshot()); } catch { /* best effort */ }
+    }
   }
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
+    checkpointSnapshot: options.progressRuntime?.snapshot(),
     failure: toolLoopFailureSince(toolLoopGuard, toolLoopFailureCheckpoint)
       ?? finalTurnError(session, startLen),
   };

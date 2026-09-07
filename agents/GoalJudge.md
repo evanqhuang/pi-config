@@ -3,7 +3,7 @@ name: GoalJudge
 display_name: Goal Judge
 description: Internal one-turn evaluator for native /goal completion decisions.
 tools: none
-extensions: local-mode
+extensions: false
 skills: false
 disallowed_tools: request_deeper_reasoning
 max_turns: 1

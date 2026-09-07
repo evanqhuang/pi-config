@@ -29,7 +29,7 @@ import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from ".
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
-import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
+import { checkModelScope, getLocalModelPolicyError, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -60,7 +60,8 @@ import {
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
+import { createUsageLedger, getLifetimeCost, getLifetimeTotal, getSessionContextPercent, recordUsageContribution, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
+import { renderUsageView, type UsageRestorationGap, type UsageViewWorker } from "./usage-view.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled, toWorktreeReport } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -173,6 +174,25 @@ function buildWorktreeMetadata(record: Pick<AgentRecord, "worktree" | "worktreeR
   return metadata;
 }
 
+/**
+ * Bounded attribution metadata shared by lifecycle events and tool results.
+ * `directUsageLedger` is direct assistant-message spend for this record;
+ * `inclusiveUsage` retains the existing lifetime view, which includes nested
+ * descendants folded into the parent record. They must stay labelled rather
+ * than being added together by consumers.
+ */
+function buildUsageAttribution(record: Pick<AgentRecord, "invocation" | "session" | "directUsageLedger" | "lifetimeUsage">) {
+  const model = record.invocation?.modelId
+    ?? record.invocation?.modelName
+    ?? (record.session?.model ? `${record.session.model.provider}/${record.session.model.id}` : undefined);
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(record.invocation?.thinking !== undefined ? { thinking: record.invocation.thinking } : {}),
+    ...(record.directUsageLedger !== undefined ? { directUsageLedger: record.directUsageLedger } : {}),
+    inclusiveUsage: toReportedUsage(record.lifetimeUsage),
+  };
+}
+
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
 function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
   const status = getStatusLabel(record.status, record.error);
@@ -228,6 +248,8 @@ function buildDetails(
     error?: string;
     id?: string;
     session?: any;
+    invocation?: AgentRecord["invocation"];
+    directUsageLedger?: AgentRecord["directUsageLedger"];
     lifetimeUsage: LifetimeUsage;
     worktree?: AgentRecord["worktree"];
     worktreeResult?: AgentRecord["worktreeResult"];
@@ -249,6 +271,7 @@ function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    ...(buildUsageAttribution(record) as any),
     ...(buildWorktreeMetadata(record) as any),
     ...overrides,
   };
@@ -395,7 +418,13 @@ export default function (pi: ExtensionAPI) {
 
   // Read directly rather than waiting for applyAndEmitLoaded below: this decides
   // the initial load, which happens hundreds of lines before settings are applied.
-  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+  const initialSettings = loadSettings(process.cwd());
+  let strictAgentFiles = initialSettings.strictAgentFiles === true;
+  // These settings are owned by the checkpoint/settings integration, but this
+  // extension still has to preserve them when it snapshots unrelated settings.
+  // Keep the loaded values rather than inventing defaults or reading a transcript.
+  let progressCheckpointSettings = initialSettings.progressCheckpoints;
+  let usageWarningUsd = initialSettings.usageWarningUsd;
 
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
@@ -438,6 +467,95 @@ export default function (pi: ExtensionAPI) {
   function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
   function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
   const pendingUsage = new PendingUsagePool();
+
+  // Parent usage is deliberately a separate direct ledger.  It only observes
+  // this extension's host-session message_end events; child AgentSessions have
+  // their own subscriptions in agent-runner/manager and never flow through this
+  // handler.  In particular, do not derive it by subtracting tool-result usage
+  // from session stats: that is inclusive accounting and loses attribution.
+  let parentUsageLedger = createUsageLedger();
+  let parentMessageOrdinal = 0;
+  let usageRestorationGap: UsageRestorationGap | undefined;
+  const parentAttemptId = `parent-session-${Date.now()}`;
+
+  function finiteUsageNumber(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  }
+
+  function parentAssistantUsage(message: any, effectiveModel: any): LifetimeUsage | undefined {
+    if (!message?.usage || typeof message.usage !== "object") return undefined;
+    const sdkUsage = message.usage as Record<string, unknown>;
+    const sdkCost = sdkUsage.cost && typeof sdkUsage.cost === "object"
+      ? sdkUsage.cost as Record<string, unknown>
+      : undefined;
+    const usage: LifetimeUsage = {
+      input: finiteUsageNumber(sdkUsage.input) ?? 0,
+      output: finiteUsageNumber(sdkUsage.output) ?? 0,
+      cacheWrite: finiteUsageNumber(sdkUsage.cacheWrite) ?? 0,
+      cacheRead: finiteUsageNumber(sdkUsage.cacheRead) ?? 0,
+    };
+    const costKeys = ["input", "output", "cacheRead", "cacheWrite"] as const;
+    const sdkHasNonzeroCost = sdkCost !== undefined
+      && (costKeys.some(key => (finiteUsageNumber(sdkCost[key]) ?? 0) !== 0)
+        || (finiteUsageNumber(sdkCost.total) ?? 0) !== 0);
+    const modelCost = effectiveModel?.cost && typeof effectiveModel.cost === "object"
+      ? effectiveModel.cost as Record<string, unknown>
+      : undefined;
+    const modelHasPricing = modelCost !== undefined
+      && costKeys.some(key => (finiteUsageNumber(modelCost[key]) ?? 0) !== 0);
+    const sameModel = (!message.provider || message.provider === effectiveModel?.provider)
+      && (!message.model || message.model === effectiveModel?.id);
+
+    // A zero SDK cost is not evidence of a free response.  It is usable only
+    // when the effective model supplies non-zero rates for this same model.
+    if (!sdkHasNonzeroCost && !(sameModel && modelHasPricing)) {
+      usage.costStatus = "unavailable";
+      usage.costProvenance = "unknown";
+      return usage;
+    }
+
+    if (sdkCost) {
+      const components: NonNullable<LifetimeUsage["costComponents"]> = {};
+      for (const key of costKeys) {
+        const value = finiteUsageNumber(sdkCost[key]);
+        if (value !== undefined) components[key] = value;
+      }
+      if (Object.keys(components).length > 0) usage.costComponents = components;
+      const total = finiteUsageNumber(sdkCost.total);
+      if (total !== undefined) usage.cost = total;
+      const complete = costKeys.every(key => finiteUsageNumber(sdkCost[key]) !== undefined);
+      usage.costStatus = complete || total !== undefined ? "model-priced" : "partial";
+    } else {
+      usage.costStatus = "unavailable";
+      usage.costProvenance = "unknown";
+      return usage;
+    }
+    usage.costProvenance = "model-pricing-estimate";
+    return usage;
+  }
+
+  pi.on("message_end", (event, ctx) => {
+    const message = event?.message;
+    if (!message || message.role !== "assistant") return;
+    const usage = parentAssistantUsage(message, ctx?.model);
+    if (!usage) return;
+    const responseId = typeof message.responseId === "string" && message.responseId.length > 0
+      ? message.responseId
+      : undefined;
+    const timestamp = finiteUsageNumber(message.timestamp);
+    const messageId = responseId ?? (timestamp !== undefined ? String(timestamp) : `message-${++parentMessageOrdinal}`);
+    const contribution = recordUsageContribution(parentUsageLedger, {
+      provider: typeof message.provider === "string" ? message.provider : (ctx?.model?.provider ?? null),
+      model: typeof message.model === "string" ? message.model : (ctx?.model?.id ?? null),
+      // Assistant messages normally carry a responseId. The bounded fallback
+      // still deduplicates a repeated event with the same timestamp without
+      // consulting or retaining transcript history.
+      attemptId: responseId ?? parentAttemptId,
+      messageId,
+      usage,
+    });
+    if (contribution.accepted) parentUsageLedger = contribution.ledger;
+  });
 
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
@@ -556,6 +674,7 @@ export default function (pi: ExtensionAPI) {
       durationMs,
       tokens,
       usage,
+      ...buildUsageAttribution(record),
       ...buildWorktreeMetadata(record),
     };
   }
@@ -567,6 +686,7 @@ export default function (pi: ExtensionAPI) {
     if (record.parentAgentId) return;
 
     // Emit lifecycle event based on terminal status
+    appendUsageSummary();
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
     if (isError) {
@@ -580,6 +700,9 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      // A bounded record snapshot is useful to consumers that only retain the
+      // completion entry. It is evidence for this run, not a restoration scan.
+      usage: buildUsageAttribution(record),
       ...buildWorktreeMetadata(record),
     });
 
@@ -617,15 +740,18 @@ export default function (pi: ExtensionAPI) {
       fleet.update();
     }
     // Emit started event when agent transitions to running (including from queue)
+    appendUsageSummary();
     pi.events.emit("subagents:started", {
       id: record.id,
       type: record.type,
       description: record.description,
+      ...buildUsageAttribution(record),
       ...buildWorktreeMetadata(record),
     });
   }, (record, info) => {
     if (record.parentAgentId) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
+    appendUsageSummary();
     pi.events.emit("subagents:compacted", {
       id: record.id,
       type: record.type,
@@ -633,6 +759,7 @@ export default function (pi: ExtensionAPI) {
       reason: info.reason,
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
+      ...buildUsageAttribution(record),
       ...buildWorktreeMetadata(record),
     });
   }, (_record, usage) => {
@@ -641,6 +768,30 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+  });
+
+  /** Persist bounded usage state only at lifecycle milestones, never per message. */
+  function appendUsageSummary(): void {
+    pi.appendEntry("subagents:usage", {
+      version: 1,
+      parent: parentUsageLedger,
+      workerTotals: manager.getCurrentRunUsageLedger(),
+      ...(usageRestorationGap !== undefined ? { restorationGap: usageRestorationGap } : {}),
+    });
+  }
+
+  manager.setOnProgressAttention((record, effect) => {
+    const data = { id: record.id, type: record.type, reason: effect.reason,
+      checkpointId: effect.checkpointId, report: effect.report };
+    pi.events.emit("subagents:attention", data);
+    pi.sendMessage({
+      customType: "subagents:attention",
+      content: `Worker ${record.id} needs attention (${effect.reason}). This is an incomplete handoff, not completion.\n`
+        + `Worker-reported evidence: ${effect.report.evidence}\nBlocker: ${effect.report.blocker}\n`
+        + `Next action: ${effect.report.nextAction}\nChoose whether to narrow, continue with evidence, clarify, or retain the incomplete handoff. No replacement or escalation was started.`,
+      display: true,
+    }, { triggerTurn: true, deliverAs: "followUp" });
+    widget.update();
   });
 
   // Ctrl+B is global rather than editor-local: it is reserved for detaching the
@@ -845,7 +996,7 @@ export default function (pi: ExtensionAPI) {
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     currentCtx = ctx;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -883,6 +1034,13 @@ export default function (pi: ExtensionAPI) {
       // Emitting after all factories have run (rather than at factory time)
       // also avoids the race where a consumer loaded after us misses the event.
       pi.events.emit("subagents:ready", {});
+    }
+    // A resumed/forked host session already contains transcript history, but
+    // its old assistant usage is intentionally not reconstructed here. Keep a
+    // visible gap until new message_end evidence arrives instead.
+    if (event.reason === "resume" || event.reason === "fork") {
+      usageRestorationGap = "restored history usage gap: current-run totals exclude prior transcript history";
+      appendUsageSummary();
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
@@ -1131,6 +1289,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    // Persist the bounded current-run summary before the host changes sessions;
+    // no transcript replay is needed (or attempted) on the next activation.
+    appendUsageSummary();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -1150,6 +1311,7 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
+    appendUsageSummary();
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
@@ -1296,6 +1458,12 @@ export default function (pi: ExtensionAPI) {
     prompt: string,
     opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
+    const resumePolicyError = getLocalModelPolicyError(existing.session?.model);
+    if (resumePolicyError) {
+      ctx.ui.notify(resumePolicyError, "error");
+      return undefined;
+    }
+
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
     // Assigned unconditionally: the completion notification carries this as
@@ -1326,6 +1494,7 @@ export default function (pi: ExtensionAPI) {
     // the parent turn is interrupted (user Esc), while agents started with
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
+      continueFromParent: true,
       isBackground: true,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
@@ -1631,6 +1800,9 @@ Terse command-style prompts produce shallow, generic work.
           description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
         }),
       ),
+      orchestrator_owned: Type.Optional(Type.Boolean({
+        description: "Enable soft progress checkpoints for explicitly orchestrator-owned work.",
+      })),
       max_turns: Type.Optional(
         Type.Number({
           description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
@@ -1988,6 +2160,8 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+        const resumePolicyError = getLocalModelPolicyError(existing.session.model);
+        if (resumePolicyError) return textResult(resumePolicyError);
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2029,7 +2203,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, { continueFromParent: true });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2065,6 +2239,7 @@ Terse command-style prompts produce shallow, generic work.
         // tool call failed only when execute throws, and a returned message
         // reads to the model as a subagent that ran and reported this (#179).
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          orchestratorOwned: params.orchestrator_owned === true,
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2218,6 +2393,7 @@ Terse command-style prompts produce shallow, generic work.
       let record: AgentRecord;
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
+          orchestratorOwned: params.orchestrator_owned === true,
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2526,6 +2702,39 @@ Terse command-style prompts produce shallow, generic work.
     return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
   }
 
+  const MAX_USAGE_STATUS_ROWS = 64;
+
+  /** Build a bounded status-only view; result text/history never enters usage state. */
+  function currentUsageView() {
+    const records = manager.listAgents();
+    const workers: UsageViewWorker[] = records.slice(0, MAX_USAGE_STATUS_ROWS).map(record => {
+      const checkpointStatus = (record as AgentRecord & { checkpointStatus?: unknown }).checkpointStatus;
+      return {
+        id: record.id,
+        status: record.status,
+        ...(record.invocation?.modelId
+          ? { model: record.invocation.modelId }
+          : record.invocation?.modelName ? { model: record.invocation.modelName } : {}),
+        ...(record.invocation?.thinking !== undefined ? { thinking: record.invocation.thinking } : {}),
+        ...(typeof checkpointStatus === "string" ? { checkpointStatus } : {}),
+        ...(record.directUsageLedger !== undefined ? { directUsageLedger: record.directUsageLedger } : {}),
+      };
+    });
+    return renderUsageView({
+      parent: parentUsageLedger,
+      workers,
+      // This is authoritative and includes records already evicted from the
+      // bounded status list (and nested workers), without copying their output.
+      workerTotals: manager.getCurrentRunUsageLedger(),
+      ...(usageRestorationGap !== undefined ? { restorationGap: usageRestorationGap } : {}),
+      ...(usageWarningUsd !== undefined ? { costWarningThreshold: usageWarningUsd } : {}),
+    });
+  }
+
+  async function showUsage(ctx: ExtensionCommandContext): Promise<void> {
+    ctx.ui.notify(currentUsageView().text, "info");
+  }
+
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
     reloadCustomAgents();
     const allNames = getAllTypes();
@@ -2540,6 +2749,10 @@ Terse command-style prompts produce shallow, generic work.
       const done = agents.filter(a => a.status === "completed" || a.status === "steered").length;
       options.push(`Running agents (${agents.length}) — ${running} running, ${done} done`);
     }
+
+    // Usage is always available, including before the first worker starts: an
+    // empty current-run ledger is different from an unavailable restored one.
+    options.push("Usage");
 
     // Agent types list
     if (allNames.length > 0) {
@@ -2571,6 +2784,9 @@ Terse command-style prompts produce shallow, generic work.
 
     if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Usage") {
+      await showUsage(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
@@ -3081,6 +3297,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
       outputTranscript: getOutputTranscriptDefault(),
       worktreeIsolation: isWorktreeIsolationEnabled(),
       maxSubagentDepth: getMaxSubagentDepth(),
+      // Owned by the separate checkpoint runtime; preserve it byte-for-byte
+      // when an unrelated /agents setting is saved.
+      progressCheckpoints: progressCheckpointSettings,
+      usageWarningUsd,
       // Deliberately NOT `?? "general-purpose"`: every settings change writes the
       // whole snapshot, and materializing the implicit default would turn it into
       // explicit configuration — which then fails loudly if general-purpose later
@@ -3555,7 +3775,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
   }
 
   pi.registerCommand("agents", {
-    description: "Manage agents",
-    handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+    description: "Manage agents (or show usage)",
+    handler: async (args, ctx) => {
+      if ((args ?? "").trim().toLowerCase() === "usage") {
+        await showUsage(ctx);
+        return;
+      }
+      await showAgentsMenu(ctx);
+    },
   });
 }

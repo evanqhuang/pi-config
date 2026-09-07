@@ -6,7 +6,29 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import type { ProgressCheckpointConfigOverride } from "./progress-checkpoint.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
+
+/** Serializable policy values for progress checkpoint controllers. */
+interface ProgressCheckpointPolicySettings {
+  enabled?: boolean;
+  displayTokenInterval?: number;
+  elapsedIntervalMs?: number;
+  repeatedFingerprintThreshold?: number;
+  repeatedReportThreshold?: number;
+}
+
+export interface ProgressCheckpointSettingsOverride extends ProgressCheckpointPolicySettings {
+  /** Exact provider identity to which this override applies. */
+  provider?: string;
+  /** Exact model identity to which this override applies. */
+  model?: string;
+}
+
+/** Global progress checkpoint policy plus exact provider/model overrides. */
+export interface ProgressCheckpointSettings extends ProgressCheckpointPolicySettings {
+  overrides?: ProgressCheckpointSettingsOverride[];
+}
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
@@ -230,15 +252,26 @@ export interface SubagentsSettings {
    * are wrong.
    *
    * Three properties of what gets reported:
-   *   - Tokens exclude `cacheRead`, for the reason in `usage.ts` — the parent's
-   *     token total therefore rises by billed tokens only.
-   *   - Cost is pi's own per-message `usage.cost.total`; we price nothing, and
-   *     a model pi has no rates for contributes 0.
+   *   - Reported usage includes input, output, `cacheRead`, and `cacheWrite`
+   *     components; the parent's token total therefore includes cache reads.
+   *   - Cost is pi's model-priced estimate, not a quota or a provider-billed
+   *     amount. Missing pricing remains visible as a pricing gap rather than
+   *     being presented as a measured charge.
    *   - The context-window percentage is untouched. Pi derives it from assistant
    *     messages alone (`getContextUsage`), so a delegating session's context
    *     does not appear to fill up faster.
    */
   reportUsage?: boolean;
+
+  /**
+   * Optional progress checkpoint policy configuration. The controller owns its
+   * activation rules and the 150k display-token default; this setting only
+   * supplies explicit policy values and exact provider/model overrides.
+   */
+  progressCheckpoints?: ProgressCheckpointSettings;
+
+  /** Optional USD threshold for an explicitly enabled usage warning. */
+  usageWarningUsd?: number;
   /**
    * Whether the subagent surfaces show an estimated dollar cost next to their
    * token counts (widget, FleetView, conversation viewer, foreground results,
@@ -325,6 +358,73 @@ const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
 
+// Keep hand-edited identity selectors and override lists bounded. These are
+// deliberately generous for real provider/model IDs while preventing a config
+// file from becoming an unbounded source of controller state.
+export const MAX_PROGRESS_CHECKPOINT_OVERRIDES = 64;
+export const MAX_PROGRESS_CHECKPOINT_PROVIDER_MODEL_LENGTH = 256;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function finitePositive(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function validThreshold(value: unknown): value is number {
+  // progress-checkpoint.ts rounds thresholds up, but rejects values below one.
+  return finitePositive(value) && value >= 1;
+}
+
+function boundedIdentity(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, MAX_PROGRESS_CHECKPOINT_PROVIDER_MODEL_LENGTH) : undefined;
+}
+
+function sanitizeProgressCheckpointOverride(
+  raw: unknown,
+  includeIdentity: boolean,
+): ProgressCheckpointSettingsOverride | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: ProgressCheckpointSettingsOverride = {};
+  if (includeIdentity) {
+    const provider = boundedIdentity(raw.provider);
+    const model = boundedIdentity(raw.model);
+    if (provider !== undefined) out.provider = provider;
+    if (model !== undefined) out.model = model;
+  }
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  if (finitePositive(raw.displayTokenInterval)) out.displayTokenInterval = raw.displayTokenInterval;
+  if (finitePositive(raw.elapsedIntervalMs)) out.elapsedIntervalMs = raw.elapsedIntervalMs;
+  if (validThreshold(raw.repeatedFingerprintThreshold)) {
+    out.repeatedFingerprintThreshold = raw.repeatedFingerprintThreshold;
+  }
+  if (validThreshold(raw.repeatedReportThreshold)) out.repeatedReportThreshold = raw.repeatedReportThreshold;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function sanitizeProgressCheckpointSettings(raw: unknown): ProgressCheckpointSettings | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: ProgressCheckpointSettings = {};
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  if (finitePositive(raw.displayTokenInterval)) out.displayTokenInterval = raw.displayTokenInterval;
+  if (finitePositive(raw.elapsedIntervalMs)) out.elapsedIntervalMs = raw.elapsedIntervalMs;
+  if (validThreshold(raw.repeatedFingerprintThreshold)) {
+    out.repeatedFingerprintThreshold = raw.repeatedFingerprintThreshold;
+  }
+  if (validThreshold(raw.repeatedReportThreshold)) out.repeatedReportThreshold = raw.repeatedReportThreshold;
+  if (Array.isArray(raw.overrides)) {
+    const overrides = raw.overrides
+      .slice(0, MAX_PROGRESS_CHECKPOINT_OVERRIDES)
+      .map(override => sanitizeProgressCheckpointOverride(override, true))
+      .filter((override): override is ProgressCheckpointSettingsOverride => override !== undefined);
+    out.overrides = overrides;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
@@ -410,6 +510,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.worktreeIsolation === "boolean") {
     out.worktreeIsolation = r.worktreeIsolation;
   }
+  const progressCheckpoints = sanitizeProgressCheckpointSettings(r.progressCheckpoints);
+  if (progressCheckpoints !== undefined) out.progressCheckpoints = progressCheckpoints;
+  if (finitePositive(r.usageWarningUsd)) out.usageWarningUsd = r.usageWarningUsd as number;
   if (typeof r.reportUsage === "boolean") {
     out.reportUsage = r.reportUsage;
   }
@@ -433,6 +536,61 @@ function sanitize(raw: unknown): SubagentsSettings {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
   return out;
+}
+
+function progressCheckpointPolicyValues(
+  settings: ProgressCheckpointSettings,
+): ProgressCheckpointConfigOverride {
+  const {
+    enabled,
+    displayTokenInterval,
+    elapsedIntervalMs,
+    repeatedFingerprintThreshold,
+    repeatedReportThreshold,
+  } = settings;
+  return {
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(displayTokenInterval !== undefined ? { displayTokenInterval } : {}),
+    ...(elapsedIntervalMs !== undefined ? { elapsedIntervalMs } : {}),
+    ...(repeatedFingerprintThreshold !== undefined ? { repeatedFingerprintThreshold } : {}),
+    ...(repeatedReportThreshold !== undefined ? { repeatedReportThreshold } : {}),
+  };
+}
+
+/**
+ * Resolve the policy values for an exact provider/model identity. This is a
+ * pure lookup, intentionally independent of controller activation: callers
+ * still decide whether the invocation is explicitly orchestrator-owned.
+ *
+ * A provider+model match outranks either single-identity match, which outranks
+ * a global override. Ties retain the first declaration, making the result
+ * deterministic without introducing patterns or implicit fuzzy matching.
+ */
+export function resolveProgressCheckpointSettings(
+  settings: SubagentsSettings,
+  provider?: string,
+  model?: string,
+): ProgressCheckpointConfigOverride | undefined {
+  const progress = sanitizeProgressCheckpointSettings(settings.progressCheckpoints);
+  if (progress === undefined) return undefined;
+
+  const base = progressCheckpointPolicyValues(progress);
+  let selected: ProgressCheckpointSettingsOverride | undefined;
+  let selectedSpecificity = -1;
+  for (const override of progress.overrides ?? []) {
+    const providerMatches = override.provider === undefined || override.provider === provider;
+    const modelMatches = override.model === undefined || override.model === model;
+    if (!providerMatches || !modelMatches) continue;
+    const specificity = (override.provider !== undefined ? 1 : 0)
+      + (override.model !== undefined ? 1 : 0);
+    if (specificity > selectedSpecificity) {
+      selected = override;
+      selectedSpecificity = specificity;
+    }
+  }
+
+  if (selected === undefined) return Object.keys(base).length > 0 ? base : undefined;
+  return { ...base, ...progressCheckpointPolicyValues(selected) };
 }
 
 function globalPath(): string {

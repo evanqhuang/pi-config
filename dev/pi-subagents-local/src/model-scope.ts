@@ -18,6 +18,48 @@ import { isModelInScope, type ModelRegistryRef, readEnabledModels, resolveEnable
  */
 let scopeModelsEnabled = false;
 
+/**
+ * Local mode publishes this process-global flag because child sessions may
+ * deliberately run with `extensions: false`. The subagent extension must
+ * still enforce the local-only provider contract at its own spawn boundary;
+ * otherwise those children can bypass local-mode's provider hooks entirely.
+ */
+const LOCAL_MODE_POLICY_KEY = Symbol.for("pi.local-mode.provider-policy");
+const LOCAL_PROVIDER_NAMES = new Set([
+  "qwen38-main",
+  "qwen38-subagent",
+  "qwopus-subagent",
+]);
+
+interface LocalModeProviderPolicy {
+  enabled?: unknown;
+}
+
+function getLocalModeProviderPolicy(): LocalModeProviderPolicy | undefined {
+  return (globalThis as unknown as Record<PropertyKey, unknown>)[LOCAL_MODE_POLICY_KEY] as
+    | LocalModeProviderPolicy
+    | undefined;
+}
+
+export function isLocalModeEnabled(): boolean {
+  return getLocalModeProviderPolicy()?.enabled === true;
+}
+
+export function getLocalModelPolicyError(
+  model: { provider: string; id: string } | undefined,
+  modelInput?: string,
+): string | undefined {
+  if (!isLocalModeEnabled()) return undefined;
+
+  if (!model) {
+    return "Local mode blocked the subagent: no effective model was resolved.";
+  }
+  if (LOCAL_PROVIDER_NAMES.has(model.provider)) return undefined;
+
+  const label = modelInput ?? `${model.provider}/${model.id}`;
+  return `Local mode only permits local subagent models; blocked "${label}" (${model.provider}).`;
+}
+
 export function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
 export function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
 
@@ -50,6 +92,8 @@ export function checkModelScope(args: {
   modelInput?: string;
 }): ModelScopeVerdict {
   const { model, cwd, modelRegistry, callerSupplied, agentLabel, modelInput } = args;
+  const localPolicyError = getLocalModelPolicyError(model, modelInput);
+  if (localPolicyError) return { kind: "error", message: localPolicyError };
   if (!scopeModelsEnabled || !model) return { kind: "ok" };
 
   const allowed = resolveEnabledModels(readEnabledModels(cwd), modelRegistry, cwd);

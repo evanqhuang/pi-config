@@ -44,7 +44,9 @@
       "prompts": [],
       "themes": []
     },
-    "npm:@haemmid/pi-processes"
+    "npm:@haemmid/pi-processes",
+    "npm:@howaboua/pi-codex-conversion",
+    "npm:@howaboua/pi-codex-web-run"
   ],
   "defaultProvider": "openai-codex",
   "enabledModels": [
@@ -227,5 +229,5 @@
     "+extensions/pr-worktree-guard/index.ts"
   ],
   "defaultThinkingLevel": "low",
-  "defaultModel": "gpt-5.6-luna"
+  "defaultModel": "gpt-6-astra"
 }

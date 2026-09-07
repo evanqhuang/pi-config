@@ -16,14 +16,17 @@ const mocks = vi.hoisted(() => {
     options.onSessionCreated?.(session);
     return { responseText: "verified", session, aborted: false, steered: false };
   });
-  return { createWorktree, cleanupWorktree, pruneWorktrees, isWorktreeIsolationEnabled, runAgent };
+  const resumeAgent = vi.fn(async () => ({ text: "resumed" }));
+  return { createWorktree, cleanupWorktree, pruneWorktrees, isWorktreeIsolationEnabled, runAgent, resumeAgent };
 });
 
 afterEach(() => {
+  delete (globalThis as any)[Symbol.for("pi.local-mode.provider-policy")];
   mocks.createWorktree.mockReset();
   mocks.cleanupWorktree.mockReset();
   mocks.isWorktreeIsolationEnabled.mockReset().mockReturnValue(true);
   mocks.runAgent.mockClear();
+  mocks.resumeAgent.mockClear();
 });
 
 vi.mock("../src/worktree.js", () => ({
@@ -35,7 +38,7 @@ vi.mock("../src/worktree.js", () => ({
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: mocks.runAgent,
-  resumeAgent: vi.fn(),
+  resumeAgent: mocks.resumeAgent,
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
@@ -140,6 +143,42 @@ describe("manager verifier worktree plumbing", () => {
     })).toThrow(/worktree isolation is disabled/);
     expect(mocks.createWorktree).not.toHaveBeenCalled();
     expect(mocks.runAgent).not.toHaveBeenCalled();
+
+    await manager.dispose();
+  });
+
+  it("blocks direct manager spawns with a non-local model in local mode", async () => {
+    (globalThis as any)[Symbol.for("pi.local-mode.provider-policy")] = { enabled: true };
+    const manager = new AgentManager();
+    const cloudModel = { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" } as any;
+
+    expect(() => manager.spawn(
+      {} as any,
+      { cwd: "/repo", model: cloudModel } as any,
+      "general-purpose",
+      "work",
+      { description: "cloud work", model: cloudModel, isBackground: true },
+    )).toThrow(/Local mode only permits local subagent models/);
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+
+    await manager.dispose();
+  });
+
+  it("blocks resuming an existing cloud session in local mode", async () => {
+    const manager = new AgentManager();
+    const cloudModel = { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" } as any;
+    const id = manager.spawn({} as any, { cwd: "/repo" } as any, "general-purpose", "initial", {
+      description: "initial work",
+      model: cloudModel,
+      isBackground: true,
+    });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    record.session = { model: cloudModel } as any;
+    (globalThis as any)[Symbol.for("pi.local-mode.provider-policy")] = { enabled: true };
+
+    expect(await manager.resume(id, "continue")).toBeUndefined();
+    expect(mocks.resumeAgent).not.toHaveBeenCalled();
 
     await manager.dispose();
   });

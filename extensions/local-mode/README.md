@@ -26,7 +26,7 @@ When enabled, the extension:
 - retries every local provider turn, including the 9B `qwopus-subagent`, up to five times when the final provider stop reason is `repetition`, preserving the conversation and discarding partial output from interrupted attempts;
 - requires the main local agent to create and update parent-session todos for multi-step work; Explore remains read-only and cannot update those todos;
 - adds concise local working-style, parent-session todo, and non-blocking delegation instructions to each turn;
-- remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp` and blocks other child launches while the 27B child-agent lane is disabled;
+- remaps built-in `Explore` calls to the read-only `LocalExplore` profile on `qwopus-subagent/qwopus3.5-9b-coder-mtp`, hard-blocks every ordinary subagent whose resolved provider is not local (including cards with `extensions: false` and resumed sessions), while allowing the internal GoalJudge/GoalVerifier Luna evaluators, and blocks other child launches while the 27B child-agent lane is disabled;
 - limits `/local model` and Option-Tab model cycling to `qwen38-main/qwen3.8-27b` and `qwopus-subagent/qwopus3.5-9b-coder-mtp`.
 
 When local mode is disabled, the configured model scope keeps local models out of the default `/model` view and Option-Tab cycle. The picker can still expose Pi's explicit “all models” view, and local providers remain registered so background extensions can use them.

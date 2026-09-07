@@ -119,6 +119,34 @@ describe("ephemeral service safety and cleanup", () => {
     },
   );
 
+  it.each(["GoalJudge", "GoalVerifier"] as const)(
+    "grants the local-mode Luna exception only to %s",
+    async type => {
+      const cwd = join(tempRoot, "project");
+      const child = session();
+      mocks.createWorktree.mockReturnValue({ workPath: join(tempRoot, "snapshot") } as any);
+      mocks.runAgent.mockImplementationOnce(async (_ctx: unknown, _type: string, _prompt: string, options: any) => {
+        options.onSessionCreated?.(child.value);
+        return { responseText: "evaluated", session: child.value, aborted: false, steered: false };
+      });
+
+      const service = getPiSubagentsServiceV3();
+      await service.runEphemeralAgent({
+        pi: {} as any,
+        ctx: context(cwd),
+        type,
+        prompt: "evaluate",
+      });
+
+      expect(mocks.runAgent).toHaveBeenCalledWith(
+        expect.anything(),
+        type,
+        "evaluate",
+        expect.objectContaining({ allowCloudModelInLocalMode: true }),
+      );
+    },
+  );
+
   it("forwards sanitized turn and usage progress callbacks", async () => {
     const cwd = join(tempRoot, "project");
     const child = session();

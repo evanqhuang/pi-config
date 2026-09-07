@@ -5,6 +5,8 @@ import { getAgentSafetyPolicy, getUnavailableAgentSafetyPolicyError } from "./ag
 import { registerAgents, resolveType } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { ProgressCheckpointAttentionEffect } from "./progress-checkpoint.js";
+import type { UsageMessageContribution } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled } from "./worktree.js";
 
 export const PI_SUBAGENTS_SERVICE_V3 = Symbol.for("pi-subagents:service:v3");
@@ -19,7 +21,13 @@ export interface EphemeralAgentOptions {
   signal?: AbortSignal;
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  /** Explicit opt-in for non-goal orchestrator-owned workers. */
+  orchestratorOwned?: boolean;
+  /** Goal evaluators default to native ownership and never activate checkpoints. */
+  nativeGoal?: boolean;
   onTurnEnd?: (turnCount: number) => void;
+  onProgressAttention?: (effect: ProgressCheckpointAttentionEffect) => void;
+  onUsageContribution?: (contribution: UsageMessageContribution) => void;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number; cacheRead?: number; cost?: number }) => void;
 }
 
@@ -107,12 +115,17 @@ function createService(): PiSubagentsServiceV3 {
           worktreeBase,
           model,
           thinkingLevel: options.thinkingLevel,
+          orchestratorOwned: options.orchestratorOwned,
+          nativeGoal: options.nativeGoal ?? ["goaljudge", "goalverifier"].includes(type.toLowerCase()),
+          allowCloudModelInLocalMode: ["goaljudge", "goalverifier"].includes(type.toLowerCase()),
           disallowedTools: policy?.disallowedTools,
           // Capture ownership as soon as runAgent creates the session. If a
           // later await rejects, its result is never returned to this service,
           // so the callback is the only way to ensure ephemeral cleanup runs.
           onSessionCreated: createdSession => { session = createdSession; },
           onTurnEnd: options.onTurnEnd,
+          onProgressAttention: options.onProgressAttention,
+          onUsageContribution: options.onUsageContribution,
           onAssistantUsage: options.onAssistantUsage,
         });
         session = result.session;

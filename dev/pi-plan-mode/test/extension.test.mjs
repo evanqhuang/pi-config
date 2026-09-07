@@ -589,8 +589,14 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const orchestratedAgent = { subagent_type: "general-purpose", model: "other/model", thinking: "low" };
   assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: orchestratedAgent }), undefined);
   assert.equal(orchestratedAgent.subagent_type, "ImplementationWorker");
+  assert.equal(orchestratedAgent.orchestrator_owned, true);
   assert.equal(orchestratedAgent.model, "openai-codex/gpt-5.6-luna");
-  assert.equal(orchestratedAgent.thinking, "xhigh");
+  assert.equal(orchestratedAgent.thinking, "high");
+  for (const thinking of [undefined, "high", "xhigh", "max"]) {
+    const worker = { subagent_type: "ImplementationWorker", thinking };
+    await pi.handlers.get("tool_call")({ toolName: "Agent", input: worker });
+    assert.equal(worker.thinking, thinking ?? "high");
+  }
   for (const subagent_type of ["LunaCompliance", "LunaTestVerifier"]) {
     const verifier = { subagent_type, model: "other/model", thinking: "low" };
     assert.equal(await pi.handlers.get("tool_call")({ toolName: "Agent", input: verifier }), undefined);
@@ -605,8 +611,8 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   assert.match(orchestratorStart.systemPrompt, /Do not bundle discovery, design, implementation, testing, and review into one worker/);
   assert.match(orchestratorStart.systemPrompt, /Dependent units run sequentially only after the prerequisite handoff is inspected and its contract\/tests pass/);
   assert.match(orchestratorStart.systemPrompt, /Parallelize only truly independent units with disjoint files and no dependency edge/);
-  assert.match(orchestratorStart.systemPrompt, /If scope expands or a worker approaches its context limit or needs compaction, the worker must stop with a concise handoff; the parent starts a fresh worker for the next unit rather than extending or resuming a context-heavy session/);
-  assert.match(orchestratorStart.systemPrompt, /The parent owns integration and must avoid overlapping ownership/);
+  assert.match(orchestratorStart.systemPrompt, /The parent decides whether to narrow the unit, continue from available evidence, clarify requirements, or report an incomplete handoff/);
+  assert.match(orchestratorStart.systemPrompt, /The parent owns integration across units/);
   assert.match(orchestratorStart.systemPrompt, /verify the complete result/i);
   assert.match(orchestratorStart.systemPrompt, /ImplementationWorker leaf-worker profile/);
   assert.match(orchestratorStart.systemPrompt, /cannot create, launch, steer, or wait on subagents/);

@@ -43,6 +43,7 @@ function fakePi() {
 const contexts: Array<{ dir: string; previous: string | undefined }> = [];
 afterEach(async () => {
   setWorktreeIsolationEnabled(true);
+  delete (globalThis as any)[Symbol.for("pi.local-mode.provider-policy")];
   for (const { dir, previous } of contexts.splice(0)) {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
@@ -118,6 +119,64 @@ describe("runtime verifier safety", () => {
     )).toThrow(/requires worktree isolation/);
 
     expect(handlers.get("session_shutdown")).toBeDefined();
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler();
+  });
+
+  it("blocks a cloud-pinned card even when that child disables extensions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-agent-local-model-safety-"));
+    contexts.push({ dir, previous: process.env.PI_CODING_AGENT_DIR });
+    process.env.PI_CODING_AGENT_DIR = join(dir, "global");
+    const agentsDir = join(dir, "global", "agents");
+    await mkdir(agentsDir, { recursive: true });
+    await writeFile(join(agentsDir, "ImplementationWorker.md"), [
+      "---",
+      "name: ImplementationWorker",
+      "description: implementation worker",
+      "extensions: false",
+      "model: openai-codex/gpt-5.6-luna",
+      "---",
+      "implement",
+      "",
+    ].join("\n"));
+
+    const cloudModel = { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" };
+    const localModel = { provider: "qwen38-main", id: "qwen3.8-27b", name: "Qwen3.8 27B Main" };
+    const modelRegistry = {
+      getAvailable: () => [cloudModel, localModel],
+      getAll: () => [cloudModel, localModel],
+      find: (provider: string, id: string) => [cloudModel, localModel]
+        .find(model => model.provider === provider && model.id === id),
+    };
+    (globalThis as any)[Symbol.for("pi.local-mode.provider-policy")] = { enabled: true };
+
+    const { pi, tools, handlers } = fakePi();
+    extension(pi as any);
+    const agent = tools.find(tool => tool.name === "Agent");
+    expect(agent).toBeDefined();
+
+    const result = await agent.execute(
+      "call-local-model-policy",
+      {
+        prompt: "implement",
+        description: "implement code",
+        subagent_type: "ImplementationWorker",
+      },
+      new AbortController().signal,
+      undefined,
+      {
+        cwd: dir,
+        ui: {},
+        mode: "rpc",
+        hasUI: false,
+        model: localModel,
+        modelRegistry,
+        sessionManager: { getSessionId: () => "session" },
+        getSystemPrompt: () => "",
+      },
+    );
+
+    expect(result.content[0].text).toContain("Local mode only permits local subagent models");
+    expect(result.content[0].text).toContain("openai-codex/gpt-5.6-luna");
     for (const handler of handlers.get("session_shutdown") ?? []) await handler();
   });
 });

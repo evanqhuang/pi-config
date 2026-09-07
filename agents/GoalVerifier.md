@@ -3,7 +3,7 @@ name: GoalVerifier
 display_name: Goal Verifier
 description: Internal read-only acceptance verifier for native /goal completion and fixed-point replanning.
 tools: read, bash, grep, find, ls
-extensions: local-mode
+extensions: false
 skills: false
 disallowed_tools: request_deeper_reasoning
 model: openai-codex/gpt-5.6-luna

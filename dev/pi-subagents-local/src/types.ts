@@ -4,7 +4,8 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { LifetimeUsage } from "./usage.js";
+import type { LifetimeUsage, UsageLedger } from "./usage.js";
+import type { ProgressCheckpointLifecycle, ProgressCheckpointSnapshot } from "./progress-checkpoint.js";
 import type {
   CleanupResult,
   WorktreeFinalization,
@@ -187,6 +188,11 @@ export interface AgentTombstone {
   /** Always set — a record with no session file is never tombstoned. */
   sessionFile: string;
   completedAt: number;
+  /** Bounded checkpoint state for reopening this conversation; never raw output. */
+  checkpointStatus?: ProgressCheckpointLifecycle;
+  checkpointSnapshot?: ProgressCheckpointSnapshot;
+  orchestratorOwned?: boolean;
+  nativeGoal?: boolean;
   /** Safe finalization metadata; patches and file contents are never retained. */
   worktree?: WorktreeReport;
   worktreeResult?: WorktreeReport;
@@ -276,8 +282,17 @@ export interface AgentRecord {
    * excluded — see issue #38). Initialized to zeros at spawn.
    */
   lifetimeUsage: LifetimeUsage;
+  /** Direct assistant-message usage only; descendants remain out of this ledger. */
+  directUsageLedger?: UsageLedger;
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
+  /** Bounded progress-checkpoint lifecycle, when this invocation opted in. */
+  checkpointStatus?: ProgressCheckpointLifecycle;
+  /** Bounded checkpoint state retained for explicit resume; never raw output. */
+  checkpointSnapshot?: ProgressCheckpointSnapshot;
+  /** Activation policy captured so explicit resumes preserve the same scope. */
+  orchestratorOwned?: boolean;
+  nativeGoal?: boolean;
   /**
    * Whether this agent was spawned to run in the background. Tri-state, set at
    * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =

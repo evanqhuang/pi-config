@@ -54,6 +54,68 @@ The global `LocalExplore` card has a 64-turn soft limit. At turn 64 the existing
 wrap-up steer requests a final answer; the existing five-turn grace hard-aborts
 at turn 69. An explicit call-site `maxTurns` still has higher precedence.
 
+## Current-run usage and progress checkpoints
+
+`/agents` → **Usage** is a compact, current-run view with separate
+**parent-direct** and **worker-direct** sections. Each section is grouped by
+provider/model, so direct parent usage is not mistaken for worker usage. The
+worker totals include nested workers and current-run records that have already
+left the bounded status list, without copying worker output into the view.
+
+For every model row, **display tokens** are input + output + `cacheWrite`.
+`cacheRead` is shown separately; **reported totals include `cacheRead`**. A
+missing ledger, restoration gap, or attribution gap is explicit and is never
+rendered as zero. There is no historical reconstruction: resumed or forked
+sessions report only newly observed current-run usage and expose the prior
+transcript as a gap.
+
+Dollar values are **model-priced estimates**, not provider subscription
+charges or quota measurements. Partial and unavailable pricing remain marked
+as `partial` or `unavailable`; an estimate must not be read as a bill or as
+quota savings. `usageWarningUsd` is an opt-in warning threshold and has no
+default.
+
+Settings are loaded from `~/.pi/agent/subagents.json` and then
+`<cwd>/.pi/subagents.json`; project values override global values. `/agents`
+settings writes the project file without rewriting global defaults.
+The progress policy has this shape:
+
+```json
+{
+  "progressCheckpoints": {
+    "enabled": true,
+    "displayTokenInterval": 150000,
+    "elapsedIntervalMs": 600000,
+    "repeatedFingerprintThreshold": 3,
+    "repeatedReportThreshold": 2,
+    "overrides": [
+      { "provider": "openai-codex", "model": "gpt-5.6-luna", "displayTokenInterval": 100000 }
+    ]
+  },
+  "usageWarningUsd": 1.0
+}
+```
+
+Intervals and thresholds, including `usageWarningUsd`, must be positive finite
+numbers; zero does not disable an interval. `displayTokenInterval` defaults to
+150,000 display tokens, `elapsedIntervalMs` is optional, and
+`repeatedReportThreshold` defaults to 2. `enabled: false` disables the policy.
+Each override may carry the same policy fields as the base object, with
+optional exact `provider` and `model` selectors. Provider/model override
+identities match exactly. The most-specific matching override wins (provider +
+model before either alone); ties keep the first matching entry. Overrides do
+not create historical usage or alter model pricing.
+
+The policy is opt-in only for an invocation explicitly marked
+`orchestratorOwned`; native `/goal` execution is untouched. A soft checkpoint
+requests the worker-only `report_progress` tool for concrete
+evidence, blocker, and next action while productive work continues; it is not
+a token-termination or automatic-compaction signal. Repeated no-progress,
+a blocker, or scope expansion produces one parent-attention request with an
+incomplete handoff. The runtime does not respawn or escalate the worker.
+Cancellation, `maxTurns`, and existing loop guards remain independent safety
+controls.
+
 ## Durable routing and verifier contracts
 
 **Fresh type resolution.** Every fresh spawn reloads the current project/global
