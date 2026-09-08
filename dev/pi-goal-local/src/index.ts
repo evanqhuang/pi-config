@@ -1,8 +1,10 @@
 import {
   buildSessionContext,
+  sessionEntryToContextMessages,
   type AutocompleteProviderFactory,
   type ExtensionAPI,
   type ExtensionContext,
+  type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { parseGoalCommand, formatGoalStatus } from "./commands.js";
 import { GoalController, type GoalLoopStartOptions } from "./controller.js";
@@ -23,6 +25,7 @@ import {
   type PlanBridge,
 } from "./plan-bridge.js";
 import {
+  GOAL_CONTEXT_EPOCH_TYPE,
   GOAL_STATE_V2_TYPE,
   type GoalLoopEntry,
   type GoalLoopPhase,
@@ -709,8 +712,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
     controller.prepareForTreeNavigation(treeCtx);
   });
 
-  pi.on("session_before_compact", () => {
+  pi.on("session_before_compact", (
+    event: SessionBeforeCompactEvent,
+    compactCtx: ExtensionContext,
+  ) => {
     deferredCompactionRestore = undefined;
+
+    const loop = controller.refreshLoop(compactCtx);
+    if (!loopStateIsActive(loop)) return;
+
+    const settings = loadGoalLoopSettings(compactCtx.cwd);
+    const visibleEntries = compactCtx.sessionManager.buildContextEntries();
+    const visibleMessages = visibleEntries.flatMap(sessionEntryToContextMessages);
+    const anchored = filterContextWithDisposition(visibleMessages, loop, {
+      maxBootstrapBytes: settings.maxBootstrapBytes,
+    });
+    if (!anchored.marker || (anchored.disposition !== "matched" && anchored.disposition !== "rejected")) {
+      return;
+    }
+
+    const markerEntry = visibleEntries.findLast(entry => {
+      if (entry.type !== "custom_message" || entry.customType !== GOAL_CONTEXT_EPOCH_TYPE) return false;
+      if (entry.content !== anchored.marker?.message.content) return false;
+      const details = entry.details;
+      if (!details || typeof details !== "object") return false;
+      const identity = details as { id?: unknown; hash?: unknown };
+      return identity.id === anchored.marker?.id && identity.hash === anchored.marker?.hash;
+    });
+    if (!markerEntry?.id) return;
+
+    // The epoch marker is already a validated, self-contained context summary.
+    // Keep it as the native boundary instead of asking the compaction model to
+    // re-summarize every pre-epoch message that the context hook excludes.
+    return {
+      compaction: {
+        summary: anchored.marker.message.content,
+        firstKeptEntryId: markerEntry.id,
+        tokensBefore: event.preparation.tokensBefore,
+      },
+    };
   });
 
   pi.on("session_tree", (_event, treeCtx) => {
@@ -859,7 +899,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
     shutDown = true;
     bridge.dispose();
     while (eventUnsubscribers.length > 0) {
-      try { eventUnsubscribers.pop()?.(); } catch {}
+      try { eventUnsubscribers.pop()?.(); } catch (error) { void error; }
     }
     controller.shutdown();
     invalidateDeferredLifecycle("the session shut down");

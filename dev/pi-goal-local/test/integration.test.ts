@@ -610,6 +610,97 @@ describe("goal extension provider integration", () => {
     }
   });
 
+  it("uses the validated goal epoch as the native compaction boundary", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    const state = loopState();
+    const marker = controllerEpochMarker(state);
+    state.epochMarker = { id: marker.details.id, hash: marker.details.hash };
+    harness.branch.push(
+      {
+        id: "stale-history",
+        parentId: null,
+        timestamp: new Date(0).toISOString(),
+        type: "message",
+        message: { role: "user", content: "stale".repeat(250_000), timestamp: 0 },
+      },
+      {
+        id: "goal-state-entry",
+        parentId: "stale-history",
+        timestamp: new Date(0).toISOString(),
+        type: "custom",
+        customType: GOAL_STATE_V2_TYPE,
+        data: state,
+      },
+      {
+        id: "epoch-session-entry",
+        parentId: "goal-state-entry",
+        timestamp: new Date(marker.timestamp).toISOString(),
+        type: "custom_message",
+        customType: marker.customType,
+        content: marker.content,
+        display: marker.display,
+        details: marker.details,
+      },
+      {
+        id: "current-request",
+        parentId: "epoch-session-entry",
+        timestamp: new Date(2).toISOString(),
+        type: "message",
+        message: { role: "user", content: "Continue the current epoch.", timestamp: 2 },
+      },
+    );
+
+    const result = await harness.handlers.get("session_before_compact")!({
+      type: "session_before_compact",
+      preparation: {
+        firstKeptEntryId: "stale-native-boundary",
+        tokensBefore: 165_791,
+      },
+      branchEntries: harness.branch,
+      reason: "threshold",
+      willRetry: false,
+      signal: new AbortController().signal,
+    }, harness.ctx) as { compaction: Record<string, unknown> };
+
+    expect(result.compaction).toEqual({
+      summary: marker.content,
+      firstKeptEntryId: "epoch-session-entry",
+      tokensBefore: 165_791,
+    });
+    expect(result.compaction.summary).not.toContain("stalestale");
+  });
+
+  it("does not replace native compaction when the current epoch marker is invalid", async () => {
+    const harness = integrationHarness();
+    await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+    const state = loopState();
+    const marker = controllerEpochMarker(state);
+    state.epochMarker = { id: marker.details.id, hash: marker.details.hash };
+    harness.branch.push(
+      { id: "goal-state-entry", type: "custom", customType: GOAL_STATE_V2_TYPE, data: state },
+      {
+        id: "invalid-epoch-entry",
+        type: "custom_message",
+        customType: marker.customType,
+        content: `${marker.content} `,
+        display: marker.display,
+        details: marker.details,
+      },
+    );
+
+    const result = await harness.handlers.get("session_before_compact")!({
+      type: "session_before_compact",
+      preparation: { firstKeptEntryId: "native-boundary", tokensBefore: 100_000 },
+      branchEntries: harness.branch,
+      reason: "manual",
+      willRetry: false,
+      signal: new AbortController().signal,
+    }, harness.ctx);
+
+    expect(result).toBeUndefined();
+  });
+
   it("uses a one-shot selected-branch compaction proof before idle marker publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-goal-loop-compact-handoff-"));
     const artifactDir = join(root, "goal-loops", "loop-integration");
