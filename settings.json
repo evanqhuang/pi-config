@@ -26,7 +26,7 @@
     "git:github.com/tmustier/pi-auto-compact",
     "npm:pi-chrome",
     "npm:pi-vimmode",
-    "dev/pi-code-review",
+    "git:github.com/evanqhuang/pi-review-board",
     "npm:pi-skill-manager",
     "npm:pi-btw",
     "npm:@upstash/context7-pi",
