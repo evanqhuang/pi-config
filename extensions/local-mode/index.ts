@@ -78,6 +78,7 @@ const DEFAULT_LOCAL_SUBAGENT_MODEL: LocalModelSelection = {
 };
 
 interface LocalModeState {
+	sessionEnded: boolean;
 	enabled: boolean;
 	localOnly: boolean;
 	enforcingModel: boolean;
@@ -197,6 +198,7 @@ async function ensureNonLocalModel(pi: ExtensionAPI, ctx: ExtensionContext): Pro
 }
 
 function updateLocalStatus(state: LocalModeState, ctx: ExtensionContext): void {
+	if (state.sessionEnded) return;
 	if (!state.enabled) {
 		ctx.ui.setStatus("local-mode", undefined);
 		return;
@@ -213,6 +215,7 @@ function updateLocalStatus(state: LocalModeState, ctx: ExtensionContext): void {
 }
 
 function updateUi(state: LocalModeState, ctx: ExtensionContext): void {
+	if (state.sessionEnded) return;
 	if (!state.enabled) {
 		updateLocalStatus(state, ctx);
 		ctx.ui.setWorkingMessage();
@@ -292,6 +295,7 @@ function applyAutomaticThinkingLevel(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): void {
+	if (state.sessionEnded) return;
 	if (
 		!state.localOnly ||
 		ctx.model?.id !== "qwen3.8-27b" ||
@@ -311,6 +315,7 @@ async function selectLocalModel(
 	selection: LocalModelSelection,
 	ctx: ExtensionContext,
 ): Promise<boolean> {
+	if (state.sessionEnded) return false;
 	const model = ctx.modelRegistry.find(selection.provider, selection.id);
 	if (!model) {
 		ctx.ui.notify(`Local model not found: ${modelKey(selection)}`, "error");
@@ -320,12 +325,14 @@ async function selectLocalModel(
 	state.enforcingThinking = true;
 	try {
 		if (!(await pi.setModel(model))) {
+			if (state.sessionEnded) return false;
 			ctx.ui.notify(`Local model is unavailable: ${modelKey(selection)}`, "error");
 			return false;
 		}
 	} finally {
 		state.enforcingThinking = false;
 	}
+	if (state.sessionEnded) return false;
 	state.automaticThinking = true;
 	state.automaticThinkingLevel = selection.thinkingLevel;
 	setThinkingLevelAutomatically(pi, state, selection.thinkingLevel);
@@ -380,6 +387,7 @@ function requestCompactionIfNeeded(
 	ctx: ExtensionContext,
 	profile: LocalQwenProfile | undefined,
 ): void {
+	if (state.sessionEnded) return;
 	if (!profile?.requiresCompaction) {
 		state.compactionRequested = false;
 		return;
@@ -391,7 +399,8 @@ function requestCompactionIfNeeded(
 	ctx.compact({
 		customInstructions:
 			"Preserve the current objective, decisions, changed files, test results, unresolved failures, and the next concrete action.",
-			onComplete: () => {
+		onComplete: () => {
+			if (state.sessionEnded) return;
 			state.compactionRequested = false;
 			state.activeProfile = undefined;
 			pi.sendMessage(
@@ -405,6 +414,7 @@ function requestCompactionIfNeeded(
 			);
 		},
 		onError: (error) => {
+			if (state.sessionEnded) return;
 			state.compactionRequested = false;
 			ctx.ui.notify(`Local Qwen compaction failed: ${error.message}`, "warning");
 		},
@@ -416,6 +426,7 @@ async function enforceLocalProvider(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): Promise<boolean> {
+	if (state.sessionEnded) return false;
 	const requiredProvider = requiredLocalProvider(ctx, state.localOnly);
 	if (!requiredProvider) {
 		enforceLocalThinkingProfile(pi, state, ctx);
@@ -430,6 +441,7 @@ async function enforceLocalProvider(
 				? DEFAULT_LOCAL_SUBAGENT_MODEL
 				: DEFAULT_LOCAL_MODEL;
 		const selected = await selectLocalModel(pi, state, selection, ctx);
+		if (state.sessionEnded) return false;
 		if (!selected) ctx.abort();
 		if (selected) enforceLocalThinkingProfile(pi, state, ctx);
 		return selected;
@@ -444,6 +456,7 @@ async function cycleLocalModel(
 	ctx: ExtensionContext,
 	direction: "forward" | "backward",
 ): Promise<void> {
+	if (state.sessionEnded) return;
 	if (state.cycling) return;
 	state.cycling = true;
 	try {
@@ -453,6 +466,7 @@ async function cycleLocalModel(
 		const nextIndex = (Math.max(currentIndex, 0) + step + LOCAL_MODELS.length) % LOCAL_MODELS.length;
 		const selection = LOCAL_MODELS[nextIndex];
 		if (selection && (await selectLocalModel(pi, state, selection, ctx))) {
+			if (state.sessionEnded) return;
 			ctx.ui.notify(`Local model: ${modelKey(selection)}`, "info");
 			updateUi(state, ctx);
 		}
@@ -476,6 +490,10 @@ function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: E
 		const handleInput = editor.handleInput.bind(editor);
 		editor.handleInput = (data: string) => {
 			const normalizedData = normalizeLocalModelCycleInput(data);
+			if (state.sessionEnded) {
+				handleInput(normalizedData);
+				return;
+			}
 			if (state.enabled && keybindings.matches(normalizedData, "app.model.cycleForward")) {
 				void cycleLocalModel(pi, state, ctx, "forward");
 				return;
@@ -494,7 +512,7 @@ function installLocalCycleEditor(pi: ExtensionAPI, state: LocalModeState, ctx: E
 }
 
 function applyLocalTheme(state: LocalModeState, ctx: ExtensionContext): void {
-	if (!state.enabled) return;
+	if (state.sessionEnded || !state.enabled) return;
 	const greenTheme = ctx.ui.getTheme(GREEN_THEME_NAME);
 	if (greenTheme) ctx.ui.setTheme(greenTheme);
 }
@@ -504,17 +522,20 @@ async function showLocalModelSelector(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): Promise<void> {
+	if (state.sessionEnded) return;
 	const currentKey = ctx.model ? modelKey(ctx.model) : undefined;
 	const options = LOCAL_MODELS.map((model) =>
 		modelKey(model) === currentKey ? `${model.label} (active)` : model.label,
 	);
 	const choice = await ctx.ui.select("Choose a local model", options);
+	if (state.sessionEnded) return;
 	if (!choice) return;
 
 	const selection = LOCAL_MODELS[options.indexOf(choice)];
 	if (!selection) return;
 
 	if (await selectLocalModel(pi, state, selection, ctx)) {
+		if (state.sessionEnded) return;
 		ctx.ui.notify(`Local model: ${modelKey(selection)}`, "info");
 		updateUi(state, ctx);
 	}
@@ -525,6 +546,7 @@ async function activateLocalMode(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): Promise<boolean> {
+	if (state.sessionEnded) return false;
 	if (state.enabled) return true;
 
 	state.previousModel = ctx.model;
@@ -534,6 +556,7 @@ async function activateLocalMode(
 		resetState(state);
 		return false;
 	}
+	if (state.sessionEnded) return false;
 
 	state.enabled = true;
 	state.localOnly = true;
@@ -546,21 +569,27 @@ async function activateLocalMode(
 }
 
 async function enableLocalMode(pi: ExtensionAPI, state: LocalModeState, ctx: ExtensionContext): Promise<void> {
+	if (state.sessionEnded) return;
 	if (state.enabled) return;
-	if (await activateLocalMode(pi, state, ctx)) {
+	const activated = await activateLocalMode(pi, state, ctx);
+	if (state.sessionEnded) return;
+	if (activated) {
 		persistLocalModeState(pi, state);
 	}
 }
 
 async function disableLocalMode(pi: ExtensionAPI, state: LocalModeState, ctx: ExtensionContext): Promise<void> {
+	if (state.sessionEnded) return;
 	if (!state.enabled) return;
 
 	state.enabled = false;
 	state.localOnly = false;
 	getProcessLocalProviderPolicy().enabled = false;
 	if (state.previousModel && !(await pi.setModel(state.previousModel))) {
+		if (state.sessionEnded) return;
 		ctx.ui.notify(`Could not restore model: ${modelKey(state.previousModel)}`, "warning");
 	}
+	if (state.sessionEnded) return;
 	if (state.previousThinkingLevel) {
 		pi.setThinkingLevel(state.previousThinkingLevel);
 	}
@@ -568,6 +597,7 @@ async function disableLocalMode(pi: ExtensionAPI, state: LocalModeState, ctx: Ex
 		ctx.ui.setTheme(state.previousTheme);
 	}
 	await ensureNonLocalModel(pi, ctx);
+	if (state.sessionEnded) return;
 	persistLocalModeState(pi, state);
 	resetState(state);
 	updateUi(state, ctx);
@@ -579,7 +609,9 @@ async function enableAutomaticLocalMode(
 	state: LocalModeState,
 	ctx: ExtensionContext,
 ): Promise<void> {
+	if (state.sessionEnded) return;
 	if (!state.enabled) await enableLocalMode(pi, state, ctx);
+	if (state.sessionEnded) return;
 	if (!state.enabled) return;
 
 	state.automaticThinking = true;
@@ -597,9 +629,11 @@ async function handleLocalCommand(
 	args: string,
 	ctx: ExtensionContext,
 ): Promise<void> {
+	if (state.sessionEnded) return;
 	const action = args.trim().toLowerCase();
 	if (action === "model" || action === "models") {
 		if (!state.enabled) await enableLocalMode(pi, state, ctx);
+		if (state.sessionEnded) return;
 		if (state.enabled) await showLocalModelSelector(pi, state, ctx);
 		return;
 	}
@@ -617,6 +651,7 @@ async function handleLocalCommand(
 	}
 	if (action === "subagent-27b on" || action === "subagent-27b off") {
 		if (!state.enabled) await enableLocalMode(pi, state, ctx);
+		if (state.sessionEnded) return;
 		if (!state.enabled) return;
 		state.qwen38SubagentEnabled = action.endsWith("on");
 		persistLocalModeState(pi, state);
@@ -649,6 +684,7 @@ export default function localModeExtension(
 	}
 
 	const state: LocalModeState = {
+		sessionEnded: false,
 		enabled: false,
 		localOnly: false,
 		enforcingModel: false,
@@ -665,7 +701,11 @@ export default function localModeExtension(
 	};
 
 	pi.on("resources_discover", (_event, ctx) => {
-		setTimeout(() => applyLocalTheme(state, ctx), 0);
+		if (state.sessionEnded) return;
+		setTimeout(() => {
+			if (state.sessionEnded) return;
+			applyLocalTheme(state, ctx);
+		}, 0);
 		return { themePaths: [GREEN_THEME_PATH] };
 	});
 
@@ -685,6 +725,12 @@ export default function localModeExtension(
 			}),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			if (state.sessionEnded) {
+				return {
+					content: [{ type: "text", text: "The session was replaced before deeper reasoning could be requested." }],
+					details: { applied: false, reason: "session-replaced" },
+				};
+			}
 			if (!canRequestLocalQwenDeepReasoning(ctx, state.localOnly, state.automaticThinking)) {
 				return {
 					content: [{ type: "text", text: "Deeper reasoning is available only in automatic local Qwen mode." }],
@@ -716,6 +762,7 @@ export default function localModeExtension(
 	});
 
 	pi.on("tool_call", (event, ctx) => {
+		if (state.sessionEnded) return;
 		if (event.toolName === "Agent") {
 			const input = event.input as AgentInvocationInput;
 			routeLocalExploreAgent(input, state.localOnly);
@@ -743,7 +790,9 @@ export default function localModeExtension(
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		if (state.sessionEnded) return;
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		if (state.sessionEnded) return;
 		requestAutoCompactPolicy(state, ctx);
 		if (state.automaticThinking && ctx.model?.id === "qwen3.8-27b") {
 			state.automaticThinkingLevel = "medium";
@@ -758,8 +807,10 @@ export default function localModeExtension(
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
+		if (state.sessionEnded) return;
 		state.autoCompactPolicy.clear();
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		if (state.sessionEnded) return;
 		requestAutoCompactPolicy(state, ctx);
 		if (!state.enabled) return;
 		state.generationStartedAt = undefined;
@@ -768,6 +819,7 @@ export default function localModeExtension(
 	});
 
 	pi.on("thinking_level_select", (event, ctx) => {
+		if (state.sessionEnded) return;
 		const automaticChange =
 			state.pendingAutomaticThinkingLevel === event.level;
 		if (automaticChange) {
@@ -784,7 +836,9 @@ export default function localModeExtension(
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
+		if (state.sessionEnded) return;
 		if (!(await enforceLocalProvider(pi, state, ctx))) return;
+		if (state.sessionEnded) return;
 		requestAutoCompactPolicy(state, ctx);
 		applyAutomaticThinkingLevel(pi, state, ctx);
 		enforceLocalThinkingProfile(pi, state, ctx);
@@ -795,6 +849,7 @@ export default function localModeExtension(
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
+		if (state.sessionEnded) return;
 		if (state.automaticThinking && state.localOnly && ctx.model?.id === "qwen3.8-27b") {
 			state.automaticThinkingLevel = "medium";
 			state.deepReasoningRequested = false;
@@ -805,6 +860,7 @@ export default function localModeExtension(
 	});
 
 	pi.on("before_provider_headers", (_event, ctx) => {
+		if (state.sessionEnded) return;
 		if (
 			!state.localOnly ||
 			(ctx.model && LOCAL_PROVIDER_NAMES.has(ctx.model.provider))
@@ -816,6 +872,7 @@ export default function localModeExtension(
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
+		if (state.sessionEnded) return;
 		requestAutoCompactPolicy(state, ctx);
 		if (
 			!state.localOnly ||
@@ -836,16 +893,19 @@ export default function localModeExtension(
 	});
 
 	pi.on("message_update", (event, ctx) => {
+		if (state.sessionEnded) return;
 		if (!state.enabled || event.message.role !== "assistant") return;
 		updateTokensPerSecond(state, ctx, event.message.usage.output, clock);
 	});
 
 	pi.on("message_end", (event, ctx) => {
+		if (state.sessionEnded) return;
 		if (!state.enabled || event.message.role !== "assistant") return;
 		updateTokensPerSecond(state, ctx, event.message.usage.output, clock);
 	});
 
 	pi.on("session_compact", (_event, ctx) => {
+		if (state.sessionEnded) return;
 		state.compactionRequested = false;
 		state.activeProfile = undefined;
 		if (state.automaticThinking && state.localOnly && ctx.model?.id === "qwen3.8-27b") {
@@ -856,20 +916,24 @@ export default function localModeExtension(
 	});
 
 	pi.on("session_compact_failed", () => {
+		if (state.sessionEnded) return;
 		state.compactionRequested = false;
 	});
 
 	pi.on("session_shutdown", () => {
+		state.sessionEnded = true;
 		state.autoCompactPolicy.stop();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		state.sessionEnded = false;
 		state.autoCompactPolicy.start();
 		resetState(state);
 		requestAutoCompactPolicy(state, ctx);
 		if (isSubagentSession(ctx)) {
 			state.localOnly = getProcessLocalProviderPolicy().enabled;
 			if (state.localOnly) await enforceLocalProvider(pi, state, ctx);
+			if (state.sessionEnded) return;
 			if (
 				state.localOnly ||
 				shouldPreserveExplicitLocalSubagentModel(ctx)
@@ -885,6 +949,7 @@ export default function localModeExtension(
 		const persistedState = getPersistedLocalModeState(ctx);
 		if (persistedState?.enabled === true) {
 			await activateLocalMode(pi, state, ctx);
+			if (state.sessionEnded) return;
 			state.qwen38SubagentEnabled = persistedState.qwen38SubagentEnabled !== false;
 			if (
 				persistedState?.automaticThinking === false &&
@@ -896,6 +961,7 @@ export default function localModeExtension(
 			}
 		} else {
 			await ensureNonLocalModel(pi, ctx);
+			if (state.sessionEnded) return;
 			updateUi(state, ctx);
 		}
 	});

@@ -57,6 +57,8 @@ export interface HarnessFacts {
 }
 
 export interface NotesRuntime {
+  /** Set during session replacement so late callbacks cannot touch stale pi objects. */
+  sessionEnded: boolean;
   activationMode: ActivationMode;
   active: boolean;
   notesId: string;
@@ -297,6 +299,7 @@ export function notesPathFor(notesId: string): string {
 export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMode): NotesRuntime {
   const notesId = randomUUID();
   return {
+    sessionEnded: false,
     activationMode: mode,
     active: mode === "manual",
     notesId,
@@ -498,6 +501,7 @@ function persistentFacts(runtime: NotesRuntime): CheckpointRecord["harnessFacts"
 }
 
 async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload: CheckpointPayload): Promise<{ hash: string; generation: number }> {
+  if (runtime.sessionEnded) throw new Error("The session was replaced before the Notes checkpoint completed");
   if (!runtime.active) throw new Error("Durable Notes are not active; run /notes on or /notes auto first");
   if (isChildSession()) throw new Error("Child subagent sessions cannot write the parent session Notes file");
   if (runtime.checkpointInFlight) throw new Error("A Notes checkpoint is already in progress");
@@ -513,6 +517,7 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
       throw new Error(`Rendered Notes exceed ${DEFAULT_CONFIG.notesMaxBytes} bytes (${bytes}); keep only continuation-relevant state`);
     }
     await atomicWrite(runtime.notesPath, rendered);
+    if (runtime.sessionEnded) throw new Error("The session was replaced before the Notes checkpoint completed");
     const hash = hashText(rendered);
     const generation = runtime.checkpointGeneration + 1;
     const checkpointedAt = Date.now();
@@ -882,6 +887,7 @@ export function stripNotesReminders(messages: readonly any[]): any[] {
 }
 
 export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime: NotesRuntime): string | undefined {
+  if (runtime.sessionEnded) return undefined;
   if (!runtime.active || !pi.getActiveTools().includes("checkpoint_notes")) return undefined;
   if (runtime.reentryRequired) {
     runtime.reentryRequired = false;
@@ -956,6 +962,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
   pi.registerCommand("notes", {
     description: "Durable task Notes: status | on | off | auto | checkpoint | resume | restore",
     handler: async (args, ctx) => {
+      if (runtime.sessionEnded) return;
       const command = args.trim().toLowerCase() || "status";
       if (command === "status") return displayStatus(ctx, runtime, pi);
       if (command === "on") {
@@ -1028,29 +1035,39 @@ export default function notesExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    runtime.sessionEnded = false;
     await restoreFromBranch(pi, runtime, ctx, event.reason);
   });
   pi.on("session_tree", async (_event, ctx) => {
+    if (runtime.sessionEnded) return;
     await restoreFromBranch(pi, runtime, ctx, "tree");
   });
+  pi.on("session_shutdown", () => {
+    runtime.sessionEnded = true;
+  });
   pi.on("session_compact", () => {
+    if (runtime.sessionEnded) return;
     if (!runtime.active) return;
     runtime.reentryRequired = true;
     if (runtime.dirty) setCheckpointDue(runtime, true);
   });
   pi.on("session_compact_failed", () => {
+    if (runtime.sessionEnded) return;
     // Preserve state. A failed/aborted compaction is not a recovery boundary.
   });
   pi.on("before_agent_start", (event) => {
+    if (runtime.sessionEnded) return undefined;
     if (!runtime.active) return undefined;
     return { systemPrompt: `${event.systemPrompt}\n\n${notesPolicy()}` };
   });
   pi.on("context", (event) => {
+    if (runtime.sessionEnded) return { messages: stripNotesReminders(event.messages) };
     const messages = stripNotesReminders(event.messages);
     const reminder = selectReminder(pi, runtime);
     return { messages: reminder ? [...messages, reminderMessage(reminder) as any] : messages };
   });
   pi.on("turn_end", () => {
+    if (runtime.sessionEnded) return;
     runtime.activationTurns += 1;
     if (runtime.toolCallsThisTurn > 0 && !runtime.highSignalThisTurn) runtime.readOnlyTurns += 1;
     else if (runtime.highSignalThisTurn) runtime.readOnlyTurns = 0;
@@ -1069,6 +1086,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     activateIfNeeded(pi, runtime);
   });
   pi.on("tool_result", (event) => {
+    if (runtime.sessionEnded) return;
     if (event.toolName === "checkpoint_notes") return;
     recordActivity(pi, runtime, event.toolName, event.input, event.isError, {
       content: event.content,
@@ -1076,6 +1094,7 @@ export default function notesExtension(pi: ExtensionAPI): void {
     });
   });
   pi.on("tool_call", async (event, ctx) => {
+    if (runtime.sessionEnded) return;
     if (isChildSession() && event.toolName === "checkpoint_notes") {
       return { block: true, reason: "Child subagent sessions cannot write the parent session Notes file." };
     }

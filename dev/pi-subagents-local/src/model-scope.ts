@@ -60,6 +60,20 @@ export function getLocalModelPolicyError(
   return `Local mode only permits local subagent models; blocked "${label}" (${model.provider}).`;
 }
 
+export function getLocalModelPolicyErrorForAgent(
+  type: string,
+  model: { provider: string; id: string } | undefined,
+  allowCloudModelInLocalMode = false,
+  modelInput?: string,
+): string | undefined {
+  const normalizedType = type.toLowerCase();
+  const allowedEvaluatorModel = allowCloudModelInLocalMode
+    && (normalizedType === "goaljudge" || normalizedType === "goalverifier")
+    && model?.provider === "openai-codex"
+    && model.id.toLowerCase().includes("luna");
+  return allowedEvaluatorModel ? undefined : getLocalModelPolicyError(model, modelInput);
+}
+
 export function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
 export function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
 

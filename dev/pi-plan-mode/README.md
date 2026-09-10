@@ -16,6 +16,39 @@ A focused Pi extension with exactly three workflow modes:
 
 The selected mode is persisted in the current Pi session. Fresh, malformed, and no-session contexts default to YOLO.
 
+## Default models and effort
+
+Configure optional per-mode model defaults in the normal Pi settings files:
+
+```json
+{
+  "pi-plan-mode": {
+    "models": {
+      "PLAN": "openai-codex/gpt-5.6-sol",
+      "ORCHESTRATOR": "openai-codex/gpt-5.6-luna",
+      "YOLO": "openai-codex/gpt-6-astra"
+    },
+    "effort": {
+      "PLAN": "high",
+      "ORCHESTRATOR": "xhigh",
+      "YOLO": "medium"
+    }
+  }
+}
+```
+
+Global settings live at `~/.pi/agent/settings.json`; a project
+`.pi/settings.json` overrides only the modes it names. References use
+`provider/modelId` (additional slashes belong to the model ID). Defaults are
+applied when a parent session starts, changes mode, or restores a session tree;
+reapplying the current mode does not reset a manually selected model. An
+unconfigured model or effort keeps the current value. An unavailable configured
+model produces one warning while leaving the current model unchanged. Effort
+levels are `low`, `medium`, `high`, `xhigh`, and `max`; Pi clamps them when the
+selected model supports fewer levels. The `efforts` key is
+also accepted as an alias for `effort`. Child PLAN sessions keep the model and
+effort selected by their subagent runner.
+
 ## File-backed planning workflow
 
 PLAN keeps long plans out of repetitive chat output:

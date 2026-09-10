@@ -1516,3 +1516,182 @@ test("explicit recommendation fields and legacy drafts remain advisory through a
   assert.equal(pi.active.includes("write"), false);
   assert.equal(pi.entries.some(entry => entry.data?.status === "approved-pending"), false);
 });
+
+test("applies configured parent model defaults on mode changes and tree restore", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  const root = isolatedEnvironment(t);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
+  writeFileSync(join(root, "settings.json"), JSON.stringify({
+    "pi-plan-mode": {
+      models: {
+        PLAN: "provider/plan/model",
+        ORCHESTRATOR: "provider/orchestrator",
+        YOLO: "provider/yolo",
+      },
+      effort: {
+        PLAN: "high",
+        ORCHESTRATOR: "xhigh",
+        YOLO: "medium",
+      },
+    },
+  }));
+
+  const models = new Map([
+    ["provider/plan/model", { provider: "provider", id: "plan/model" }],
+    ["provider/orchestrator", { provider: "provider", id: "orchestrator" }],
+    ["provider/yolo", { provider: "provider", id: "yolo" }],
+  ]);
+  const pi = mockPi();
+  const selected = [];
+  const selectedEfforts = [];
+  const defaultApplicationOrder = [];
+  let currentEffort = "low";
+  const ctx = mockContext(pi.entries, undefined);
+  ctx.model = { provider: "initial", id: "model" };
+  ctx.modelRegistry = { find: (provider, id) => models.get(`${provider}/${id}`) };
+  pi.setModel = async (model) => {
+    defaultApplicationOrder.push("model");
+    selected.push(`${model.provider}/${model.id}`);
+    ctx.model = model;
+    return true;
+  };
+  pi.getThinkingLevel = () => currentEffort;
+  pi.setThinkingLevel = (effort) => {
+    defaultApplicationOrder.push("effort");
+    selectedEfforts.push(effort);
+    currentEffort = effort;
+  };
+  await registerPlanMode(pi);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+
+  await pi.handlers.get("session_start")({}, ctx);
+  assert.deepEqual(selected, ["provider/yolo"]);
+  assert.deepEqual(selectedEfforts, ["medium"]);
+  assert.deepEqual(defaultApplicationOrder, ["model", "effort"], "effort is applied after the mode model");
+
+  await pi.commands.get("plan").handler(undefined, ctx);
+  assert.deepEqual(selected, ["provider/yolo", "provider/plan/model"]);
+  assert.deepEqual(selectedEfforts, ["medium", "high"]);
+
+  ctx.model = { provider: "manual", id: "selection" };
+  pi.setThinkingLevel("max");
+  await pi.commands.get("plan").handler(undefined, ctx);
+  assert.deepEqual(selected, ["provider/yolo", "provider/plan/model"], "same-mode requests preserve manual selections");
+  assert.deepEqual(selectedEfforts, ["medium", "high", "max"], "same-mode requests preserve manual effort");
+
+  await pi.handlers.get("session_tree")({}, ctx);
+  assert.deepEqual(selected, ["provider/yolo", "provider/plan/model", "provider/plan/model"], "tree restore reapplies the branch default");
+  assert.deepEqual(selectedEfforts, ["medium", "high", "max", "high"], "tree restore reapplies the branch effort");
+
+  await pi.commands.get("yolo").handler(undefined, ctx);
+  assert.deepEqual(selected, ["provider/yolo", "provider/plan/model", "provider/plan/model", "provider/yolo"]);
+  assert.deepEqual(selectedEfforts, ["medium", "high", "max", "high", "medium"]);
+});
+
+test("unavailable mode model defaults warn once without blocking mode changes", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  const root = isolatedEnvironment(t);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
+  writeFileSync(join(root, "settings.json"), JSON.stringify({
+    "pi-plan-mode": { models: { YOLO: "missing/model" } },
+  }));
+
+  const pi = mockPi();
+  const ctx = mockContext(pi.entries, undefined);
+  ctx.modelRegistry = { find: () => undefined };
+  pi.setModel = async () => true;
+  await registerPlanMode(pi);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+  await pi.handlers.get("session_start")({}, ctx);
+  await pi.handlers.get("session_tree")({}, ctx);
+  assert.equal(ctx.notifications.filter(({ message }) => message.includes("missing/model")).length, 1);
+  assert.deepEqual(pi.active, [...pi.tools.keys()]);
+});
+
+test("child PLAN sessions do not override their runner model or effort", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  const root = isolatedEnvironment(t);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const probeKey = Symbol.for("pi-subagents:child-context:v1");
+  const previousProbe = globalThis[probeKey];
+  process.env.PI_CODING_AGENT_DIR = root;
+  globalThis[probeKey] = () => true;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousProbe === undefined) delete globalThis[probeKey];
+    else globalThis[probeKey] = previousProbe;
+  });
+  writeFileSync(join(root, "settings.json"), JSON.stringify({
+    "pi-plan-mode": {
+      models: { PLAN: "provider/parent-plan" },
+      effort: { PLAN: "max" },
+    },
+  }));
+
+  const pi = mockPi();
+  const ctx = mockContext(pi.entries, undefined);
+  ctx.modelRegistry = { find: () => ({ provider: "provider", id: "parent-plan" }) };
+  pi.setModel = async () => {
+    throw new Error("child model setter should not be called");
+  };
+  pi.getThinkingLevel = () => "low";
+  pi.setThinkingLevel = () => {
+    throw new Error("child effort setter should not be called");
+  };
+  await registerPlanMode(pi);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+  await pi.handlers.get("session_start")({}, ctx);
+  assert.equal(ctx.notifications.some(({ message }) => message.includes("child model setter")), false);
+  assert.equal(ctx.notifications.some(({ message }) => message.includes("child effort setter")), false);
+  assert.equal(pi.active.includes("write"), false);
+});
+
+test("effort setter failures warn once without blocking mode changes", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  const root = isolatedEnvironment(t);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
+  writeFileSync(join(root, "settings.json"), JSON.stringify({
+    "pi-plan-mode": { effort: { YOLO: "high" } },
+  }));
+
+  const pi = mockPi();
+  const ctx = mockContext(pi.entries, undefined);
+  pi.getThinkingLevel = () => "low";
+  pi.setThinkingLevel = () => {
+    throw new Error("effort unavailable");
+  };
+  await registerPlanMode(pi);
+  t.after(() => pi.handlers.get("session_shutdown")({}, ctx));
+  await pi.handlers.get("session_start")({}, ctx);
+  await pi.handlers.get("session_tree")({}, ctx);
+  assert.equal(ctx.notifications.filter(({ message }) => message.includes("effort unavailable")).length, 1);
+  assert.deepEqual(pi.active, [...pi.tools.keys()]);
+});

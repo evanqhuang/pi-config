@@ -25,7 +25,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
-import { getLocalModelPolicyError } from "./model-scope.js";
+import { getLocalModelPolicyErrorForAgent } from "./model-scope.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createToolLoopGuard, type ToolLoopGuard } from "./tool-loop-guard.js";
 import { loadSettings, resolveProgressCheckpointSettings } from "./settings.js";
@@ -1083,13 +1083,12 @@ export async function runAgent(
   const model = options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
-  const isAllowedGoalEvaluatorCloudModel = options.allowCloudModelInLocalMode === true
-    && (type === "GoalJudge" || type === "GoalVerifier")
-    && model?.provider === "openai-codex"
-    && model.id.toLowerCase().includes("luna");
-  const localModelPolicyError = isAllowedGoalEvaluatorCloudModel
-    ? undefined
-    : getLocalModelPolicyError(model, agentConfig?.model);
+  const localModelPolicyError = getLocalModelPolicyErrorForAgent(
+    type,
+    model,
+    options.allowCloudModelInLocalMode,
+    agentConfig?.model,
+  );
   if (localModelPolicyError) throw new Error(localModelPolicyError);
 
   // Progress checkpoints are opt-in and explicitly orchestrator-owned. Native
@@ -1307,7 +1306,11 @@ export async function runAgent(
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
   progressSession = session;
-  const sessionLocalModelPolicyError = getLocalModelPolicyError(session.model);
+  const sessionLocalModelPolicyError = getLocalModelPolicyErrorForAgent(
+    type,
+    session.model,
+    options.allowCloudModelInLocalMode,
+  );
   if (sessionLocalModelPolicyError) {
     session.dispose();
     throw new Error(sessionLocalModelPolicyError);

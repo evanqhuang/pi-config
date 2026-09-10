@@ -154,6 +154,20 @@ test("calculates valid speed and rejects invalid inputs", () => {
 	}
 });
 
+test("ignores late agent settlement after session shutdown", () => {
+	const { pi, ctx, emit } = fixture();
+	localModeExtension(pi, () => 1000);
+	emit("session_shutdown");
+	Object.defineProperty(ctx, "model", {
+		configurable: true,
+		get() {
+			throw new Error("stale ExtensionContext");
+		},
+	});
+
+	assert.doesNotThrow(() => emit("agent_settled"));
+});
+
 test("reinstalls the cycle wrapper after a disabled editor replacement", async () => {
 	const { pi, ctx } = fixture();
 	const firstInputs = [];

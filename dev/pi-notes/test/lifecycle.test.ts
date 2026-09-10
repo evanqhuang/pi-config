@@ -59,6 +59,7 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
   const notifications: Array<{ message: string; level: string }> = [];
+  let activeToolsStale = false;
 
   const pi = {
     registerTool(tool: any) { tools.set(tool.name, tool); },
@@ -67,7 +68,10 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
     appendEntry(customType: string, data: unknown) {
       branch.push({ type: "custom", customType, data });
     },
-    getActiveTools() { return ["read", "write", "edit", "checkpoint_notes", "goal_progress"]; },
+    getActiveTools() {
+      if (activeToolsStale) throw new Error("stale ExtensionAPI");
+      return ["read", "write", "edit", "checkpoint_notes", "goal_progress"];
+    },
     sendMessage() {},
   } as unknown as ExtensionAPI;
 
@@ -95,6 +99,7 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
     command,
     checkpointTool,
     notifications,
+    setActiveToolsStale(value: boolean) { activeToolsStale = value; },
     get branch() { return branch; },
     setBranch(next: any[]) { branch = next; },
     async status() {
@@ -106,6 +111,18 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
 }
 
 describe("session lifecycle integration", () => {
+  it("ignores late context callbacks after session shutdown", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    h.handlers.get("session_shutdown")!();
+    h.setActiveToolsStale(true);
+
+    expect(() => h.handlers.get("context")!({ messages: [] }, h.ctx)).not.toThrow();
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx)).toEqual({ messages: [] });
+    expect(() => h.handlers.get("turn_end")!()).not.toThrow();
+  });
+
   it.skipIf(process.platform === "win32")("accepts an agent directory reached through a symlinked ancestor", async () => {
     const container = await mkdtemp(join(tmpdir(), "pi-notes-symlink-"));
     createdRoots.push(container);

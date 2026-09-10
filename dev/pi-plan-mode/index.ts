@@ -47,6 +47,7 @@ import {
   createModeChangeReminderMessage,
   removeModeChangeReminderMessages,
 } from "./src/mode-change-reminder.mjs";
+import { loadModeDefaults } from "./src/mode-models.mjs";
 
 const STATE_TYPE = "pi-plan-mode-state";
 const LEGACY_STATE_TYPE = "mode-state";
@@ -84,6 +85,11 @@ const YOLO_MODE_CHANGE_CONTRACT = "YOLO mode is active: the complete tool regist
 type Mode = "PLAN" | "ORCHESTRATOR" | "YOLO";
 type ParentRecommendation = "YOLO" | "ORCHESTRATOR" | "PREWALK";
 type CompactionAdvice = "direct" | "compact-first";
+type ModeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+type ModeDefaults = Partial<Record<Mode, {
+  model?: { provider: string; id: string; ref: string };
+  effort?: ModeEffort;
+}>>;
 type PlanRecommendation = {
   // These names mirror the managed-plan front matter contract.
   recommendedMode: ParentRecommendation;
@@ -197,6 +203,10 @@ type State = {
   midRunModeChange?: Mode;
   /** Depth counter from ui_prompt_start/ui_prompt_end; gates the mid-run fast path so a mode switch cannot land mid-dialog (e.g. the plan-approval select). */
   openUiPrompts: number;
+  /** Prevent same-mode lifecycle re-entry from resetting a user's model choice. */
+  modeInitialized: boolean;
+  /** Avoid repeating unavailable/default-selection warnings in one extension lifetime. */
+  modeDefaultWarnings: Set<string>;
   /** Serializes concurrent apply() calls; see applySerialized. */
   applyChain: Promise<void>;
 };
@@ -797,6 +807,8 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     orchestrator: createOrchestratorState(),
     planStatus: "none",
     openUiPrompts: 0,
+    modeInitialized: false,
+    modeDefaultWarnings: new Set(),
     applyChain: Promise.resolve(),
   };
 
@@ -920,7 +932,59 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     return { block: true, reason };
   };
 
-  const apply = async (mode: Mode, ctx: ExtensionContext) => {
+  const warnModeDefaultOnce = (mode: Mode, defaultKey: string, message: string, ctx: ExtensionContext) => {
+    const key = `${mode}:${defaultKey}`;
+    if (state.modeDefaultWarnings.has(key)) return;
+    state.modeDefaultWarnings.add(key);
+    notify(ctx, message, "warning");
+  };
+
+  const applyModeDefaults = async (mode: Mode, ctx: ExtensionContext) => {
+    // Child sessions receive their model from the subagent runner. Applying a
+    // parent default here would silently overwrite that per-agent selection.
+    if (isChild) return;
+    const configured = (loadModeDefaults(ctx.cwd) as ModeDefaults)[mode];
+    if (!configured) return;
+
+    if (configured.model && typeof ctx.modelRegistry?.find === "function" && typeof pi.setModel === "function"
+      && (ctx.model?.provider !== configured.model.provider || ctx.model?.id !== configured.model.id)) {
+      const model = ctx.modelRegistry.find(configured.model.provider, configured.model.id);
+      if (!model) {
+        warnModeDefaultOnce(mode, `model:${configured.model.ref}`, `Configured ${mode} default model is unavailable: ${configured.model.ref}`, ctx);
+      } else {
+        try {
+          const selected = await pi.setModel(model);
+          if (selected === false) {
+            warnModeDefaultOnce(mode, `model:${configured.model.ref}`, `Could not activate configured ${mode} default model: ${configured.model.ref}`, ctx);
+          }
+        } catch (error) {
+          warnModeDefaultOnce(
+            mode,
+            `model:${configured.model.ref}`,
+            `Could not activate configured ${mode} default model ${configured.model.ref}: ${error instanceof Error ? error.message : String(error)}`,
+            ctx,
+          );
+        }
+      }
+    }
+
+    if (configured.effort && typeof pi.setThinkingLevel === "function"
+      && (typeof pi.getThinkingLevel !== "function" || pi.getThinkingLevel() !== configured.effort)) {
+      try {
+        pi.setThinkingLevel(configured.effort);
+      } catch (error) {
+        warnModeDefaultOnce(
+          mode,
+          `effort:${configured.effort}`,
+          `Could not activate configured ${mode} default effort ${configured.effort}: ${error instanceof Error ? error.message : String(error)}`,
+          ctx,
+        );
+      }
+    }
+  };
+
+  const apply = async (mode: Mode, ctx: ExtensionContext, applyDefaults = false) => {
+    const modeChanged = state.mode !== mode;
     if (mode === "PLAN" && !state.sandboxed) {
       if (!contextPatch.available) throw new Error("context-mode native sandbox integration is unavailable");
       const paths = contextSandboxPaths();
@@ -948,6 +1012,8 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       ? forceFullReminder(state.reminder, "plan-entry")
       : clearReminderState();
     refreshTools();
+    if (applyDefaults || modeChanged || !state.modeInitialized) await applyModeDefaults(mode, ctx);
+    state.modeInitialized = true;
     pi.appendEntry(STATE_TYPE, { mode });
     const status = mode === "PLAN"
       ? ctx.ui.theme.fg("warning", "PLAN")
@@ -964,8 +1030,8 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   // the sandbox and flips state.mode — so every call is serialized through
   // this chain. A rejection here must not block later calls, so the chain
   // itself always resolves; callers still get the real result/rejection back.
-  const applySerialized = (mode: Mode, ctx: ExtensionContext) => {
-    const run = state.applyChain.then(() => apply(mode, ctx));
+  const applySerialized = (mode: Mode, ctx: ExtensionContext, applyDefaults = false) => {
+    const run = state.applyChain.then(() => apply(mode, ctx, applyDefaults));
     state.applyChain = run.then(() => undefined, () => undefined);
     return run;
   };
@@ -997,7 +1063,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       return;
     }
     try {
-      await applySerialized(mode, ctx);
+      await applySerialized(mode, ctx, state.mode !== mode);
       state.midRunModeChange = midRun ? mode : undefined;
     } catch (error) {
       notify(ctx, `Cannot activate ${mode} mode: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -1468,7 +1534,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       // A recoverable approval is an explicit safety interlock: it never
       // restores the previously persisted execution mode before the user
       // chooses whether to resume it.
-      await applySerialized(recoveredApproval ? "PLAN" : isChild ? "PLAN" : lastMode(ctx), ctx);
+      await applySerialized(recoveredApproval ? "PLAN" : isChild ? "PLAN" : lastMode(ctx), ctx, true);
       if (!recoveredApproval || !genuineResume || !ctx.hasUI) return;
       // Explicit runtime reasons distinguish reload/fork from a later real
       // startup/resume. Adapters without the reason use the process/session
@@ -1581,7 +1647,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
     state.pendingApprovalArmed = false;
     // Tree navigation re-evaluates the branch but never prompts or consumes an
     // approval. A valid pending record still forces the hard PLAN gate.
-    await applySerialized(isChild ? "PLAN" : recoveredApproval ? "PLAN" : lastMode(ctx), ctx);
+    await applySerialized(isChild ? "PLAN" : recoveredApproval ? "PLAN" : lastMode(ctx), ctx, true);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

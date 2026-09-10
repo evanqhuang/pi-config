@@ -13,9 +13,10 @@
           "contextWindow": 272000,
           "maxTokens": 128000,
           "thinkingLevelMap": {
+            "off": null,
             "xhigh": "xhigh",
             "max": "max",
-            "minimal": "low"
+            "minimal": null
           },
           "compat": {
             "supportsOpenAIGrammarTools": true,

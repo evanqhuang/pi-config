@@ -8,7 +8,7 @@
     "dev/pi-notes",
     "npm:pi-rtk-rewrite",
     "npm:pi-playwright",
-    "npm:@juicesharp/rpiv-todo",
+    "dev/rpiv-mono/packages/rpiv-todo",
     "npm:@petechu/pi-extension-toggle",
     "npm:@juicesharp/rpiv-ask-user-question",
     "dev/pi-subagents-local",
@@ -46,7 +46,14 @@
     },
     "npm:@haemmid/pi-processes",
     "npm:@howaboua/pi-codex-conversion",
-    "npm:@howaboua/pi-codex-web-run"
+    "npm:@howaboua/pi-codex-web-run",
+    {
+      "source": "dev/pi-advisor-flow",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    }
   ],
   "defaultProvider": "openai-codex",
   "enabledModels": [
@@ -229,5 +236,17 @@
     "+extensions/pr-worktree-guard/index.ts"
   ],
   "defaultThinkingLevel": "low",
-  "defaultModel": "gpt-6-astra"
+  "defaultModel": "gpt-5.6-sol",
+  "pi-plan-mode": {
+    "models": {
+      "PLAN": "openai-codex/gpt-6-astra",
+      "YOLO": "openai-codex/gpt-5.6-luna",
+      "ORCHESTRATOR": "openai-codex/gpt-5.6-sol"
+    },
+    "effort": {
+      "PLAN": "medium",
+      "YOLO": "xhigh",
+      "ORCHESTRATOR": "low"
+    }
+  }
 }
