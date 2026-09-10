@@ -498,12 +498,19 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   ]) {
     assert.equal(await pi.handlers.get("tool_call")({ toolName: "bash", input: { command } }), undefined, command);
   }
+  assert.equal(await pi.handlers.get("tool_call")({
+    toolName: "exec_command",
+    input: { cmd: "cat /Users/evanhuang/.codex/AGENTS.md; git -C /Users/evanhuang/hostelhawk branch --show-current; git -C /Users/evanhuang/hostelhawk status --short" },
+  }), undefined);
   for (const command of ["touch x", "git status && touch x", "git status > marker", "echo $(touch x)"]) {
     const blockedBash = await pi.handlers.get("tool_call")({ toolName: "bash", input: { command } });
     assert.equal(blockedBash.block, true, command);
     assert.equal(blockedBash.terminate, undefined);
     assert.match(blockedBash.reason, /recognized read-only commands or compositions/);
   }
+  const blockedExecCommand = await pi.handlers.get("tool_call")({ toolName: "exec_command", input: { cmd: "git status && touch x" } });
+  assert.equal(blockedExecCommand.block, true);
+  assert.match(blockedExecCommand.reason, /recognized read-only commands or compositions/);
 
   const worker = await pi.handlers.get("tool_call")({ toolName: "Agent", input: { subagent_type: "worker" } });
   assert.equal(worker.block, true);

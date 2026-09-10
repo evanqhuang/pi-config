@@ -22,6 +22,7 @@ test("exposes exactly PLAN, ORCHESTRATOR, and YOLO", () => {
 test("PLAN is an explicit read-only allowlist and unknown tools fail closed", () => {
   assert.ok(PLAN_TOOLS.includes("read"));
   assert.ok(PLAN_TOOLS.includes("bash"));
+  assert.ok(PLAN_TOOLS.includes("exec_command"));
   assert.ok(PLAN_TOOLS.includes("ctx_execute"));
   assert.ok(PLAN_TOOLS.includes("ctx_batch_execute"));
   assert.ok(PLAN_TOOLS.includes("checkpoint_notes"));
@@ -107,6 +108,9 @@ test("read-only commands include inspection-only Git and GitHub workflows", () =
   for (const command of [
     "git status --short",
     "git status --short --branch",
+    "git -C /Users/evanhuang/hostelhawk branch --show-current",
+    "git -C /Users/evanhuang/hostelhawk status --short",
+    "git -C /Users/evanhuang/hostelhawk branch --show-current; git -C /Users/evanhuang/hostelhawk status --short",
     "git diff --stat",
     "git worktree list --porcelain",
     "git branch -a --no-color",
@@ -150,6 +154,9 @@ test("read-only command policy fails closed on mutation and shell escapes", () =
     "git status | touch marker",
     "git worktree add ../other",
     "git worktree remove ../other",
+    "git -C /Users/evanhuang/hostelhawk status && touch marker",
+    "git -C",
+    "git -C -- status",
     "git branch -D old",
     "git branch new-branch",
     "git remote add origin example.invalid/repo",

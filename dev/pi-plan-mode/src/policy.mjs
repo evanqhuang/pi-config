@@ -20,7 +20,7 @@ export const CHILD_PLAN_BLOCKED_TOOLS = Object.freeze([
 // This is deliberately explicit. New tools are unavailable in PLAN until their
 // behavior has been reviewed and added here.
 export const PLAN_TOOLS = Object.freeze([
-  "read", "grep", "find", "ls", "bash",
+  "read", "grep", "find", "ls", "bash", "exec_command",
   "ask_user_question", "questionnaire", "manage_plan_draft", "submit_plan_for_approval",
   "ctx_execute", "ctx_execute_file", "ctx_batch_execute",
   "ctx_search", "ctx_fetch_and_index", "ctx_index", "ctx_stats", "ctx_doctor",
@@ -217,17 +217,43 @@ const FORBIDDEN_ARGUMENTS = new Set([
 const READ_ONLY_GIT_COMMANDS = new Set([
   "status", "log", "diff", "show", "ls-files", "ls-tree", "rev-parse", "describe",
 ]);
+const READ_ONLY_GIT_GLOBAL_FLAGS = new Set([
+  "--no-pager", "--no-replace-objects", "--literal-pathspecs",
+]);
+
+function readOnlyGitSubcommandIndex(args) {
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (READ_ONLY_GIT_GLOBAL_FLAGS.has(arg)) {
+      index++;
+      continue;
+    }
+    if (arg === "-C") {
+      const path = args[index + 1];
+      if (!path || path.startsWith("-")) return -1;
+      index += 2;
+      continue;
+    }
+    // Git also accepts the compact -C<path> spelling.
+    if (arg.startsWith("-C") && arg.length > 2) {
+      index++;
+      continue;
+    }
+    break;
+  }
+  return index;
+}
 
 function hasOption(args, option) {
   return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
 }
 
 function isReadOnlyGit(args) {
-  const subcommandIndex = args.findIndex((arg) => !arg.startsWith("-"));
-  if (subcommandIndex < 0) return false;
+  const subcommandIndex = readOnlyGitSubcommandIndex(args);
+  if (subcommandIndex < 0 || subcommandIndex >= args.length) return false;
   const subcommand = args[subcommandIndex];
   const subcommandArgs = args.slice(subcommandIndex + 1);
-  if (args.slice(0, subcommandIndex).some((arg) => !["--no-pager", "--no-replace-objects", "--literal-pathspecs"].includes(arg))) return false;
   if (args.some((arg) => arg === "--output" || arg.startsWith("--output=") || ["--ext-diff", "--textconv", "--show-signature"].includes(arg))) return false;
 
   if (READ_ONLY_GIT_COMMANDS.has(subcommand)) return true;

@@ -57,6 +57,7 @@ const APPROVAL_RESUME_OPTIONS = ["Resume approved implementation", "Stay in PLAN
 const RESTORE_PROMPT_REGISTRY = Symbol.for("pi-plan-mode:approval-restore-prompts:v1");
 const CHILD_CONTEXT_PROBE = Symbol.for("pi-subagents:child-context:v1");
 const CHILD_PLAN_TOOL_SET = new Set(CHILD_PLAN_BLOCKED_TOOLS);
+const READ_ONLY_SHELL_TOOLS = new Set(["bash", "exec_command"]);
 const ORCHESTRATOR_ROLES = new Map([
   ["implementationworker", "ImplementationWorker"],
   ["explore", "Explore"],
@@ -1463,8 +1464,11 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       return blockPlanTool(`PLAN blocks unknown or mutating tool: ${event.toolName}`);
     }
 
-    if (event.toolName === "bash") {
-      const command = (event.input as { command?: unknown })?.command;
+    if (READ_ONLY_SHELL_TOOLS.has(event.toolName)) {
+      const input = isRecord(event.input) ? event.input as Record<string, unknown> : undefined;
+      // Pi's native Bash tool uses `command`; the host exec_command adapter
+      // uses `cmd`. Both paths share the same read-only shell policy.
+      const command = input?.command ?? input?.cmd;
       if (!isReadOnlyCommand(command)) {
         return blockPlanTool("PLAN Bash only permits recognized read-only commands or compositions; use ctx_execute for sandboxed derivation.");
       }
@@ -1472,7 +1476,7 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
       // mid-run mode switch can flip state.mode before this call's execute()
       // runs; re-reading live state there would silently drop sandboxing for
       // a call PLAN already approved.
-      if (event.input && typeof event.input === "object") (event.input as Record<string, unknown>).__planSandboxed = true;
+      if (event.toolName === "bash" && input) input.__planSandboxed = true;
     }
 
     if (event.toolName === "ctx_batch_execute" && !isReadOnlyBatch(event.input)) {
