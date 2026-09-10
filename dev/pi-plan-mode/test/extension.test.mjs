@@ -321,6 +321,9 @@ test("extension exposes PLAN enforcement and full-permission ORCHESTRATOR and YO
   const planStart = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
   assert.match(planStart.systemPrompt, /use ask_user_question/);
   assert.match(planStart.systemPrompt, /continue with allowed read-only investigation/);
+  assert.match(planStart.systemPrompt, /synthesize the evidence into an implementation-ready plan/);
+  assert.match(planStart.systemPrompt, /Trace each proposed change to an inspected fact or clearly labeled assumption/);
+  assert.match(planStart.systemPrompt, /do not add empty sections or invent detail to satisfy a template/);
   assert.match(planStart.systemPrompt, /concrete plan containing context, numbered changes/);
   assert.match(planStart.systemPrompt, /submit_plan_for_approval/);
   assert.match(planStart.systemPrompt, /do not switch modes yourself or ask the user to switch modes/i);
@@ -735,6 +738,49 @@ test("managed plans record bounded recommendations and approval puts the recomme
   assert.match(ctx.selectCalls.at(-1).title, /PREWALK:/);
   assert.match(ctx.selectCalls.at(-1).title, /sole approval/);
   assert.equal(pi.active.includes("write"), false, "recommendations must not switch modes");
+  await pi.handlers.get("session_shutdown")({}, ctx);
+});
+
+test("submission accepts an implementation-ready phased plan without prescribed headings", async (t) => {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    t.skip("native sandbox is only supported on macOS/Linux");
+    return;
+  }
+  isolatedEnvironment(t);
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  await pi.handlers.get("session_start")({}, ctx);
+  await pi.commands.get("plan").handler(undefined, ctx);
+
+  const phasedPlan = `# Connector rollout
+
+## Phase 1 — Contract
+Update \`src/connectors/client.ts\` to preserve the existing timeout behavior while adding the new transport option. This depends on the current client factory confirmed during exploration.
+
+## Phase 2 — Integration
+Wire the option through \`src/connectors/index.ts\`, then add focused success and timeout cases in \`test/connectors/client.test.ts\`.
+
+## Release checks
+Run \`npm test -- test/connectors/client.test.ts\` and \`npm run typecheck\`. If the timeout behavior regresses, revert the integration and client changes together before release.
+`;
+  const draft = await pi.tools.get("manage_plan_draft").execute(
+    "phased-plan",
+    { action: "create", plan: phasedPlan },
+    undefined,
+    undefined,
+    ctx,
+  );
+
+  const result = await pi.tools.get("submit_plan_for_approval").execute(
+    "phased-approval",
+    { planPath: draft.details.planPath },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(result.details.status, "cancelled");
+  assert.equal(ctx.selectCalls.length, 1, "plan shape must not prevent the approval UI");
   await pi.handlers.get("session_shutdown")({}, ctx);
 });
 

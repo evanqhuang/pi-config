@@ -66,6 +66,8 @@ const PARENT_FULL_WORKFLOW = [
   "Ask focused questions only after enough repository investigation to present meaningful options and a recommendation.",
   "Do not make large assumptions merely to finish the plan.",
   "Fold each resolved answer into the managed plan before submission.",
+  "Before creating the managed draft, synthesize inspected evidence into an implementation-ready plan and review it against the user's request; trace proposed changes to facts or labeled assumptions, name exact files and symbols when known (or explicit new paths), and describe intended behavior and dependencies.",
+  "Resolve blocking unknowns through inspection or a focused user question rather than deferring them to implementation. Include behavior-focused verification and material failure handling or rollback where relevant, using the plan structure that best fits the work instead of padding a fixed template.",
   "Substantial plans identify parent-owned integration, proposed workers with exclusive files, required interfaces, dependency order, and focused verification. State why each worker is preferable to parent execution; file count and numbered headings are insufficient. Recommend direct execution when shared types, lifecycle state, or unresolved interfaces dominate; recommend ORCHESTRATOR only for a concrete delegation benefit. Recommendations remain advisory.",
   "Use ask_user_question only for clarification or approach selection, never for ‘is this plan okay?’ or implementation approval.",
   "Approval is submit-only: call submit_plan_for_approval for implementation approval; do not use a generic question as approval.",
