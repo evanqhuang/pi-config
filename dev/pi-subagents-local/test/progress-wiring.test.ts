@@ -25,6 +25,7 @@ const baseCard = {
 };
 
 let root: string;
+let previousAgentDir: string | undefined;
 let runtime: ModelRuntime;
 let model: Model<any>;
 let calls: string[][];
@@ -80,7 +81,12 @@ const pi = {
 } as any;
 
 beforeEach(async () => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   root = await mkdtemp(join(tmpdir(), "pi-progress-wiring-"));
+  // Keep the session loader away from the repository's settings.json. That
+  // file contains installable packages, and loading it makes these offline
+  // wiring tests race with the package manager instead of testing the runner.
+  process.env.PI_CODING_AGENT_DIR = join(root, "agent-dir");
   calls = [];
   runtime = await ModelRuntime.create({
     modelsPath: null,
@@ -106,6 +112,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   await rm(root, { recursive: true, force: true });
 });
 
