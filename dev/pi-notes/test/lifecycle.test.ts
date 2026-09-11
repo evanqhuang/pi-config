@@ -59,6 +59,7 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
   const notifications: Array<{ message: string; level: string }> = [];
+  const sentMessages: any[] = [];
   let activeToolsStale = false;
 
   const pi = {
@@ -72,7 +73,7 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
       if (activeToolsStale) throw new Error("stale ExtensionAPI");
       return ["read", "write", "edit", "checkpoint_notes", "goal_progress"];
     },
-    sendMessage() {},
+    sendMessage(message: unknown) { sentMessages.push(message); },
   } as unknown as ExtensionAPI;
 
   const ctx = {
@@ -99,6 +100,7 @@ async function makeHarness(initialBranch: any[] = [], existingRoot?: string) {
     command,
     checkpointTool,
     notifications,
+    sentMessages,
     setActiveToolsStale(value: boolean) { activeToolsStale = value; },
     get branch() { return branch; },
     setBranch(next: any[]) { branch = next; },
@@ -284,7 +286,8 @@ describe("session lifecycle integration", () => {
     } catch (error) {
       failure = error as Error;
     }
-    expect(failure?.message).toMatch(/Invalid checkpoint payload.*Summarize/s);
+    expect(failure?.message).toMatch(/Invalid checkpoint payload.*Continue the main task/s);
+    expect(failure?.message).not.toContain("Summarize only continuation state and retry");
     expect(failure?.message).not.toContain("DO_NOT_ECHO");
     expect(failure?.message.length).toBeLessThan(400);
     expect(h.branch).toHaveLength(branchLengthBefore);
@@ -303,6 +306,95 @@ describe("session lifecycle integration", () => {
       current: "c".repeat(2048),
       completed: Array.from({ length: 40 }, () => "completed".repeat(128)),
     })).rejects.toThrow(/Rendered Notes exceed 8192 bytes/);
+  });
+
+  it("records checkpoint failure without changing durable state or blocking completion", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    const committed = await h.checkpointTool.execute("cp-1", payload);
+    const notesPath = committed.details.notesPath as string;
+    const notesBefore = await readFile(notesPath, "utf8");
+
+    h.handlers.get("tool_result")!({
+      toolName: "write",
+      input: { path: "src/changed.ts" },
+      isError: false,
+    });
+    const branchLengthBefore = h.branch.length;
+    await expect(h.checkpointTool.execute("cp-failed", {
+      ...payload,
+      current: "c".repeat(2048),
+      completed: Array.from({ length: 40 }, () => "completed".repeat(128)),
+    })).rejects.toThrow(/Rendered Notes exceed 8192 bytes/);
+    h.handlers.get("tool_result")!({
+      toolName: "checkpoint_notes",
+      input: payload,
+      isError: true,
+      content: [{ type: "text", text: "checkpoint failed" }],
+    });
+
+    expect(await h.status()).toContain("dirty: true");
+    expect(await h.status()).toContain("checkpoint failures: 1");
+    expect(await h.status()).toContain("generation: 1");
+    expect(h.branch).toHaveLength(branchLengthBefore);
+    expect(await readFile(notesPath, "utf8")).toBe(notesBefore);
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx).messages).toEqual([]);
+
+    const allowed = await h.handlers.get("tool_call")!({
+      toolName: "goal_progress",
+      input: { status: "done" },
+    }, h.ctx);
+    expect(allowed).toBeUndefined();
+    expect(h.notifications.at(-1)).toMatchObject({ level: "warning" });
+
+    await h.checkpointTool.execute("cp-recovered", payload);
+    expect(await h.status()).toContain("checkpoint failures: 0");
+    expect(await h.status()).toContain("dirty: false");
+  });
+
+  it("re-arms one checkpoint reminder only after activity and cooldown", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    await h.checkpointTool.execute("cp-1", payload);
+    h.handlers.get("tool_result")!({
+      toolName: "write",
+      input: { path: "src/changed.ts" },
+      isError: false,
+    });
+    h.handlers.get("tool_result")!({
+      toolName: "checkpoint_notes",
+      input: payload,
+      isError: true,
+      content: [{ type: "text", text: "checkpoint failed" }],
+    });
+
+    for (let index = 0; index < 5; index += 1) h.handlers.get("turn_end")!({});
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx).messages).toEqual([]);
+
+    h.handlers.get("tool_result")!({
+      toolName: "read",
+      input: { path: "src/new-state.ts" },
+      isError: false,
+    });
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx).messages).toEqual([]);
+    h.handlers.get("turn_end")!({});
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx).messages.at(-1)?.content)
+      .toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(h.handlers.get("context")!({ messages: [] }, h.ctx).messages).toEqual([]);
+  });
+
+  it("coalesces duplicate explicit checkpoint requests", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+
+    await h.command.handler("checkpoint", h.ctx);
+    await h.command.handler("checkpoint", h.ctx);
+
+    expect(h.sentMessages).toHaveLength(1);
+    expect(h.notifications.at(-1)?.message).toMatch(/already pending/i);
   });
 
   it("does not dirty or pressure a clean checkpoint below the read/search result threshold", async () => {
@@ -550,7 +642,7 @@ describe("session lifecycle integration", () => {
     expect(reentryContext.messages.at(-1)?.content).toContain("[TASK NOTES RE-ENTRY]");
     expect(reentryContext.messages.at(-1)?.content).toContain(notesPath);
     const checkpointContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
-    expect(checkpointContext.messages.at(-1)?.content).toContain("[TASK NOTES CHECKPOINT DUE]");
+    expect(checkpointContext.messages).toEqual([]);
 
     h.handlers.get("session_compact_failed")!({});
     expect(await h.status()).toContain("dirty: true");
@@ -559,6 +651,28 @@ describe("session lifecycle integration", () => {
 });
 
 describe("materialized Notes integrity", () => {
+  it("keeps tamper protection blocking after a checkpoint failure", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    const committed = await h.checkpointTool.execute("cp-1", payload);
+    const notesPath = committed.details.notesPath as string;
+    h.handlers.get("tool_result")!({
+      toolName: "checkpoint_notes",
+      input: payload,
+      isError: true,
+      content: [{ type: "text", text: "checkpoint failed" }],
+    });
+
+    await writeFile(notesPath, "tampered outside checkpoint_notes\n", "utf8");
+    const blocked = await h.handlers.get("tool_call")!({
+      toolName: "goal_progress",
+      input: { status: "done" },
+    }, h.ctx);
+    expect(blocked).toMatchObject({ block: true });
+    expect(blocked.reason).toMatch(/changed outside checkpoint_notes/i);
+  });
+
   it("blocks goal completion after out-of-band changes until /notes restore", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);

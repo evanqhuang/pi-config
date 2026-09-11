@@ -25,9 +25,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     requireHighSignalActivity: true,
   },
   checkpointing: {
-    dirtyTurns: 10,
-    continuityRelevantToolResults: 32,
-    readOnlyToolResults: 16,
+    dirtyTurns: 20,
+    continuityRelevantToolResults: 64,
+    readOnlyToolResults: 32,
   },
   integrations: {
     goal: true,
@@ -67,6 +67,12 @@ export interface NotesRuntime {
   checkpointDue: boolean;
   /** Runtime-only latch: each due episode gets one ambient reminder. */
   checkpointReminderPending: boolean;
+  /** Runtime-only suppression state after a failed checkpoint attempt. */
+  checkpointFailureCount: number;
+  checkpointRetryAfterTurn: number;
+  checkpointActivitySinceFailure: boolean;
+  /** Runtime-only latch for an explicitly requested follow-up turn. */
+  checkpointExplicitRequestPending: boolean;
   turnsSinceCheckpoint: number;
   continuityRelevantToolResultsSinceCheckpoint: number;
   readOnlyToolResultsSinceCheckpoint: number;
@@ -231,14 +237,15 @@ export function repairCheckpointArguments(args: unknown): unknown {
   return repaired;
 }
 
-const CHECKPOINT_RETRY_HINT =
-  "Summarize only continuation state and retry; do not paste plans, logs, test output, or file lists.";
+const CHECKPOINT_FAILURE_HINT =
+  "Continue the main task; no checkpoint was committed. Do not retry this checkpoint in the same turn; keep a later checkpoint compact.";
+const CHECKPOINT_FAILURE_COOLDOWN_TURNS = 5;
 const INVALID_CHECKPOINT_MESSAGE = [
   "Invalid checkpoint payload.",
   "Limits: current and next_action 1-2048 characters; each list item 1-1024 characters;",
   "completed, findings, decisions, and verification at most 40 items;",
   "failed_approaches and blockers at most 30 items.",
-  CHECKPOINT_RETRY_HINT,
+  CHECKPOINT_FAILURE_HINT,
 ].join(" ");
 
 function checkpointLimitViolation(args: unknown): string | undefined {
@@ -277,7 +284,7 @@ export function prepareCheckpointArguments(args: unknown): CheckpointPayload {
     const detail = checkpointLimitViolation(repaired);
     throw new Error(
       detail
-        ? `Invalid checkpoint payload: ${detail} ${CHECKPOINT_RETRY_HINT}`
+        ? `Invalid checkpoint payload: ${detail} ${CHECKPOINT_FAILURE_HINT}`
         : INVALID_CHECKPOINT_MESSAGE,
     );
   }
@@ -307,6 +314,10 @@ export function createRuntime(mode: ActivationMode = DEFAULT_CONFIG.activationMo
     dirty: false,
     checkpointDue: false,
     checkpointReminderPending: false,
+    checkpointFailureCount: 0,
+    checkpointRetryAfterTurn: 0,
+    checkpointActivitySinceFailure: false,
+    checkpointExplicitRequestPending: false,
     turnsSinceCheckpoint: 0,
     continuityRelevantToolResultsSinceCheckpoint: 0,
     readOnlyToolResultsSinceCheckpoint: 0,
@@ -500,6 +511,35 @@ function persistentFacts(runtime: NotesRuntime): CheckpointRecord["harnessFacts"
   };
 }
 
+function clearCheckpointFailure(runtime: NotesRuntime): void {
+  runtime.checkpointFailureCount = 0;
+  runtime.checkpointRetryAfterTurn = 0;
+  runtime.checkpointActivitySinceFailure = false;
+}
+
+function recordCheckpointFailure(runtime: NotesRuntime): void {
+  runtime.checkpointFailureCount += 1;
+  runtime.checkpointRetryAfterTurn = runtime.activationTurns + CHECKPOINT_FAILURE_COOLDOWN_TURNS;
+  runtime.checkpointActivitySinceFailure = false;
+  runtime.checkpointExplicitRequestPending = false;
+  runtime.checkpointReminderPending = false;
+  if (runtime.active) runtime.checkpointDue = true;
+}
+
+function maybeRearmCheckpointReminder(runtime: NotesRuntime): void {
+  if (!runtime.active
+    || !runtime.dirty
+    || !runtime.checkpointDue
+    || runtime.checkpointReminderPending
+    || runtime.checkpointExplicitRequestPending
+    || runtime.checkpointFailureCount === 0
+    || !runtime.checkpointActivitySinceFailure
+    || runtime.activationTurns < runtime.checkpointRetryAfterTurn) {
+    return;
+  }
+  setCheckpointDue(runtime, true, { remind: true });
+}
+
 async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload: CheckpointPayload): Promise<{ hash: string; generation: number }> {
   if (runtime.sessionEnded) throw new Error("The session was replaced before the Notes checkpoint completed");
   if (!runtime.active) throw new Error("Durable Notes are not active; run /notes on or /notes auto first");
@@ -545,6 +585,8 @@ async function commitCheckpoint(pi: ExtensionAPI, runtime: NotesRuntime, payload
     runtime.readOnlyTurns = 0;
     runtime.reentryRequired = false;
     runtime.harnessFacts.recentFailedCommandCount = 0;
+    clearCheckpointFailure(runtime);
+    runtime.checkpointExplicitRequestPending = false;
     return { hash, generation };
   } finally {
     runtime.checkpointInFlight = false;
@@ -560,6 +602,8 @@ function resetIdentity(runtime: NotesRuntime): void {
   runtime.dirty = false;
   runtime.checkpointDue = false;
   runtime.checkpointReminderPending = false;
+  clearCheckpointFailure(runtime);
+  runtime.checkpointExplicitRequestPending = false;
   runtime.reentryRequired = false;
   runtime.turnsSinceCheckpoint = 0;
   runtime.continuityRelevantToolResultsSinceCheckpoint = 0;
@@ -610,6 +654,8 @@ async function clearMaterializedNotes(runtime: NotesRuntime): Promise<void> {
 }
 
 function restoreRuntimeState(runtime: NotesRuntime, state: StateRecord | undefined, checkpoint: CheckpointRecord | undefined): void {
+  clearCheckpointFailure(runtime);
+  runtime.checkpointExplicitRequestPending = false;
   if (state) {
     runtime.activationMode = state.activationMode;
     runtime.active = state.active;
@@ -675,7 +721,13 @@ function setCheckpointDue(runtime: NotesRuntime, due: boolean, options: { remind
   const changed = runtime.checkpointDue !== due;
   runtime.checkpointDue = due;
   if (!due) runtime.checkpointReminderPending = false;
-  else if (changed || options.remind === true) runtime.checkpointReminderPending = options.remind ?? true;
+  else if (options.remind === false) runtime.checkpointReminderPending = false;
+  else if (changed || options.remind === true) {
+    const canRemind = runtime.checkpointFailureCount === 0
+      || (runtime.checkpointActivitySinceFailure
+        && runtime.activationTurns >= runtime.checkpointRetryAfterTurn);
+    runtime.checkpointReminderPending = canRemind;
+  }
 }
 
 function activateIfNeeded(pi: ExtensionAPI, runtime: NotesRuntime): void {
@@ -821,6 +873,10 @@ function recordActivity(
   const meaningfulSubagentCompletion = !isError
     && SUBAGENT_COMPLETION_TOOL_PATTERN.test(toolName)
     && indicatesCompletedSubagentResult(output);
+  if (runtime.checkpointFailureCount > 0
+    && (classified.continuityRelevant || classified.highSignal || meaningfulSubagentCompletion)) {
+    runtime.checkpointActivitySinceFailure = true;
+  }
   if (classified.highSignal || isError || meaningfulSubagentCompletion) {
     runtime.sawHighSignalActivity = true;
     runtime.highSignalThisTurn = true;
@@ -874,7 +930,7 @@ function notesPolicy(): string {
     "DURABLE TASK-STATE HANDOFF IS ACTIVE.",
     "NOTES.md is a compact durable continuation/task-state handoff, not general notes, a diary, or proof. Live worktree/tool/test state is authoritative. Only the current top-level session writes its session-local file.",
     CHECKPOINT_FIELD_GUIDANCE,
-    "Use checkpoint_notes after meaningful milestones, important findings/decisions, significant verification results, blockers, harness requests, and before reporting completion when the handoff is dirty.",
+    "Use checkpoint_notes after meaningful milestones, important findings/decisions, significant verification results, blockers, harness requests, and before reporting completion when the handoff is dirty. Do not checkpoint after minor observations. If checkpoint_notes fails, continue the main task, do not retry it in the same turn, and treat the eventual handoff as dirty until a later checkpoint succeeds.",
   ].join("\n");
 }
 
@@ -892,7 +948,9 @@ export function selectReminder(pi: Pick<ExtensionAPI, "getActiveTools">, runtime
   if (runtime.reentryRequired) {
     runtime.reentryRequired = false;
     if (runtime.lastCheckpointHash) {
-      return `[TASK NOTES RE-ENTRY]\nReread the compact durable continuation/task-state handoff at ${runtime.notesPath} and inspect live worktree/tool state before continuing. It is not general notes or proof.`;
+      const checkpointDue = runtime.checkpointDue && runtime.checkpointReminderPending;
+      if (checkpointDue) runtime.checkpointReminderPending = false;
+      return `[TASK NOTES RE-ENTRY]\nReread the compact durable continuation/task-state handoff at ${runtime.notesPath} and inspect live worktree/tool state before continuing. It is not general notes or proof.${checkpointDue ? "\n[TASK NOTES CHECKPOINT DUE]\nAfter rereading, call checkpoint_notes once only if the handoff is still materially dirty, then continue the main task." : ""}`;
     }
   }
   if (runtime.checkpointDue && runtime.checkpointReminderPending) {
@@ -909,6 +967,8 @@ function displayStatus(ctx: ExtensionContext, runtime: NotesRuntime, pi: Extensi
     `active: ${runtime.active}`,
     `dirty: ${runtime.dirty}`,
     `checkpoint due: ${runtime.checkpointDue}`,
+    `checkpoint failures: ${runtime.checkpointFailureCount}`,
+    `checkpoint retry after turn: ${runtime.checkpointFailureCount ? runtime.checkpointRetryAfterTurn : "none"}`,
     `generation: ${runtime.checkpointGeneration}`,
     `path: ${runtime.notesPath}`,
     `tool policy: ${paused ? "paused-by-tool-policy" : "available"}`,
@@ -947,7 +1007,13 @@ export default function notesExtension(pi: ExtensionAPI): void {
     ],
     parameters: CHECKPOINT_SCHEMA,
     prepareArguments(args) {
-      return prepareCheckpointArguments(args);
+      const prepared = prepareCheckpointArguments(args);
+      const rendered = renderNotes(prepared, runtime);
+      const bytes = Buffer.byteLength(rendered, "utf8");
+      if (bytes > DEFAULT_CONFIG.notesMaxBytes) {
+        throw new Error(`Invalid checkpoint payload: rendered Notes exceed ${DEFAULT_CONFIG.notesMaxBytes} bytes (${bytes}); keep only compact continuation state. ${CHECKPOINT_FAILURE_HINT}`);
+      }
+      return prepared;
     },
     executionMode: "sequential",
     async execute(_toolCallId, params) {
@@ -975,6 +1041,8 @@ export default function notesExtension(pi: ExtensionAPI): void {
         runtime.activationMode = "off";
         runtime.active = false;
         setCheckpointDue(runtime, false);
+        clearCheckpointFailure(runtime);
+        runtime.checkpointExplicitRequestPending = false;
         appendState(pi, runtime);
         return displayStatus(ctx, runtime, pi);
       }
@@ -993,6 +1061,11 @@ export default function notesExtension(pi: ExtensionAPI): void {
           ctx.ui.notify("checkpoint_notes is disabled by the current tool policy.", "warning");
           return;
         }
+        if (runtime.checkpointExplicitRequestPending) {
+          ctx.ui.notify("A Notes checkpoint request is already pending; continue the main task.", "info");
+          return;
+        }
+        runtime.checkpointExplicitRequestPending = true;
         setCheckpointDue(runtime, true, { remind: false });
         pi.sendMessage({
           customType: NOTES_REMINDER_TYPE,
@@ -1012,6 +1085,8 @@ export default function notesExtension(pi: ExtensionAPI): void {
           ctx.ui.notify(inherited ? "The current session already owns this checkpoint." : "No compatible inherited Notes checkpoint is visible on the active branch.", inherited ? "info" : "warning");
           return;
         }
+        clearCheckpointFailure(runtime);
+        runtime.checkpointExplicitRequestPending = false;
         runtime.active = true;
         runtime.dirty = true;
         setCheckpointDue(runtime, true);
@@ -1082,12 +1157,18 @@ export default function notesExtension(pi: ExtensionAPI): void {
         || runtime.continuityRelevantToolResultsSinceCheckpoint >= DEFAULT_CONFIG.checkpointing.continuityRelevantToolResults) {
         setCheckpointDue(runtime, true);
       }
+      maybeRearmCheckpointReminder(runtime);
     }
     activateIfNeeded(pi, runtime);
   });
   pi.on("tool_result", (event) => {
     if (runtime.sessionEnded) return;
-    if (event.toolName === "checkpoint_notes") return;
+    if (event.toolName === "checkpoint_notes") {
+      if (event.isError) recordCheckpointFailure(runtime);
+      else clearCheckpointFailure(runtime);
+      runtime.checkpointExplicitRequestPending = false;
+      return;
+    }
     recordActivity(pi, runtime, event.toolName, event.input, event.isError, {
       content: event.content,
       details: event.details,
@@ -1106,11 +1187,14 @@ export default function notesExtension(pi: ExtensionAPI): void {
     }
     if (DEFAULT_CONFIG.integrations.goal && event.toolName === "goal_progress") {
       if ((event.input as Record<string, unknown>).status === "done" && runtime.active) {
-        if (runtime.dirty) {
-          return { block: true, reason: "Goal completion is blocked until dirty durable Notes are checkpointed with checkpoint_notes." };
-        }
         if (await hasUnexpectedMaterializedChange(runtime)) {
           return { block: true, reason: "Goal completion is blocked because session-local NOTES.md changed outside checkpoint_notes; run /notes restore before completing the goal." };
+        }
+        if (runtime.dirty && runtime.checkpointFailureCount === 0) {
+          return { block: true, reason: "Goal completion is blocked until dirty durable Notes are checkpointed with checkpoint_notes." };
+        }
+        if (runtime.dirty && runtime.checkpointFailureCount > 0) {
+          ctx.ui.notify("Goal completion is proceeding with dirty Notes because the latest checkpoint failed; the durable handoff may be stale.", "warning");
         }
       }
     }

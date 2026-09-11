@@ -156,7 +156,8 @@ describe("checkpoint argument compatibility", () => {
         failure = error as Error;
       }
       expect(failure?.message).toMatch(detail);
-      expect(failure?.message).toMatch(/Summarize/);
+      expect(failure?.message).toContain("Continue the main task");
+      expect(failure?.message).not.toContain("Summarize only continuation state and retry");
       expect(failure?.message).not.toContain("c".repeat(80));
       expect(failure?.message).not.toContain("n".repeat(80));
       expect(failure?.message).not.toContain("f".repeat(80));
@@ -173,9 +174,9 @@ describe("runtime and rendering", () => {
       requireHighSignalActivity: true,
     });
     expect(DEFAULT_CONFIG.checkpointing).toEqual({
-      dirtyTurns: 10,
-      continuityRelevantToolResults: 32,
-      readOnlyToolResults: 16,
+      dirtyTurns: 20,
+      continuityRelevantToolResults: 64,
+      readOnlyToolResults: 32,
     });
   });
 
@@ -309,7 +310,7 @@ describe("transient reminders", () => {
     expect(stripNotesReminders([normal, reminder])).toEqual([normal]);
   });
 
-  it("emits path-specific re-entry once, then exposes an already-due checkpoint reminder", () => {
+  it("coalesces path-specific re-entry and an already-due checkpoint reminder", () => {
     const runtime = createRuntime("manual");
     runtime.reentryRequired = true;
     runtime.lastCheckpointHash = "committed-hash";
@@ -320,9 +321,9 @@ describe("transient reminders", () => {
 
     const reentry = selectReminder(pi, runtime);
     expect(reentry).toContain("[TASK NOTES RE-ENTRY]");
+    expect(reentry).toContain("[TASK NOTES CHECKPOINT DUE]");
     expect(reentry).toContain(runtime.notesPath);
     expect(runtime.reentryRequired).toBe(false);
-    expect(selectReminder(pi, runtime)).toContain("[TASK NOTES CHECKPOINT DUE]");
     expect(selectReminder(pi, runtime)).toBeUndefined();
   });
 
