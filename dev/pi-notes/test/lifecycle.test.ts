@@ -353,6 +353,25 @@ describe("session lifecycle integration", () => {
     expect(await h.status()).toContain("dirty: false");
   });
 
+  it("blocks an immediate retry after checkpoint failure", async () => {
+    const h = await makeHarness();
+    await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);
+    await h.command.handler("on", h.ctx);
+    h.handlers.get("tool_result")!({
+      toolName: "checkpoint_notes",
+      input: payload,
+      isError: true,
+      content: [{ type: "text", text: "checkpoint failed" }],
+    });
+
+    const blocked = await h.handlers.get("tool_call")!({
+      toolName: "checkpoint_notes",
+      input: payload,
+    }, h.ctx);
+    expect(blocked).toMatchObject({ block: true });
+    expect(blocked.reason).toMatch(/Do not retry this checkpoint in the same turn/);
+  });
+
   it("re-arms one checkpoint reminder only after activity and cooldown", async () => {
     const h = await makeHarness();
     await h.handlers.get("session_start")!({ reason: "new" }, h.ctx);

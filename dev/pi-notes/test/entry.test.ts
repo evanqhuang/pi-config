@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import notesExtensionEntry, { isSubagentChildLoad } from "../entry.js";
+import { prepareCheckpointArguments } from "../index.js";
 
 const CHILD_SESSION_CONTEXT_PROBE = Symbol.for("pi-subagents:child-context:v1");
 
@@ -34,5 +35,30 @@ describe("extension entry isolation", () => {
 
       expect(() => notesExtensionEntry(pi)).not.toThrow();
     });
+  });
+
+  it("normalizes canonical array fields serialized by the tool-call boundary", () => {
+    const prepared = prepareCheckpointArguments({
+      current: "Resume the task.",
+      completed: '["Implemented the feature."]',
+      findings: "[]",
+      decisions: '["Keep the public schema strict."]',
+      failed_approaches: "[]",
+      blockers: "[]",
+      verification: '["npm test passed"]',
+      next_action: "Run the final checks.",
+    });
+
+    expect(prepared.completed).toEqual(["Implemented the feature."]);
+    expect(prepared.decisions).toEqual(["Keep the public schema strict."]);
+    expect(prepared.verification).toEqual(["npm test passed"]);
+  });
+
+  it("reports the first missing canonical field instead of a generic schema failure", () => {
+    expect(() => prepareCheckpointArguments({
+      current: "Resume the task.",
+      completed: [],
+      next_action: "Run the final checks.",
+    })).toThrow(/findings is required/);
   });
 });

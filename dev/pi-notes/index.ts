@@ -192,7 +192,22 @@ const MALFORMED_ARROW_SPLIT_FIELD = new RegExp(
  */
 export function repairCheckpointArguments(args: unknown): unknown {
   if (typeof args !== "object" || args === null || Array.isArray(args)) return args;
-  const input = args as Record<string, unknown>;
+  const source = args as Record<string, unknown>;
+  const input: Record<string, unknown> = { ...source };
+  let normalizedCanonicalArray = false;
+  for (const field of CHECKPOINT_ARRAY_FIELDS) {
+    const value = source[field];
+    if (typeof value !== "string") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return args;
+    }
+    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) return args;
+    input[field] = parsed;
+    normalizedCanonicalArray = true;
+  }
   const malformed: Array<{ key: string; field: (typeof CHECKPOINT_ARRAY_FIELDS)[number]; values: string[] }> = [];
 
   for (const key of Object.keys(input)) {
@@ -222,7 +237,7 @@ export function repairCheckpointArguments(args: unknown): unknown {
     malformed.push({ key, field, values: parsed });
   }
 
-  if (!malformed.length) return args;
+  if (!malformed.length) return normalizedCanonicalArray ? input : args;
   const seen = new Set<string>();
   for (const fragment of malformed) {
     if (Object.prototype.hasOwnProperty.call(input, fragment.field) || seen.has(fragment.field)) return args;
@@ -261,6 +276,9 @@ function checkpointLimitViolation(args: unknown): string | undefined {
 
   for (const field of CHECKPOINT_ARRAY_FIELDS) {
     const value = input[field];
+    if (value !== undefined && !Array.isArray(value)) {
+      return `${field} must be an array of strings.`;
+    }
     if (!Array.isArray(value)) continue;
     const maxItems = CHECKPOINT_MAX_ITEMS[field];
     if (value.length > maxItems) {
@@ -274,6 +292,10 @@ function checkpointLimitViolation(args: unknown): string | undefined {
       return `${field}[${oversizedIndex}] is ${item.length} characters (maximum ${CHECKPOINT_LIST_ITEM_MAX_LENGTH}).`;
     }
   }
+
+  const missing = ["current", ...CHECKPOINT_ARRAY_FIELDS, "next_action"]
+    .find((field) => !Object.prototype.hasOwnProperty.call(input, field));
+  if (missing) return `${missing} is required.`;
 
   return undefined;
 }
@@ -1178,6 +1200,12 @@ export default function notesExtension(pi: ExtensionAPI): void {
     if (runtime.sessionEnded) return;
     if (isChildSession() && event.toolName === "checkpoint_notes") {
       return { block: true, reason: "Child subagent sessions cannot write the parent session Notes file." };
+    }
+    if (event.toolName === "checkpoint_notes"
+      && runtime.checkpointFailureCount > 0
+      && !runtime.checkpointExplicitRequestPending
+      && (!runtime.checkpointActivitySinceFailure || runtime.activationTurns < runtime.checkpointRetryAfterTurn)) {
+      return { block: true, reason: CHECKPOINT_FAILURE_HINT };
     }
     if (runtime.active && (event.toolName === "edit" || event.toolName === "write")) {
       const target = canonicalToolPath(ctx, event.input);
