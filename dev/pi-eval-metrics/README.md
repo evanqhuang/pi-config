@@ -1,0 +1,104 @@
+# pi-eval-metrics
+
+`pi-eval-metrics` is an observational Pi extension and unattended benchmark
+harness for long-horizon agentic tasks. Loading the package enables recording;
+omitting or disabling the package disables recording. The extension does not
+add an LLM-callable tool, inject instructions, add context messages, or write
+Pi session entries.
+
+## Run the full unattended benchmark
+
+From this directory, one command sets up dependencies, creates clean detached
+worktrees from one baseline commit, and runs all eight scenarios sequentially:
+
+```sh
+npm run benchmark -- --repo /private/tmp/records-dd-eval
+```
+
+Each scenario runs `notes-absent` first (pi-notes is omitted entirely), then
+`notes-present` (pi-notes is loaded). The default model is
+`qwen38-main/qwen3.8-27b` at medium thinking and each arm has a three-hour
+timeout. Override `--model`, `--provider`, `--thinking`, or `--timeout` when
+needed. Use `--dry-run` to validate the 16-run plan without starting agents,
+`--scenario <id>` to select a subset, `--resume <harness-id>` after an
+interruption, and `--cleanup-worktrees` to remove result worktrees.
+
+The runner preserves source changes by never resetting the target checkout.
+It uses clean Git worktrees, symlinks an existing `node_modules` and ignored
+environment files when present, and stores the resumable harness manifest,
+per-arm session directories, reports, and summary under `~/.pi/evals/harness`.
+The final `summary.md` links each scenario's filtered report and raw Pi
+`sessionFile` paths for deeper investigation.
+
+The scenario prompts live in
+[`benchmarks/scenarios`](benchmarks/scenarios/README.md). They cover case
+files, county refresh, recorded documents, owner requests, agent tasks,
+screening, provenance/drift, and deterministic investigation exports.
+
+## Automatic metadata
+
+The recorder waits for the first top-level task prompt, hashes its normalized
+text, and stores only the hash and length. It derives the Pi session ID, model,
+provider, thinking level, Git revisions, compaction fingerprint, Notes arm, and
+replicate ordinal automatically. No environment variables or manually supplied
+run labels are required.
+
+The arm is inferred from the tool surface:
+
+- `notes-present`: `checkpoint_notes` is registered (load `dev/pi-notes`).
+- `notes-absent`: `checkpoint_notes` is not registered (omit `dev/pi-notes`).
+
+Do not use `/notes off` as the control: that leaves the Notes tool in the model
+surface and is not a Notes-absent run.
+
+Events are sanitized JSONL under `~/.pi/evals`. Prompts, provider payloads,
+tool arguments, tool output, plans, logs, file lists, and full errors are never
+persisted. After each successful compaction, the recorder stores only a small
+window of assistant thinking/reasoning and response excerpts: hashes, lengths,
+turn/request metadata, and bounded redacted text. Credentials, URLs, home
+paths, and oversized content are redacted or truncated. Queue drops and write
+failures are reported in the run manifest so compromised runs can be excluded.
+The raw Pi session remains at the manifest's `sessionFile` path for local
+inspection; it is not copied into analytics.
+
+## Benchmark protocol
+
+1. Start from the same clean Git commit and a fresh top-level Pi session for
+   each arm.
+2. Load `dev/pi-eval-metrics` in both sessions.
+3. Load `dev/pi-notes` only for the Notes-present arm.
+4. Paste the exact prompt in
+   [`benchmarks/saved-due-diligence-case-file.md`](benchmarks/saved-due-diligence-case-file.md).
+5. Repeat with fresh sessions. At least three replicates per arm are
+   recommended; one Notes-present/one Notes-absent pair is useful as a smoke
+   evaluation.
+
+The extension is independent of the Pi profile directory, so both arms write
+to the shared `~/.pi/evals` root.
+
+## Report
+
+From this package directory, run:
+
+```sh
+npm run report
+```
+
+The command takes no metadata arguments. It selects the most recent experiment
+with both arms, validates comparability, excludes incomplete/dirty/dropped or
+mismatched runs with explicit reasons, and writes JSON, CSV, and Markdown
+artifacts under `~/.pi/evals/reports/`. Completion is reported as an
+observational goal signal; verification/test/build outcomes remain separate.
+Matching replicate IDs are preferred. If one arm contains short accidental
+attempts that consumed replicate numbers, substantive runs (at least 10
+provider requests or tool calls) are paired by start order and labeled as
+`substantive-fallback` in the report. Per-scenario reports also include a
+`Post-compaction transcript excerpts` section, and the harness writes a
+cross-scenario `summary.md` and `summary.json` after all scheduled runs.
+
+## Non-interference
+
+Lifecycle handlers enqueue asynchronous writes and return immediately. The
+queue is bounded and failures are contained. Shutdown is the only lifecycle
+point that awaits the queue. Child sessions marked by `pi-subagents-local` are
+not instrumented.
