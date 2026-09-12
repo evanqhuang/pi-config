@@ -146,9 +146,9 @@ Options:
   --baseline <commit>      Records baseline commit (default: repository HEAD)
   --hostelhawk-baseline <commit> HostelHawk baseline (default: repository HEAD)
   --scenario <id,...>      Run selected scenario IDs (default: all twelve)
-  --provider <name>        Pi provider (default: ${DEFAULT_PROVIDER})
-  --model <id>             Pi model (default: ${DEFAULT_MODEL})
-  --thinking <level>       Thinking level (default: ${DEFAULT_THINKING})
+  --provider <name>        Must remain ${DEFAULT_PROVIDER}
+  --model <id>             Must remain ${DEFAULT_MODEL}
+  --thinking <level>       Must remain medium automatic local mode
   --timeout <duration>     Per-arm timeout, e.g. 3h, 90m, 30s
   --pi-bin <path>          Pi executable (default: pi)
   --resume <harness-id>    Resume pending/failed runs from ~/.pi/evals/harness
@@ -163,6 +163,13 @@ function requiredValue(args: string[], index: number, flag: string): string {
 	const value = args[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
 	return value;
+}
+
+export function assertLocalModel(provider: string, model: string, thinking = "medium"): void {
+	if (provider !== "qwen38-main" || model !== "qwen3.8-27b") {
+		throw new Error(`Benchmark runs require local mode with qwen38-main/qwen3.8-27b; received ${provider}/${model}`);
+	}
+	if (thinking !== "medium") throw new Error(`Benchmark runs require automatic local-mode medium reasoning; received ${thinking}`);
 }
 
 export function parseDuration(value: string): number {
@@ -600,7 +607,7 @@ async function runScenarioArm(options: CliOptions, manifestPath: string, manifes
 			options.piBin,
 			piArgs(options, scenario, arm, run.sessionDir),
 			run.worktree,
-			{ ...process.env, PI_OFFLINE: "1" },
+			{ ...process.env, PI_OFFLINE: "1", PI_LOCAL_MODE_BOOTSTRAP: "1" },
 			manifest.timeoutMs,
 			{ stdoutPath: run.stdoutPath, stderrPath: run.stderrPath, onStdoutLine: line => activity?.consumeLine(line), heartbeat: () => activity?.heartbeat() },
 		);
@@ -684,6 +691,7 @@ function renderHarnessSummary(manifest: HarnessManifest, reports: Array<{ scenar
 
 async function main(): Promise<void> {
 	const options = parseArgs(process.argv.slice(2));
+	assertLocalModel(options.provider, options.model, options.thinking);
 	if (options.resume) {
 		const loaded = await loadHarness(options.resume);
 		const scenarios = await loadScenarios(loaded.manifest.scenarios.map(scenario => scenario.id));

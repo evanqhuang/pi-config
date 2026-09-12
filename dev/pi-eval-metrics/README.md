@@ -21,8 +21,12 @@ Scenarios 9–12 run against `~/hostelhawk` by default; override that with
 `--hostelhawk-repo`. Each scenario runs `notes-absent` first (pi-notes is
 omitted entirely), then `notes-present` (pi-notes is loaded). The default model is
 `qwen38-main/qwen3.8-27b` at medium thinking and each arm has a three-hour
-timeout. Override `--model`, `--provider`, `--thinking`, or `--timeout` when
-needed. Use `--dry-run` to validate the 24-run plan without starting agents,
+timeout. The harness sets `PI_LOCAL_MODE_BOOTSTRAP=1`, which enables the
+local-mode extension during session startup, and rejects any provider/model
+other than `qwen38-main/qwen3.8-27b`; cloud fallback is not allowed. Override
+`--timeout` when needed. Reasoning starts in automatic medium mode, with the
+local-mode extension's bounded one-shot xhigh escalation available when
+justified. Use `--dry-run` to validate the 24-run plan without starting agents,
 `--scenario <id>` to select a subset, `--resume <harness-id>` after an
 interruption, and `--cleanup-worktrees` to remove result worktrees.
 

@@ -168,6 +168,22 @@ test("ignores late agent settlement after session shutdown", () => {
 	assert.doesNotThrow(() => emit("agent_settled"));
 });
 
+test("bootstraps local mode for trusted unattended sessions", async () => {
+	const previous = process.env.PI_LOCAL_MODE_BOOTSTRAP;
+	process.env.PI_LOCAL_MODE_BOOTSTRAP = "1";
+	try {
+		const { pi, emit, getStatus, getModel } = fixture();
+		localModeExtension(pi, () => 1000);
+		await emit("session_start");
+		assert.equal(getModel().provider, "qwen38-main");
+		assert.equal(getModel().id, "qwen3.8-27b");
+		assert.match(getStatus(), /LOCAL/);
+	} finally {
+		if (previous === undefined) delete process.env.PI_LOCAL_MODE_BOOTSTRAP;
+		else process.env.PI_LOCAL_MODE_BOOTSTRAP = previous;
+	}
+});
+
 test("reinstalls the cycle wrapper after a disabled editor replacement", async () => {
 	const { pi, ctx } = fixture();
 	const firstInputs = [];

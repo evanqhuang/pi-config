@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { LiveActivity, loadScenarios, parseDuration } from "../harness.js";
+import { LiveActivity, assertLocalModel, loadScenarios, parseDuration } from "../harness.js";
 
 describe("unattended benchmark harness", () => {
 	it("parses per-arm timeouts", () => {
 		expect(parseDuration("3h")).toBe(10_800_000);
 		expect(parseDuration("90m")).toBe(5_400_000);
 		expect(parseDuration("30s")).toBe(30_000);
+	});
+
+	it("rejects any non-local benchmark model", () => {
+		expect(() => assertLocalModel("qwen38-main", "qwen3.8-27b")).not.toThrow();
+		expect(() => assertLocalModel("openai", "gpt-5")).toThrow(/require local mode/u);
+		expect(() => assertLocalModel("qwen38-subagent", "qwen3.8-27b")).toThrow(/require local mode/u);
+		expect(() => assertLocalModel("qwen38-main", "qwen3.8-27b", "xhigh")).toThrow(/medium reasoning/u);
 	});
 
 	it("discovers twelve repository-aware long-horizon scenarios", async () => {

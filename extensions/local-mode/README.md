@@ -13,6 +13,11 @@ Local mode is off by default. The normal model scope contains only the configure
 - Resuming or reloading a session restores the local-mode state saved in that session.
 - `/local model` — enable local mode if needed, then open a picker containing only the local 27B and 9B models.
 
+Trusted unattended launchers can set `PI_LOCAL_MODE_BOOTSTRAP=1` to activate
+local mode during `session_start`, before the first provider request. This is
+intended for harnesses that must fail closed onto local providers; ordinary new
+sessions remain off by default.
+
 When enabled, the extension:
 
 - selects `qwen38-main/qwen3.8-27b` with the default medium profile;

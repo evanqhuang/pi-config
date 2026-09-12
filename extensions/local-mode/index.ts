@@ -35,6 +35,7 @@ const EXTENSION_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const GREEN_THEME_NAME = "local-green";
 const GREEN_THEME_PATH = join(EXTENSION_DIRECTORY, "local-green.json");
 const LOCAL_MODE_STATE_ENTRY = "local-mode-state";
+const LOCAL_MODE_BOOTSTRAP_ENV = "PI_LOCAL_MODE_BOOTSTRAP";
 const LEGACY_ALT_TAB = "\x1b\t";
 const KITTY_ALT_TAB = "\x1b[9;3u";
 const LOCAL_PROVIDER_NAMES = new Set(["qwen38-main", "qwen38-subagent", "qwopus-subagent"]);
@@ -947,10 +948,11 @@ export default function localModeExtension(
 
 		getProcessLocalProviderPolicy().enabled = false;
 		const persistedState = getPersistedLocalModeState(ctx);
-		if (persistedState?.enabled === true) {
+		const bootstrapLocalMode = process.env[LOCAL_MODE_BOOTSTRAP_ENV] === "1";
+		if (persistedState?.enabled === true || bootstrapLocalMode) {
 			await activateLocalMode(pi, state, ctx);
 			if (state.sessionEnded) return;
-			state.qwen38SubagentEnabled = persistedState.qwen38SubagentEnabled !== false;
+			state.qwen38SubagentEnabled = persistedState?.qwen38SubagentEnabled !== false;
 			if (
 				persistedState?.automaticThinking === false &&
 				persistedState.thinkingLevel
