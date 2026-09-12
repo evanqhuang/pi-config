@@ -849,12 +849,18 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
   }
 
   const currentTools = () => pi.getAllTools().map((tool) => tool.name);
-  const refreshTools = () => {
+  const refreshTools = (preserveActiveProjection = false) => {
     state.allTools = currentTools();
     const available = filterTools(state.mode, state.allTools);
-    pi.setActiveTools(isChild && state.mode === "PLAN"
+    const modeTools = isChild && state.mode === "PLAN"
       ? available.filter((name) => !CHILD_PLAN_TOOL_SET.has(name))
-      : available);
+      : available;
+    if (preserveActiveProjection) {
+      const allowed = new Set(modeTools);
+      pi.setActiveTools(pi.getActiveTools().filter((name) => allowed.has(name)));
+      return;
+    }
+    pi.setActiveTools(modeTools);
   };
 
   const recordPlanContext = async (
@@ -1575,7 +1581,11 @@ export default async function piPlanMode(pi: ExtensionAPI): Promise<void> {
 
   pi.on("turn_start", async () => {
     if (state.mode === "PLAN") state.reminder = advanceReminderTurn(state.reminder);
-    refreshTools();
+    // In YOLO/ORCHESTRATOR, another extension may have already projected the
+    // registry for the current model. Preserve that projection instead of
+    // blindly re-adding every registered tool; mode changes still force a
+    // complete refresh through apply(). PLAN remains an explicit allowlist.
+    refreshTools(state.mode !== "PLAN");
   });
 
   // Best-effort depth counter: gates the mid-run mode-switch fast path so it

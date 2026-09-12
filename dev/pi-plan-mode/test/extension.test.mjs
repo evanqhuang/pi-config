@@ -58,6 +58,7 @@ function mockPi() {
     registerShortcut(key, shortcut) { shortcuts.set(key, shortcut); },
     on(name, handler) { handlers.set(name, handler); },
     getAllTools() { return [...tools.values()]; },
+    getActiveTools() { return [...active]; },
     setActiveTools(names) { active.splice(0, active.length, ...names); },
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
     sendUserMessage(message) { sentMessages.push(message); },
@@ -136,6 +137,18 @@ function mockContext(entries, sessionFile) {
     },
   };
 }
+
+test("YOLO turn_start preserves an existing model-facing tool projection", async () => {
+  const pi = mockPi();
+  await registerPlanMode(pi);
+  const ctx = mockContext([], undefined);
+  await pi.commands.get("yolo").handler(undefined, ctx);
+
+  pi.setActiveTools(["read", "edit"]);
+  await pi.handlers.get("turn_start")({}, ctx);
+
+  assert.deepEqual(pi.active, ["read", "edit"]);
+});
 
 test("non-PLAN Bash follows the session context cwd", async (t) => {
   const targetCwd = mkdtempSync(join(process.cwd(), ".pi-plan-bash-cwd-"));
