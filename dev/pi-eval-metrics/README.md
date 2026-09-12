@@ -9,31 +9,44 @@ Pi session entries.
 ## Run the full unattended benchmark
 
 From this directory, one command sets up dependencies, creates clean detached
-worktrees from one baseline commit, and runs all eight scenarios sequentially:
+worktrees from repository-specific baseline commits, and runs all twelve
+scenarios sequentially:
 
 ```sh
 npm run benchmark -- --repo /private/tmp/records-dd-eval
 ```
 
-Each scenario runs `notes-absent` first (pi-notes is omitted entirely), then
-`notes-present` (pi-notes is loaded). The default model is
+Scenarios 1–8 run against the Records repository supplied by `--repo`.
+Scenarios 9–12 run against `~/hostelhawk` by default; override that with
+`--hostelhawk-repo`. Each scenario runs `notes-absent` first (pi-notes is
+omitted entirely), then `notes-present` (pi-notes is loaded). The default model is
 `qwen38-main/qwen3.8-27b` at medium thinking and each arm has a three-hour
 timeout. Override `--model`, `--provider`, `--thinking`, or `--timeout` when
-needed. Use `--dry-run` to validate the 16-run plan without starting agents,
+needed. Use `--dry-run` to validate the 24-run plan without starting agents,
 `--scenario <id>` to select a subset, `--resume <harness-id>` after an
 interruption, and `--cleanup-worktrees` to remove result worktrees.
 
 The runner preserves source changes by never resetting the target checkout.
 It uses clean Git worktrees, symlinks an existing `node_modules` and ignored
 environment files when present, and stores the resumable harness manifest,
-per-arm session directories, reports, and summary under `~/.pi/evals/harness`.
+per-arm session directories, raw JSON activity streams, stderr logs, reports,
+and summary under `~/.pi/evals/harness`.
 The final `summary.md` links each scenario's filtered report and raw Pi
 `sessionFile` paths for deeper investigation.
 
 The scenario prompts live in
 [`benchmarks/scenarios`](benchmarks/scenarios/README.md). They cover case
 files, county refresh, recorded documents, owner requests, agent tasks,
-screening, provenance/drift, and deterministic investigation exports.
+screening, provenance/drift, deterministic investigation exports, multi-phase
+investigation, late requirements, failure recovery, and independent review.
+
+While an arm runs, the harness prints every turn, tool start/result, context
+compaction, and a 30-second heartbeat with elapsed time and cumulative counters.
+The heartbeat includes repeated tool calls and post-compaction rediscovery.
+Full JSON events—including assistant messages, reasoning, tool arguments, and
+tool results—are retained in the arm's `activity.jsonl`; stderr is retained in
+`stderr.log`. The final summary records first-tool/mutation/verification
+latencies and other live counters alongside the evaluator report.
 
 ## Automatic metadata
 
@@ -51,15 +64,16 @@ The arm is inferred from the tool surface:
 Do not use `/notes off` as the control: that leaves the Notes tool in the model
 surface and is not a Notes-absent run.
 
-Events are sanitized JSONL under `~/.pi/evals`. Prompts, provider payloads,
-tool arguments, tool output, plans, logs, file lists, and full errors are never
-persisted. After each successful compaction, the recorder stores only a small
-window of assistant thinking/reasoning and response excerpts: hashes, lengths,
-turn/request metadata, and bounded redacted text. Credentials, URLs, home
-paths, and oversized content are redacted or truncated. Queue drops and write
-failures are reported in the run manifest so compromised runs can be excluded.
-The raw Pi session remains at the manifest's `sessionFile` path for local
-inspection; it is not copied into analytics.
+The evaluator extension's derived events remain sanitized JSONL under
+`~/.pi/evals`. After each successful compaction, it stores a small bounded and
+redacted assistant thinking/response window for convenient reports. The
+unattended harness additionally retains Pi's complete JSON-mode stdout and
+stderr per arm because these runs execute on trusted local infrastructure.
+Those raw artifacts may contain prompts, reasoning, tool arguments/results,
+paths, logs, and credentials returned by tools; keep `~/.pi/evals` private.
+Queue drops and write failures are reported in the run manifest so compromised
+runs can be excluded. The authoritative Pi session also remains at the
+manifest's `sessionFile` path.
 
 ## Benchmark protocol
 

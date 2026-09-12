@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { createWriteStream, existsSync } from "node:fs";
 import { access, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { buildReport, writeReport, type EvalReport } from "./report.js";
 import { writeJsonAtomically, writeTextAtomically } from "./writer.js";
@@ -11,7 +12,7 @@ import { writeJsonAtomically, writeTextAtomically } from "./writer.js";
 const execFileAsync = promisify(execFile);
 const PACKAGE_DIR = resolve(new URL(".", import.meta.url).pathname);
 const DEFAULT_EVAL_ROOT = join(homedir(), ".pi", "evals");
-const HARNESS_SCHEMA_VERSION = 1;
+const HARNESS_SCHEMA_VERSION = 2;
 const COMMON_PROTOCOL = `
 
 ## Completion protocol
@@ -26,10 +27,12 @@ implementation and verification are complete.`;
 
 type Arm = "notes-absent" | "notes-present";
 type RunStatus = "pending" | "running" | "completed" | "failed";
+type RepositoryKey = "records" | "hostelhawk";
 
 interface Scenario {
 	id: string;
 	title: string;
+	repository: RepositoryKey;
 	path: string;
 	prompt: string;
 	promptHash: string;
@@ -42,8 +45,31 @@ interface ProcessResult {
 	timedOut: boolean;
 }
 
+interface RunProcessOptions {
+	stdoutPath?: string;
+	stderrPath?: string;
+	onStdoutLine?: (line: string) => void;
+	heartbeat?: () => void;
+}
+
+export interface ActivitySnapshot {
+	turns: number;
+	tools: number;
+	toolErrors: number;
+	compactions: number;
+	thinkingChars: number;
+	responseChars: number;
+	repeatedToolCalls: number;
+	postCompactionRediscoveries: number;
+	maxConsecutiveSameTool: number;
+	firstToolMs: number | null;
+	firstMutationMs: number | null;
+	firstVerificationMs: number | null;
+}
+
 interface HarnessRun {
 	scenarioId: string;
+	repository: RepositoryKey;
 	arm: Arm;
 	status: RunStatus;
 	worktree: string;
@@ -54,6 +80,9 @@ interface HarnessRun {
 	signal?: NodeJS.Signals | null;
 	timedOut?: boolean;
 	worktreeDirty?: boolean;
+	stdoutPath?: string;
+	stderrPath?: string;
+	activity?: ActivitySnapshot;
 	evalRunId?: string;
 	experimentKey?: string;
 	evalManifestPath?: string;
@@ -68,20 +97,20 @@ interface HarnessManifest {
 	createdAt: string;
 	updatedAt: string;
 	status: "running" | "completed" | "partial";
-	repo: string;
-	baselineCommit: string;
-	sourceDirty: boolean;
+	repositories: Record<RepositoryKey, { path: string; baselineCommit: string; sourceDirty: boolean }>;
 	provider: string;
 	model: string;
 	thinking: string;
 	timeoutMs: number;
-	scenarios: Array<{ id: string; title: string; promptHash: string; promptLength: number }>;
+	scenarios: Array<{ id: string; title: string; repository: RepositoryKey; promptHash: string; promptLength: number }>;
 	runs: HarnessRun[];
 }
 
 interface CliOptions {
 	repo?: string;
+	hostelhawkRepo?: string;
 	baseline?: string;
+	hostelhawkBaseline?: string;
 	provider: string;
 	model: string;
 	thinking: string;
@@ -112,9 +141,11 @@ function printHelp(): void {
 Runs every scenario sequentially, Notes-absent first and Notes-present second.
 
 Options:
-  --repo <path>             Target Git repository (auto-detects the Records demo)
-  --baseline <commit>      Baseline commit (default: target HEAD)
-  --scenario <id,...>      Run selected scenario IDs (default: all eight)
+  --repo <path>             Records repository (default: /private/tmp/records-dd-eval)
+  --hostelhawk-repo <path> HostelHawk repository (default: ~/hostelhawk)
+  --baseline <commit>      Records baseline commit (default: repository HEAD)
+  --hostelhawk-baseline <commit> HostelHawk baseline (default: repository HEAD)
+  --scenario <id,...>      Run selected scenario IDs (default: all twelve)
   --provider <name>        Pi provider (default: ${DEFAULT_PROVIDER})
   --model <id>             Pi model (default: ${DEFAULT_MODEL})
   --thinking <level>       Thinking level (default: ${DEFAULT_THINKING})
@@ -158,7 +189,9 @@ function parseArgs(argv: string[]): CliOptions {
 		const arg = argv[index];
 		switch (arg) {
 			case "--repo": options.repo = requiredValue(argv, index, arg); index += 1; break;
+			case "--hostelhawk-repo": options.hostelhawkRepo = requiredValue(argv, index, arg); index += 1; break;
 			case "--baseline": options.baseline = requiredValue(argv, index, arg); index += 1; break;
+			case "--hostelhawk-baseline": options.hostelhawkBaseline = requiredValue(argv, index, arg); index += 1; break;
 			case "--provider": options.provider = requiredValue(argv, index, arg); index += 1; break;
 			case "--model": options.model = requiredValue(argv, index, arg); index += 1; break;
 			case "--thinking": options.thinking = requiredValue(argv, index, arg); index += 1; break;
@@ -189,8 +222,8 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return result.stdout.trim();
 }
 
-async function resolveRepository(requested?: string): Promise<string> {
-	const candidates = [requested, process.env.PI_EVAL_REPO, "/private/tmp/records-dd-eval", process.cwd()].filter((value): value is string => Boolean(value));
+async function resolveRepository(requested: string | undefined, fallbacks: string[]): Promise<string> {
+	const candidates = [requested, ...fallbacks].filter((value): value is string => Boolean(value));
 	for (const candidate of candidates) {
 		try {
 			return await git(resolve(candidate), ["rev-parse", "--show-toplevel"]);
@@ -198,7 +231,7 @@ async function resolveRepository(requested?: string): Promise<string> {
 			// Try the next candidate.
 		}
 	}
-	throw new Error("Could not find a Git repository. Pass --repo /path/to/repository.");
+	throw new Error(`Could not find a Git repository from: ${candidates.join(", ")}`);
 }
 
 export async function loadScenarios(selectedIds?: string[]): Promise<Scenario[]> {
@@ -209,9 +242,11 @@ export async function loadScenarios(selectedIds?: string[]): Promise<Scenario[]>
 		const path = join(PACKAGE_DIR, "benchmarks", "scenarios", entry.name);
 		const body = (await readFile(path, "utf8")).trim();
 		const title = body.match(/^#\s+(.+)$/mu)?.[1]?.trim() ?? basename(entry.name, ".md");
+		const repositoryValue = body.match(/<!--\s*repository:\s*([a-z-]+)\s*-->/iu)?.[1] ?? "records";
+		if (repositoryValue !== "records" && repositoryValue !== "hostelhawk") throw new Error(`Unsupported repository '${repositoryValue}' in ${path}`);
 		const id = basename(entry.name, ".md").replace(/^\d+-/u, "");
 		const prompt = `${body}\n${COMMON_PROTOCOL}`;
-		scenarios.push({ id, title, path, prompt, promptHash: hashText(prompt), promptLength: prompt.length });
+		scenarios.push({ id, title, repository: repositoryValue, path, prompt, promptHash: hashText(prompt), promptLength: prompt.length });
 	}
 	if (!scenarios.length) throw new Error("No scenario markdown files found");
 	const selected = selectedIds ? scenarios.filter(scenario => selectedIds.includes(scenario.id)) : scenarios;
@@ -226,11 +261,13 @@ function hashText(value: string): string {
 }
 
 async function setupDependencies(repo: string, skipInstall: boolean): Promise<void> {
-	if (skipInstall || await exists(join(repo, "node_modules"))) return;
-	const packageManager = await exists(join(repo, "package-lock.json")) ? "npm" : await exists(join(repo, "pnpm-lock.yaml")) ? "pnpm" : "yarn";
+	if (skipInstall || await exists(join(repo, "node_modules")) || await exists(join(repo, "web", "node_modules"))) return;
+	const packageRoot = await exists(join(repo, "package.json")) ? repo : await exists(join(repo, "web", "package.json")) ? join(repo, "web") : undefined;
+	if (!packageRoot) return;
+	const packageManager = await exists(join(packageRoot, "pnpm-lock.yaml")) || await exists(join(repo, "pnpm-lock.yaml")) ? "pnpm" : await exists(join(packageRoot, "package-lock.json")) ? "npm" : "yarn";
 	const args = packageManager === "npm" ? ["ci"] : packageManager === "pnpm" ? ["install", "--frozen-lockfile"] : ["install", "--frozen-lockfile"];
 	console.log(`Installing dependencies once with ${packageManager} ${args.join(" ")}...`);
-	const result = await runProcess(packageManager, args, repo, process.env, 30 * 60 * 1000);
+	const result = await runProcess(packageManager, args, packageRoot, process.env, 30 * 60 * 1000);
 	if (result.timedOut || result.exitCode !== 0) throw new Error(`Dependency setup failed (${packageManager} exit ${result.exitCode ?? "null"})`);
 }
 
@@ -243,9 +280,16 @@ async function prepareWorktree(repo: string, baseline: string, worktree: string)
 	await git(repo, ["worktree", "add", "--detach", worktree, baseline]);
 	const dependencies = join(repo, "node_modules");
 	if (await exists(dependencies) && !(await exists(join(worktree, "node_modules")))) await symlink(dependencies, join(worktree, "node_modules"), "dir");
+	const webDependencies = join(repo, "web", "node_modules");
+	if (await exists(webDependencies) && !(await exists(join(worktree, "web", "node_modules")))) await symlink(webDependencies, join(worktree, "web", "node_modules"), "dir");
 	for (const name of [".env", ".env.local", ".env.development", ".env.development.local", ".env.test", ".env.test.local"]) {
 		const source = join(repo, name);
 		const destination = join(worktree, name);
+		if (await exists(source) && !(await exists(destination))) await symlink(source, destination);
+	}
+	for (const name of [".env", ".env.local", ".env.test"]) {
+		const source = join(repo, "web", name);
+		const destination = join(worktree, "web", name);
 		if (await exists(source) && !(await exists(destination))) await symlink(source, destination);
 	}
 }
@@ -293,18 +337,152 @@ function piArgs(options: CliOptions, scenario: Scenario, arm: Arm, sessionDir: s
 	];
 }
 
-async function runProcess(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<ProcessResult> {
-	const child = spawn(command, args, { cwd, env, detached: true, stdio: "ignore" });
+function compactValue(value: unknown, maxLength = 300): string {
+	let text: string;
+	try { text = typeof value === "string" ? value : JSON.stringify(value); } catch { text = String(value); }
+	text = text.replace(/\s+/gu, " ").trim();
+	return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+export class LiveActivity {
+	private readonly startedAt = Date.now();
+	private turns = 0;
+	private tools = 0;
+	private toolErrors = 0;
+	private textChars = 0;
+	private thinkingChars = 0;
+	private compactions = 0;
+	private lastEvent = "starting";
+	private repeatedToolCalls = 0;
+	private postCompactionRediscoveries = 0;
+	private maxConsecutiveSameTool = 0;
+	private consecutiveSameTool = 0;
+	private lastTool = "";
+	private firstToolMs: number | null = null;
+	private firstMutationMs: number | null = null;
+	private firstVerificationMs: number | null = null;
+	private readonly toolSignatures = new Set<string>();
+	private afterCompaction = false;
+
+	constructor(private readonly label: string, private readonly output: (line: string) => void = console.log) {}
+
+	consumeLine(line: string): void {
+		let event: Record<string, unknown>;
+		try { event = JSON.parse(line) as Record<string, unknown>; } catch { return; }
+		const type = typeof event.type === "string" ? event.type : "unknown";
+		if (type === "turn_start") {
+			this.turns += 1;
+			this.lastEvent = `turn ${this.turns}`;
+			this.emit(`turn ${this.turns} started`);
+			return;
+		}
+		if (type === "tool_execution_start") {
+			this.tools += 1;
+			const tool = String(event.toolName ?? "unknown");
+			const args = compactValue(event.args, 10_000);
+			const signature = hashText(`${tool}\0${args}`);
+			if (this.toolSignatures.has(signature)) {
+				this.repeatedToolCalls += 1;
+				if (this.afterCompaction) this.postCompactionRediscoveries += 1;
+			}
+			this.toolSignatures.add(signature);
+			this.consecutiveSameTool = tool === this.lastTool ? this.consecutiveSameTool + 1 : 1;
+			this.lastTool = tool;
+			this.maxConsecutiveSameTool = Math.max(this.maxConsecutiveSameTool, this.consecutiveSameTool);
+			const elapsed = Date.now() - this.startedAt;
+			this.firstToolMs ??= elapsed;
+			if (/^(?:edit|write|apply_patch|ast_grep_replace)$/iu.test(tool)) this.firstMutationMs ??= elapsed;
+			if (/(?:test|build|lint|typecheck|diagnostic)/iu.test(`${tool} ${args}`)) this.firstVerificationMs ??= elapsed;
+			this.lastEvent = `running ${tool}`;
+			this.emit(`→ ${tool} ${compactValue(event.args)}`);
+			return;
+		}
+		if (type === "tool_execution_end") {
+			const failed = event.isError === true;
+			if (failed) this.toolErrors += 1;
+			const tool = String(event.toolName ?? "unknown");
+			this.lastEvent = `${tool} ${failed ? "failed" : "finished"}`;
+			this.emit(`${failed ? "✗" : "✓"} ${tool}`);
+			return;
+		}
+		if (type === "message_update") {
+			const update = event.assistantMessageEvent && typeof event.assistantMessageEvent === "object" ? event.assistantMessageEvent as Record<string, unknown> : {};
+			const deltaLength = typeof update.delta === "string" ? update.delta.length : 0;
+			if (update.type === "thinking_delta") this.thinkingChars += deltaLength;
+			if (update.type === "text_delta") this.textChars += deltaLength;
+			if (update.type === "toolcall_start") this.lastEvent = `preparing ${String(update.toolName ?? "tool")}`;
+			return;
+		}
+		if (type === "compaction_start") {
+			this.compactions += 1;
+			this.afterCompaction = true;
+			this.lastEvent = "compacting context";
+			this.emit(`context compaction ${this.compactions} started`);
+			return;
+		}
+		if (type === "compaction_end") {
+			this.lastEvent = "compaction complete";
+			this.emit(`context compaction ${this.compactions} completed`);
+			return;
+		}
+		if (type === "agent_end") {
+			this.lastEvent = "agent ended";
+			this.emit("agent ended");
+		}
+	}
+
+	heartbeat(): void {
+		this.emit(`alive ${this.elapsed()} · turns=${this.turns} tools=${this.tools} errors=${this.toolErrors} repeats=${this.repeatedToolCalls} rediscovery=${this.postCompactionRediscoveries} thinking=${this.thinkingChars}ch response=${this.textChars}ch · ${this.lastEvent}`);
+	}
+
+	snapshot(): ActivitySnapshot {
+		return {
+			turns: this.turns,
+			tools: this.tools,
+			toolErrors: this.toolErrors,
+			compactions: this.compactions,
+			thinkingChars: this.thinkingChars,
+			responseChars: this.textChars,
+			repeatedToolCalls: this.repeatedToolCalls,
+			postCompactionRediscoveries: this.postCompactionRediscoveries,
+			maxConsecutiveSameTool: this.maxConsecutiveSameTool,
+			firstToolMs: this.firstToolMs,
+			firstMutationMs: this.firstMutationMs,
+			firstVerificationMs: this.firstVerificationMs,
+		};
+	}
+
+	private elapsed(): string {
+		const seconds = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
+		return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+	}
+
+	private emit(message: string): void {
+		this.output(`[${this.label}] ${message}`);
+	}
+}
+
+async function runProcess(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number, options: RunProcessOptions = {}): Promise<ProcessResult> {
+	const child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+	const stdoutFile = options.stdoutPath ? createWriteStream(options.stdoutPath, { flags: "a" }) : undefined;
+	const stderrFile = options.stderrPath ? createWriteStream(options.stderrPath, { flags: "a" }) : undefined;
+	if (stdoutFile) child.stdout.pipe(stdoutFile);
+	if (stderrFile) child.stderr.pipe(stderrFile);
+	const lines = createInterface({ input: child.stdout });
+	lines.on("line", line => options.onStdoutLine ? options.onStdoutLine(line) : console.log(line));
+	child.stderr.on("data", chunk => process.stderr.write(chunk));
 	return new Promise(resolveResult => {
 		let timedOut = false;
 		let settled = false;
 		let timer: NodeJS.Timeout | undefined;
 		let forceTimer: NodeJS.Timeout | undefined;
+		const heartbeatTimer = options.heartbeat ? setInterval(options.heartbeat, 30_000) : undefined;
 		const finish = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
 			if (!timedOut && forceTimer) clearTimeout(forceTimer);
+			if (heartbeatTimer) clearInterval(heartbeatTimer);
 			resolveResult({ exitCode, signal, timedOut });
 		};
 		child.once("error", () => finish(null, null));
@@ -362,7 +540,7 @@ async function persistHarness(path: string, manifest: HarnessManifest): Promise<
 	await writeJsonAtomically(path, manifest);
 }
 
-async function createHarness(options: CliOptions, repo: string, baseline: string, sourceDirty: boolean, scenarios: Scenario[]): Promise<{ path: string; manifest: HarnessManifest }> {
+async function createHarness(options: CliOptions, repositories: HarnessManifest["repositories"], scenarios: Scenario[]): Promise<{ path: string; manifest: HarnessManifest }> {
 	const harnessId = `harness-${Date.now()}-${randomUUID().slice(0, 8)}`;
 	const directory = join(DEFAULT_EVAL_ROOT, "harness", harnessId);
 	const now = new Date().toISOString();
@@ -373,19 +551,18 @@ async function createHarness(options: CliOptions, repo: string, baseline: string
 		createdAt: now,
 		updatedAt: now,
 		status: "running",
-		repo,
-		baselineCommit: baseline,
-		sourceDirty,
+		repositories,
 		provider: options.provider,
 		model: options.model,
 		thinking: options.thinking,
 		timeoutMs: options.timeoutMs,
-		scenarios: scenarios.map(scenario => ({ id: scenario.id, title: scenario.title, promptHash: scenario.promptHash, promptLength: scenario.promptLength })),
+		scenarios: scenarios.map(scenario => ({ id: scenario.id, title: scenario.title, repository: scenario.repository, promptHash: scenario.promptHash, promptLength: scenario.promptLength })),
 		runs: scenarios.flatMap(scenario => (["notes-absent", "notes-present"] as Arm[]).map(arm => ({
 			scenarioId: scenario.id,
+			repository: scenario.repository,
 			arm,
 			status: "pending" as const,
-			worktree: join(repo, ".worktrees", "pi-eval-harness", harnessId, scenario.id, arm),
+			worktree: join(repositories[scenario.repository].path, ".worktrees", "pi-eval-harness", harnessId, scenario.id, arm),
 			sessionDir: join(directory, "sessions", scenario.id, arm),
 		}))),
 	};
@@ -407,12 +584,27 @@ async function runScenarioArm(options: CliOptions, manifestPath: string, manifes
 	run.startedAt = new Date().toISOString();
 	await persistHarness(manifestPath, manifest);
 	let result: ProcessResult = { exitCode: null, signal: null, timedOut: false };
+	let activity: LiveActivity | undefined;
 	try {
+		const repository = manifest.repositories[run.repository];
 		await assertExtensionPaths(extensionPaths(arm === "notes-present"));
-		await prepareWorktree(manifest.repo, manifest.baselineCommit, run.worktree);
+		await prepareWorktree(repository.path, repository.baselineCommit, run.worktree);
 		await mkdir(run.sessionDir, { recursive: true });
-		console.log(`\n[${scenario.id}] ${arm} starting`);
-		result = await runProcess(options.piBin, piArgs(options, scenario, arm, run.sessionDir), run.worktree, { ...process.env, PI_OFFLINE: "1" }, manifest.timeoutMs);
+		run.stdoutPath = join(run.sessionDir, "activity.jsonl");
+		run.stderrPath = join(run.sessionDir, "stderr.log");
+		const label = `${scenario.id}/${arm}`;
+		activity = new LiveActivity(label);
+		console.log(`\n[${label}] starting in ${run.repository} worktree ${run.worktree}`);
+		console.log(`[${label}] raw JSON: ${run.stdoutPath}`);
+		result = await runProcess(
+			options.piBin,
+			piArgs(options, scenario, arm, run.sessionDir),
+			run.worktree,
+			{ ...process.env, PI_OFFLINE: "1" },
+			manifest.timeoutMs,
+			{ stdoutPath: run.stdoutPath, stderrPath: run.stderrPath, onStdoutLine: line => activity?.consumeLine(line), heartbeat: () => activity?.heartbeat() },
+		);
+		run.activity = activity.snapshot();
 		run.worktreeDirty = (await git(run.worktree, ["status", "--porcelain"]).catch(() => "")).length > 0;
 		const evalManifest = await findEvalManifest(run.sessionDir);
 		if (evalManifest) {
@@ -429,9 +621,10 @@ async function runScenarioArm(options: CliOptions, manifestPath: string, manifes
 		run.exitCode = result.exitCode;
 		run.signal = result.signal;
 		run.timedOut = result.timedOut;
+		run.activity ??= activity?.snapshot();
 		run.endedAt = new Date().toISOString();
 		if (options.cleanupWorktrees && await exists(run.worktree)) {
-			await git(manifest.repo, ["worktree", "remove", "--force", run.worktree]).catch(() => undefined);
+			await git(manifest.repositories[run.repository].path, ["worktree", "remove", "--force", run.worktree]).catch(() => undefined);
 			await rm(run.worktree, { recursive: true, force: true });
 		}
 		await persistHarness(manifestPath, manifest);
@@ -454,19 +647,23 @@ function renderHarnessSummary(manifest: HarnessManifest, reports: Array<{ scenar
 		"# Pi long-horizon evaluation harness",
 		"",
 		`Harness: ${manifest.harnessId}`,
-		`Repository: ${manifest.repo}`,
-		`Baseline: ${manifest.baselineCommit}`,
+		`Records: ${manifest.repositories.records.path} @ ${manifest.repositories.records.baselineCommit}`,
+		`HostelHawk: ${manifest.repositories.hostelhawk.path} @ ${manifest.repositories.hostelhawk.baselineCommit}`,
 		`Model: ${manifest.provider}/${manifest.model} (${manifest.thinking})`,
 		"",
 		"Runs are sequential: Notes-absent first, then Notes-present. Pair deltas are Notes-present minus Notes-absent. See each JSON report for bounded post-compaction trace excerpts and the raw sessionFile links.",
 	];
 	for (const { scenario, report } of reports) {
-		lines.push("", `## ${scenario.title}`, "", `Scenario: \`${scenario.id}\``);
+		lines.push("", `## ${scenario.title}`, "", `Scenario: \`${scenario.id}\` (${scenario.repository})`);
 		const scenarioRuns = manifest.runs.filter(run => run.scenarioId === scenario.id);
 		const reportPath = scenarioRuns.find(run => run.reportJson)?.reportJson;
 		lines.push(`Report JSON: ${reportPath ? `[${reportPath}](file://${reportPath})` : "not generated"}`);
 		lines.push(`Evaluator manifests: ${scenarioRuns.map(run => run.evalManifestPath ? `[${run.evalManifestPath}](file://${run.evalManifestPath})` : "not found").join(", ")}`);
-		for (const run of scenarioRuns) lines.push(`- ${run.arm} session: ${run.sessionFile ? `[${run.sessionFile}](file://${run.sessionFile})` : "not found"}`);
+		for (const run of scenarioRuns) {
+			lines.push(`- ${run.arm} session: ${run.sessionFile ? `[${run.sessionFile}](file://${run.sessionFile})` : "not found"}`);
+			lines.push(`  - raw activity: ${run.stdoutPath ? `[${run.stdoutPath}](file://${run.stdoutPath})` : "not found"}`);
+			lines.push(`  - stderr: ${run.stderrPath ? `[${run.stderrPath}](file://${run.stderrPath})` : "not found"}`);
+		}
 		if (!report) {
 			lines.push("No evaluator manifests were found for this scenario.");
 			continue;
@@ -477,6 +674,10 @@ function renderHarnessSummary(manifest: HarnessManifest, reports: Array<{ scenar
 			const traceCount = row.postCompactionTraces.length;
 			lines.push(`- ${row.variant} r${row.replicate}: ${row.providerRequests} requests, ${row.toolCalls} tools, ${row.compactionSuccesses} successful compactions, ${traceCount} post-compaction traces, completion signal ${row.completionSignal ? "yes" : "no"}`);
 		}
+		for (const run of scenarioRuns) {
+			if (!run.activity) continue;
+			lines.push(`- ${run.arm} live metrics: ${run.activity.turns} turns, ${run.activity.tools} tools, ${run.activity.toolErrors} tool errors, ${run.activity.repeatedToolCalls} repeated calls, ${run.activity.postCompactionRediscoveries} post-compaction rediscoveries; first tool/mutation/verification ${run.activity.firstToolMs ?? "n/a"}/${run.activity.firstMutationMs ?? "n/a"}/${run.activity.firstVerificationMs ?? "n/a"}ms`);
+		}
 	}
 	return `${lines.join("\n")}\n`;
 }
@@ -486,27 +687,40 @@ async function main(): Promise<void> {
 	if (options.resume) {
 		const loaded = await loadHarness(options.resume);
 		const scenarios = await loadScenarios(loaded.manifest.scenarios.map(scenario => scenario.id));
-		if (options.repo || options.baseline || options.provider !== DEFAULT_PROVIDER || options.model !== DEFAULT_MODEL || options.thinking !== DEFAULT_THINKING) console.warn("Resume uses the original harness repository, baseline, model, and thinking configuration.");
-		await executeHarness({ ...options, repo: loaded.manifest.repo, baseline: loaded.manifest.baselineCommit, provider: loaded.manifest.provider, model: loaded.manifest.model, thinking: loaded.manifest.thinking }, loaded.path, loaded.manifest, scenarios);
+		if (options.repo || options.hostelhawkRepo || options.baseline || options.hostelhawkBaseline || options.provider !== DEFAULT_PROVIDER || options.model !== DEFAULT_MODEL || options.thinking !== DEFAULT_THINKING) console.warn("Resume uses the original harness repositories, baselines, model, and thinking configuration.");
+		await executeHarness({ ...options, provider: loaded.manifest.provider, model: loaded.manifest.model, thinking: loaded.manifest.thinking }, loaded.path, loaded.manifest, scenarios);
 		return;
 	}
-	const repo = await resolveRepository(options.repo);
-	const baseline = options.baseline ?? await git(repo, ["rev-parse", "HEAD"]);
-	const sourceDirty = (await git(repo, ["status", "--porcelain"])).length > 0;
 	const scenarios = await loadScenarios(options.scenarioIds);
-	if (sourceDirty) console.warn("Target repository has local changes; runs use clean detached worktrees from the selected baseline and will not copy those changes.");
+	const records = await resolveRepository(options.repo, [process.env.PI_EVAL_REPO ?? "", "/private/tmp/records-dd-eval", process.cwd()]);
+	const hostelhawk = await resolveRepository(options.hostelhawkRepo, [process.env.PI_EVAL_HOSTELHAWK_REPO ?? "", join(homedir(), "hostelhawk")]);
+	const repositories: HarnessManifest["repositories"] = {
+		records: {
+			path: records,
+			baselineCommit: options.baseline ?? await git(records, ["rev-parse", "HEAD"]),
+			sourceDirty: (await git(records, ["status", "--porcelain"])).length > 0,
+		},
+		hostelhawk: {
+			path: hostelhawk,
+			baselineCommit: options.hostelhawkBaseline ?? await git(hostelhawk, ["rev-parse", "HEAD"]),
+			sourceDirty: (await git(hostelhawk, ["status", "--porcelain"])).length > 0,
+		},
+	};
+	for (const [key, repository] of Object.entries(repositories)) {
+		if (repository.sourceDirty) console.warn(`${key} repository has local changes; runs use clean detached worktrees from ${repository.baselineCommit} and will not copy those changes.`);
+	}
 	const requiredPaths = [...extensionPaths(false), ...extensionPaths(true)];
 	await assertExtensionPaths([...new Set(requiredPaths)]);
 	if (options.dryRun) {
 		console.log(`Dry run: ${scenarios.length} scenarios × 2 arms`);
-		console.log(`Baseline: ${baseline}`);
-		for (const scenario of scenarios) console.log(`- ${scenario.id}: notes-absent → notes-present`);
+		for (const [key, repository] of Object.entries(repositories)) console.log(`${key}: ${repository.path} @ ${repository.baselineCommit}`);
+		for (const scenario of scenarios) console.log(`- ${scenario.id} [${scenario.repository}]: notes-absent → notes-present`);
 		return;
 	}
-	await setupDependencies(repo, options.skipInstall);
-	const created = await createHarness(options, repo, baseline, sourceDirty, scenarios);
+	for (const key of new Set(scenarios.map(scenario => scenario.repository))) await setupDependencies(repositories[key].path, options.skipInstall);
+	const created = await createHarness(options, repositories, scenarios);
 	console.log(`Harness ${created.manifest.harnessId}: ${scenarios.length} scenarios × 2 arms`);
-	console.log(`Baseline: ${baseline}`);
+	for (const [key, repository] of Object.entries(repositories)) console.log(`${key}: ${repository.path} @ ${repository.baselineCommit}`);
 	await executeHarness(options, created.path, created.manifest, scenarios);
 }
 
